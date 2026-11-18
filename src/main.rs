@@ -55,6 +55,96 @@ fn note_count() -> u64 {
         .unwrap_or(0)
 }
 
+/// Messages from the human that this process has not shown the agent yet.
+///
+/// A human typing while the agent works is the whole point of the chat window,
+/// and checking only at the agent's own convenience means a question can sit
+/// unanswered for minutes. So every tool reply carries whatever arrived since
+/// the last one: the agent sees the message attached to the call it was already
+/// about to make, with no extra round trip and nothing to poll.
+///
+/// The cursor is a byte offset into notes.jsonl, and only this function moves
+/// it. A partial final line is not consumed: the writer appends without a lock,
+/// so a half-written line must wait for its newline rather than be read as
+/// truncated JSON and lost.
+fn inbox() -> &'static Mutex<Inbox> {
+    static INBOX: OnceLock<Mutex<Inbox>> = OnceLock::new();
+    INBOX.get_or_init(|| Mutex::new(Inbox { offset: 0, started: false }))
+}
+
+struct Inbox {
+    offset: u64,
+    started: bool,
+}
+
+/// Up to `limit` messages the human has sent since the last call, oldest first.
+fn take_messages(limit: usize) -> Vec<Value> {
+    let path = data_dir().join("notes.jsonl");
+    let body = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    let mut inbox = inbox().lock().unwrap();
+    if !inbox.started {
+        // A cursor file, not "start at the end": the server restarts constantly
+        // (every reload, every crash), and starting at the end threw away
+        // anything typed while it was down — a message delivered to the window
+        // and to this file, and then silently dropped.
+        let cursor = data_dir().join("notes.cursor");
+        inbox.offset = match std::fs::read_to_string(&cursor) {
+            Ok(v) => v.trim().parse::<u64>().unwrap_or(0).min(body.len() as u64),
+            // Genuinely first run: do not replay a day of chat at the agent.
+            Err(_) => body.len() as u64,
+        };
+        inbox.started = true;
+        // Persist the anchor. Without this every restart re-anchors to the end
+        // of the file and silently skips whatever was typed while it was down,
+        // which is the whole reason the cursor exists. Measured: a message
+        // written between two server runs was invisible on the second run.
+        let _ = std::fs::write(&cursor, inbox.offset.to_string());
+        if inbox.offset == body.len() as u64 {
+            return Vec::new();
+        }
+    }
+    if body.len() as u64 <= inbox.offset {
+        // A rotated or truncated file: start over rather than trust the offset.
+        if (body.len() as u64) < inbox.offset {
+            inbox.offset = 0;
+        } else {
+            return Vec::new();
+        }
+    }
+    let tail = &body[inbox.offset as usize..];
+    // Only whole lines: the last chunk without a newline belongs to a writer
+    // that has not finished.
+    let usable = match tail.iter().rposition(|b| *b == b'\n') {
+        Some(n) => n + 1,
+        None => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for line in String::from_utf8_lossy(&tail[..usable]).lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(line) {
+            // Only the human writes here; the agent's own `add` must not be
+            // echoed back to it as a message from the human.
+            if v.get("from").and_then(Value::as_str) == Some("human") {
+                out.push(v);
+            }
+        }
+    }
+    inbox.offset += usable as u64;
+    // Written after the bytes are consumed: a crash between the two replays one
+    // message, which is better than losing it.
+    let _ = std::fs::write(data_dir().join("notes.cursor"), inbox.offset.to_string());
+    if out.len() > limit {
+        out.drain(..out.len() - limit);
+    }
+    out
+}
+
 fn scan_cache() -> &'static Mutex<HashMap<String, Value>> {
     static CACHE: OnceLock<Mutex<HashMap<String, Value>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -535,7 +625,8 @@ fn tool_defs() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "maxIdleMs": { "type": "integer", "description": "give up after this long with no page change (default 600000 = 10 min)" },
+                    "timeoutMs": { "type": "integer", "description": "stop waiting after this long, message or not (default 600000 = 10 min, max 900000)" },
+                    "maxIdleMs": { "type": "integer", "description": "treat the page as idle after this long with no change (defaults to timeoutMs)" },
                     "pollMs": { "type": "integer", "description": "how often to look (default 2000)" },
                     "untilText": { "type": "string", "description": "also wake when this text appears" },
                     "stopOn": { "type": "string", "enum": ["any", "none"], "description": "whether a human note wakes it (default any)" },
@@ -1543,7 +1634,12 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
             // A wait that can last a long time without spinning and without
             // hanging forever: it sleeps, and gives up only when the page has
             // not changed for `maxIdleMs`. Ending early is the caller's business.
-            let max_idle = args.get("maxIdleMs").and_then(Value::as_u64).unwrap_or(600_000);
+            // Two different limits, and conflating them was a bug: how long to
+            // wait at all (`timeoutMs`), and how quiet the page must be before
+            // describing it as idle (`maxIdleMs`). A page that keeps ticking
+            // must not turn a 10-minute wait into an instant one.
+            let timeout = args.get("timeoutMs").and_then(Value::as_u64).unwrap_or(600_000);
+            let max_idle = args.get("maxIdleMs").and_then(Value::as_u64).unwrap_or(timeout);
             let poll = args.get("pollMs").and_then(Value::as_u64).unwrap_or(2_000).clamp(200, 10_000);
             let stop_on_note = args.get("stopOn").and_then(Value::as_str).unwrap_or("any") != "none";
             let until_text = args.get("untilText").and_then(Value::as_str).map(str::to_string);
@@ -1568,13 +1664,24 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                 }).unwrap_or((String::new(), false));
                 let note_hit = note_count() > notes_at_start;
 
-                // A note is the human speaking: that is the event worth waking for.
+                // A note is the human speaking: that is the event worth waking
+                // for, and what they said is the whole point of waking. Reading
+                // it here also advances the inbox, so the same message is not
+                // delivered twice.
                 if note_hit && stop_on_note {
+                    let messages = take_messages(20);
                     chat_say("woken by a note from you");
+                    let text = messages.iter()
+                        .map(|m| m.get("text").and_then(Value::as_str).unwrap_or("").to_string())
+                        .filter(|t| !t.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n");
                     return Ok(json!({
                         "woke": "note",
                         "elapsedMs": started.elapsed().as_millis() as u64,
                         "url": sig.split('|').next().unwrap_or(""),
+                        "message": text,
+                        "note": "the human is talking to you; answer them before continuing",
                     }));
                 }
                 if text_hit {
@@ -1591,6 +1698,13 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                 } else {
                     last_sig = sig;
                     idle_for = 0;
+                }
+                if started.elapsed().as_millis() as u64 >= timeout {
+                    return Ok(json!({
+                        "woke": "timeout",
+                        "elapsedMs": started.elapsed().as_millis() as u64,
+                        "note": "waited the full timeout with nothing to report",
+                    }));
                 }
                 nap(poll)?;
             }
@@ -1925,6 +2039,10 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                     "total": total,
                     "shown": shown.len(),
                     "truncated": shown.len() < total,
+                    // How many of these came from inside a cross-origin frame.
+                    // Absent would read as "none", which is a lie when it is
+                    // non-zero, so it is always present.
+                    "framesScanned": scan_v.get("framesScanned").cloned().unwrap_or(json!(0)),
                     "elements": shown,
                 });
 
@@ -2732,18 +2850,45 @@ fn main() {
                 if was_cancelled {
                     continue; // the client has stopped listening for this reply
                 }
+                // Whatever the human typed while this call ran rides along with
+                // the reply, so a question never waits for the agent's next
+                // convenient moment. `note` already reports the inbox itself.
+                let pending = if name == "note" { Vec::new() } else { take_messages(20) };
+                let human_note = |blocks: &mut Vec<Value>| {
+                    if pending.is_empty() {
+                        return;
+                    }
+                    let text = pending
+                        .iter()
+                        .map(|m| m.get("text").and_then(Value::as_str).unwrap_or("").to_string())
+                        .filter(|t| !t.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    blocks.push(json!({
+                        "type": "text",
+                        "text": format!(
+                            "A message from the human arrived while this ran — read it before continuing, \
+                             and answer it in your next reply:\n{text}"
+                        ),
+                    }));
+                };
                 match result {
                     Ok(v) => {
-                        let content = match v.get("__content").and_then(Value::as_array) {
+                        let mut content = match v.get("__content").and_then(Value::as_array) {
                             Some(blocks) => blocks.clone(),
                             None => vec![json!({ "type": "text", "text": v.to_string() })],
                         };
+                        human_note(&mut content);
                         send(json!({ "jsonrpc": "2.0", "id": id, "result": { "content": content } }));
                     }
-                    Err(e) => send(json!({ "jsonrpc": "2.0", "id": id, "result": {
-                        "content": [{ "type": "text", "text": format!("ERROR: {e}") }],
-                        "isError": true
-                    }})),
+                    Err(e) => {
+                        let mut content = vec![json!({ "type": "text", "text": format!("ERROR: {e}") })];
+                        human_note(&mut content);
+                        send(json!({ "jsonrpc": "2.0", "id": id, "result": {
+                            "content": content,
+                            "isError": true
+                        }}));
+                    }
                 }
             }
             other => send(json!({ "jsonrpc": "2.0", "id": id,
