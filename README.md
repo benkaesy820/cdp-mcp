@@ -138,7 +138,7 @@ Options:
 
 ## Tools
 
-Eighteen tools. Every one resolves its own tab, so nothing has to be called
+Nineteen tools. Every one resolves its own tab, so nothing has to be called
 before anything else.
 
 | Tool | What it does |
@@ -158,6 +158,7 @@ before anything else.
 | `upload` | set a file on an `<input type=file>` |
 | `paste` | type text, or paste an image, into the focused element |
 | `shot` | screenshot to a path — opt-in, because an image costs context |
+| `chat` | a portable chat page, served by the tool: `serve` opens `http://127.0.0.1:8767/` in any browser on any OS, no credentials involved; `send`/`state`/`clear` drive the same queue headlessly |
 | `report` | file an issue or an idea with version, profile and page attached |
 | `profile` | per-agent settings and a capped memory of what was done |
 | `batch` | several tool calls in one request |
@@ -225,7 +226,22 @@ site isolation, not of this tool.
 
 ### Talking to it while it works
 
-`~/.local/bin/cdp-chat` is a small window (niri: `Mod+Shift+N`) that gives a
+`chat {action:"serve"}` starts a page at **`http://127.0.0.1:8767/`** — one HTML
+file, no build step, no webfont, no framework. It works in any browser on any OS,
+including a phone on the same machine, because it is served by the tool rather
+than by a desktop toolkit. There is no credential anywhere: the page is a queue,
+and the agent drains it by waiting.
+
+The trade is stated plainly, because it matters: **a message sent while the agent
+is not waiting is stored, not delivered.** It is answered the next time the agent
+calls `idle`. That is the price of having no credentials, and it is the right
+one — the alternative is a second client that has to impersonate the session.
+
+`Clear` deletes both sides *and* the agent's read position, keeping one
+`conversation-<stamp>.jsonl` archive. Renaming the files without resetting the
+cursor would leave it pointing into a deleted file, so Clear would be a lie.
+
+The older GTK window (`cdp-chat`) (niri: `Mod+Shift+N`) that gives a
 human a way to redirect the agent mid-run without reaching for a terminal. It
 writes `chat.jsonl`; the agent waits on that file with `idle`, which **costs
 nothing while it blocks** — no turns, no polling, no tokens. The reply costs one

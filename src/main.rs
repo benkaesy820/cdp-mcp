@@ -13,6 +13,7 @@
 
 mod cdp;
 mod scan;
+mod webchat;
 
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -220,22 +221,6 @@ fn take_chat(limit: usize) -> Vec<Value> {
     out
 }
 
-/// Say something in the chat window. Silent if the window is not installed.
-fn chat_say(text: &str) {
-    use std::io::Write as _;
-    let _ = std::fs::create_dir_all(data_dir());
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(data_dir().join("talk.jsonl"))
-    {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let _ = writeln!(f, "{}", json!({ "id": ts, "ts": ts, "from": "agent", "text": text }));
-    }
-}
 
 fn check_cancel() -> Result<(), String> {
     if CANCELLED.load(std::sync::atomic::Ordering::Relaxed) {
@@ -620,6 +605,19 @@ fn tool_defs() -> Value {
 
                     "tab": { "type": "string" }
                 }
+            }
+        },
+        {
+            "name": "chat",
+            "description": "A portable chat surface for the human, served by this tool: {action:\"serve\"} starts a small page at http://127.0.0.1:8767/ that works in any browser on any OS, with no credentials. The human types there; the agent drains the same queue by calling `idle`, which returns their message. {action:\"send\"} and {action:\"state\"} drive it without a browser; {action:\"clear\"} wipes both sides and one archive is kept.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["serve", "send", "state", "clear", "messages"] },
+                    "text": { "type": "string", "description": "for action=send" },
+                    "port": { "type": "integer", "description": "for action=serve, default 8767" }
+                },
+                "required": ["action"]
             }
         },
         {
@@ -1651,6 +1649,57 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                     }));
                 }
                 nap(poll)?;
+            }
+        }
+        "chat" => {
+            // The portable chat surface. `serve` starts a loopback HTTP page;
+            // `send`/`state` let an agent drive the same queue without a browser.
+            let store = webchat::Store::new(data_dir());
+            match args.get("action").and_then(Value::as_str).unwrap_or("state") {
+                "serve" => {
+                    let port = args.get("port").and_then(Value::as_u64).unwrap_or(8767) as u16;
+                    // One server per port, started once. A second `serve` would
+                    // fail to bind and that is a confusing error for a tool the
+                    // agent calls repeatedly.
+                    static STARTED: std::sync::OnceLock<std::sync::Mutex<Vec<u16>>> =
+                        std::sync::OnceLock::new();
+                    let started = STARTED.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+                    if started.lock().unwrap().contains(&port) {
+                        return Ok(json!({ "serving": true, "url": format!("http://127.0.0.1:{port}/"), "alreadyRunning": true }));
+                    }
+                    let st = webchat::Store::new(data_dir());
+                    std::thread::spawn(move || {
+                        let _ = webchat::serve(st, port);
+                    });
+                    // Give the listener a moment so the URL is live when this
+                    // returns; otherwise a caller opens the page and gets a
+                    // connection refused.
+                    for _ in 0..40 {
+                        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    started.lock().unwrap().push(port);
+                    Ok(json!({ "serving": true, "url": format!("http://127.0.0.1:{port}/") }))
+                }
+                "send" => {
+                    let text = args.get("text").and_then(Value::as_str).ok_or("chat send needs text")?;
+                    let rec = store.append_human(text)?;
+                    Ok(json!({ "queued": rec }))
+                }
+                "state" => Ok(json!({
+                    "unread": store.unread(),
+                    "cursor": store.consumed(),
+                    "size": store.size(),
+                    "url": format!("http://127.0.0.1:{}/", args.get("port").and_then(Value::as_u64).unwrap_or(8767)),
+                })),
+                "clear" => {
+                    let archive = store.clear()?;
+                    Ok(json!({ "cleared": true, "archive": archive }))
+                }
+                "messages" => Ok(json!({ "messages": store.conversation() })),
+                other => Err(format!("unknown chat action: {other}")),
             }
         }
         "report" => {
