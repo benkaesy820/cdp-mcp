@@ -382,7 +382,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "note",
-            "description": "The human's inbox for this agent. `list` (default) returns notes he left while you were working, and marks them seen; `add` writes one. Check it at each step boundary in a long run — it is how he redirects you without interrupting. A plain file, so no web page can reach it.",
+            "description": "The human's inbox for this agent. `list` (default) returns notes they left while you were working, and marks them seen; `add` writes one. Check it at each step boundary in a long run — it is how they redirect you without interrupting. A plain file, so no web page can reach it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1790,9 +1790,9 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
             })
         }
         "clip" => {
-            // An agent-owned clipboard. The system clipboard is Ben's: touching it
-            // races with whatever he last copied. This store never leaves a file,
-            // so a copy here cannot clobber his, and `toSystem` is the explicit
+            // An agent-owned clipboard. The system clipboard is the human's: touching it
+            // races with whatever they last copied. This store never leaves a file,
+            // so a copy here cannot clobber theirs, and `toSystem` is the explicit
             // opt-in when a real Ctrl+V is the only way to paste somewhere.
             let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
             let prof = cfg.profile_now();
