@@ -13,7 +13,6 @@
 
 mod cdp;
 mod scan;
-mod webchat;
 
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -152,75 +151,6 @@ fn with_conn<R>(
 /// Set when the client cancels the request being worked on (or goes away).
 /// Long loops check it, so "stop" in the client stops the clicking.
 static CANCELLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// The human's line in the chat window, as an offset into `chat.jsonl`.
-///
-/// A blocking call that sleeps on this file costs nothing while it sleeps: no
-/// turns, no polling, no tokens. That is the cheapest possible conversation —
-/// the agent waits in one call, the human types whenever they like, and the wait
-/// returns the moment there is something to read.
-fn chat_offset() -> &'static Mutex<ChatOffset> {
-    static OFF: OnceLock<Mutex<ChatOffset>> = OnceLock::new();
-    OFF.get_or_init(|| Mutex::new(ChatOffset::default()))
-}
-
-#[derive(Default)]
-struct ChatOffset {
-    offset: u64,
-    started: bool,
-}
-
-/// Messages from the window that this process has not returned yet.
-///
-/// The cursor persists in `chat.cursor`, so a restart does not lose a line typed
-/// while it was down, and does not replay history either. A half-written final
-/// line is never consumed: the window appends without a lock.
-fn take_chat(limit: usize) -> Vec<Value> {
-    let path = data_dir().join("chat.jsonl");
-    let body = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(_) => return Vec::new(),
-    };
-    let mut st = chat_offset().lock().unwrap();
-    if !st.started {
-        let cursor = data_dir().join("chat.cursor");
-        st.offset = match std::fs::read_to_string(&cursor) {
-            Ok(v) => v.trim().parse::<u64>().unwrap_or(0).min(body.len() as u64),
-            Err(_) => body.len() as u64,
-        };
-        st.started = true;
-        if st.offset == body.len() as u64 {
-            return Vec::new();
-        }
-    }
-    if (body.len() as u64) < st.offset {
-        st.offset = 0; // the file was replaced
-    }
-    let tail = &body[st.offset as usize..];
-    let usable = match tail.iter().rposition(|b| *b == b'\n') {
-        Some(n) => n + 1,
-        None => return Vec::new(),
-    };
-    let mut out = Vec::new();
-    for line in String::from_utf8_lossy(&tail[..usable]).lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Ok(v) = serde_json::from_str::<Value>(line) {
-            if v.get("from").and_then(Value::as_str) == Some("human") {
-                out.push(v);
-            }
-        }
-    }
-    st.offset += usable as u64;
-    let _ = std::fs::write(data_dir().join("chat.cursor"), st.offset.to_string());
-    if out.len() > limit {
-        out.drain(..out.len() - limit);
-    }
-    out
-}
-
 
 fn check_cancel() -> Result<(), String> {
     if CANCELLED.load(std::sync::atomic::Ordering::Relaxed) {
@@ -594,7 +524,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "idle",
-            "description": "Wait without spinning, and without costing a turn: a blocking call is free while it blocks. Returns as soon as (a) the human types in the chat window — `woke:\"message\"` with their `message` text, (b) `untilText` appears, or (c) nothing changes for `maxIdleMs` / `timeoutMs` runs out. This is how a conversation works cheaply: wait in one call, answer in one turn.",
+            "description": "Wait without spinning: returns as soon as `untilText` appears, or when the page has stopped changing for `maxIdleMs`. A blocking call is free while it blocks, so use it instead of a sleep loop when waiting for a page.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -605,19 +535,6 @@ fn tool_defs() -> Value {
 
                     "tab": { "type": "string" }
                 }
-            }
-        },
-        {
-            "name": "chat",
-            "description": "A portable chat surface for the human, served by this tool: {action:\"serve\"} starts a small page at http://127.0.0.1:8767/ that works in any browser on any OS, with no credentials. The human types there; the agent drains the same queue by calling `idle`, which returns their message. {action:\"send\"} and {action:\"state\"} drive it without a browser; {action:\"clear\"} wipes both sides and one archive is kept.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": { "type": "string", "enum": ["serve", "send", "state", "clear", "messages"] },
-                    "text": { "type": "string", "description": "for action=send" },
-                    "port": { "type": "integer", "description": "for action=serve, default 8767" }
-                },
-                "required": ["action"]
             }
         },
         {
@@ -1588,8 +1505,6 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
 
             let until_text = args.get("untilText").and_then(Value::as_str).map(str::to_string);
             let started = std::time::Instant::now();
-            // Waiting is free: this call costs nothing while it blocks, so the
-            // human can type whenever they like and only the reply costs a turn.
             let mut last_sig = String::new();
             let mut idle_for: u64 = 0;
 
@@ -1608,24 +1523,6 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                     Ok((format!("{url}|{n}"), v.get(2).and_then(Value::as_bool).unwrap_or(false)))
                 }).unwrap_or((String::new(), false));
 
-                // The human speaking is the event worth waking for, and their
-                // words are the point of waking.
-                let messages = take_chat(20);
-                if !messages.is_empty() {
-                    let text = messages
-                        .iter()
-                        .map(|m| m.get("text").and_then(Value::as_str).unwrap_or("").to_string())
-                        .filter(|t| !t.is_empty())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    return Ok(json!({
-                        "woke": "message",
-                        "elapsedMs": started.elapsed().as_millis() as u64,
-                        "url": sig.split('|').next().unwrap_or(""),
-                        "message": text,
-                        "note": "the human is talking to you; answer them before continuing",
-                    }));
-                }
                 if text_hit {
                     return Ok(json!({ "woke": "text", "untilText": until_text,
                                       "elapsedMs": started.elapsed().as_millis() as u64 }));
@@ -1649,57 +1546,6 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                     }));
                 }
                 nap(poll)?;
-            }
-        }
-        "chat" => {
-            // The portable chat surface. `serve` starts a loopback HTTP page;
-            // `send`/`state` let an agent drive the same queue without a browser.
-            let store = webchat::Store::new(data_dir());
-            match args.get("action").and_then(Value::as_str).unwrap_or("state") {
-                "serve" => {
-                    let port = args.get("port").and_then(Value::as_u64).unwrap_or(8767) as u16;
-                    // One server per port, started once. A second `serve` would
-                    // fail to bind and that is a confusing error for a tool the
-                    // agent calls repeatedly.
-                    static STARTED: std::sync::OnceLock<std::sync::Mutex<Vec<u16>>> =
-                        std::sync::OnceLock::new();
-                    let started = STARTED.get_or_init(|| std::sync::Mutex::new(Vec::new()));
-                    if started.lock().unwrap().contains(&port) {
-                        return Ok(json!({ "serving": true, "url": format!("http://127.0.0.1:{port}/"), "alreadyRunning": true }));
-                    }
-                    let st = webchat::Store::new(data_dir());
-                    std::thread::spawn(move || {
-                        let _ = webchat::serve(st, port);
-                    });
-                    // Give the listener a moment so the URL is live when this
-                    // returns; otherwise a caller opens the page and gets a
-                    // connection refused.
-                    for _ in 0..40 {
-                        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(25));
-                    }
-                    started.lock().unwrap().push(port);
-                    Ok(json!({ "serving": true, "url": format!("http://127.0.0.1:{port}/") }))
-                }
-                "send" => {
-                    let text = args.get("text").and_then(Value::as_str).ok_or("chat send needs text")?;
-                    let rec = store.append_human(text)?;
-                    Ok(json!({ "queued": rec }))
-                }
-                "state" => Ok(json!({
-                    "unread": store.unread(),
-                    "cursor": store.consumed(),
-                    "size": store.size(),
-                    "url": format!("http://127.0.0.1:{}/", args.get("port").and_then(Value::as_u64).unwrap_or(8767)),
-                })),
-                "clear" => {
-                    let archive = store.clear()?;
-                    Ok(json!({ "cleared": true, "archive": archive }))
-                }
-                "messages" => Ok(json!({ "messages": store.conversation() })),
-                other => Err(format!("unknown chat action: {other}")),
             }
         }
         "report" => {

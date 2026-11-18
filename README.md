@@ -138,7 +138,7 @@ Options:
 
 ## Tools
 
-Nineteen tools. Every one resolves its own tab, so nothing has to be called
+Eighteen tools. Every one resolves its own tab, so nothing has to be called
 before anything else.
 
 | Tool | What it does |
@@ -158,7 +158,6 @@ before anything else.
 | `upload` | set a file on an `<input type=file>` |
 | `paste` | type text, or paste an image, into the focused element |
 | `shot` | screenshot to a path — opt-in, because an image costs context |
-| `chat` | a portable chat page, served by the tool: `serve` opens `http://127.0.0.1:8767/` in any browser on any OS, no credentials involved; `send`/`state`/`clear` drive the same queue headlessly |
 | `report` | file an issue or an idea with version, profile and page attached |
 | `profile` | per-agent settings and a capped memory of what was done |
 | `batch` | several tool calls in one request |
@@ -223,41 +222,6 @@ site isolation, not of this tool.
 // 3. prove it worked
 { "name": "eval", "arguments": { "expression": "document.body.innerText.includes('Hello')" } }
 ```
-
-### Talking to it while it works
-
-`chat {action:"serve"}` starts a page at **`http://127.0.0.1:8767/`** — one HTML
-file, no build step, no webfont, no framework. It works in any browser on any OS,
-including a phone on the same machine, because it is served by the tool rather
-than by a desktop toolkit. There is no credential anywhere: the page is a queue,
-and the agent drains it by waiting.
-
-The trade is stated plainly, because it matters: **a message sent while the agent
-is not waiting is stored, not delivered.** It is answered the next time the agent
-calls `idle`. That is the price of having no credentials, and it is the right
-one — the alternative is a second client that has to impersonate the session.
-
-`Clear` deletes both sides *and* the agent's read position, keeping one
-`conversation-<stamp>.jsonl` archive. Renaming the files without resetting the
-cursor would leave it pointing into a deleted file, so Clear would be a lie.
-
-`Mod+Shift+N` opens the page in your browser. There is no desktop window and no
-helper script: the browser you already have is the client.
-
-### Connections
-
-**There is no polling.** The server watches `chat.jsonl` with **inotify** — the
-kernel says when the file is written — and pushes the change to the page over a
-single held-open **Server-Sent Events** connection. The page has no timer and
-makes no repeat requests.
-
-Measured in a real browser: **0 requests in 4 seconds** while the page sat idle,
-and a new message still appeared without one. The first version of this page made
-40 socket connections per 20 polls; the polled version before that made 2 per 1.2 s.
-
-One honest limit: a held-open stream means one thread per connected page. That is
-one browser tab, not one per request, and it is the price of pushing instead of
-asking.
 
 ### Cost
 
