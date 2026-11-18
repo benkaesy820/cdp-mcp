@@ -267,6 +267,12 @@ pub struct Conn {
     /// whether anything reached the page before the socket died, which is the
     /// only case where running the caller's actions again is safe.
     pub replies: u64,
+    /// Out-of-process iframes of this page, as (target id, session id, url),
+    /// kept current from attach/detach events once `frames()` turned
+    /// auto-attach on. Cross-origin frames run in another renderer, so the
+    /// page's own script cannot see into them; each needs its own session.
+    oopifs: Vec<(String, String, String)>,
+    auto_attach: bool,
 }
 
 fn timeout_from_env() -> u64 {
@@ -304,7 +310,8 @@ impl Conn {
         // Bounded so a stuck page cannot hang an agent that was left alone.
         // Configurable per profile with `call_timeout_ms`.
         let ms = timeout_from_env();
-        let mut conn = Conn { ws, next: 0, focus_on: false, timeout_ms: ms, dead: false, replies: 0 };
+        let mut conn = Conn { ws, next: 0, focus_on: false, timeout_ms: ms, dead: false, replies: 0,
+                              oopifs: Vec::new(), auto_attach: false };
         conn.set_read_timeout(ms);
         // Deliberately NOT calling Runtime.enable / Page.enable: those are
         // per-session state for *events*, which this server ignores. Every
@@ -347,15 +354,71 @@ impl Conn {
                 _ => continue,
             };
             if let Ok(v) = v {
+                self.track_frames(&v);
                 return Ok(v);
             }
         }
     }
 
+    /// Keep the out-of-process iframe list current. Every message passes
+    /// through here, so an event is never missed because a call skipped it.
+    fn track_frames(&mut self, v: &Value) {
+        match v.get("method").and_then(Value::as_str) {
+            Some("Target.attachedToTarget") => {
+                let p = &v["params"];
+                let info = &p["targetInfo"];
+                if info["type"] == "iframe" {
+                    if let (Some(t), Some(sid)) = (info["targetId"].as_str(), p["sessionId"].as_str()) {
+                        let url = info["url"].as_str().unwrap_or_default().to_string();
+                        self.oopifs.retain(|f| f.0 != t);
+                        self.oopifs.push((t.to_string(), sid.to_string(), url));
+                    }
+                }
+            }
+            Some("Target.detachedFromTarget") => {
+                if let Some(sid) = v.pointer("/params/sessionId").and_then(Value::as_str) {
+                    self.oopifs.retain(|f| f.1 != sid);
+                }
+            }
+            Some("Target.targetInfoChanged") => {
+                let info = &v["params"]["targetInfo"];
+                if let (Some(t), Some(url)) = (info["targetId"].as_str(), info["url"].as_str()) {
+                    if let Some(f) = self.oopifs.iter_mut().find(|f| f.0 == t) {
+                        f.2 = url.to_string();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The page's out-of-process iframes, as (target id, session id, url),
+    /// in a stable order. The first call turns auto-attach on; Chromium
+    /// reports every existing frame before it replies, so the list is
+    /// complete when this returns.
+    pub fn frames(&mut self) -> Res<Vec<(String, String, String)>> {
+        if !self.auto_attach {
+            self.call("Target.setAutoAttach",
+                      json!({ "autoAttach": true, "waitForDebuggerOnStart": false, "flatten": true }))?;
+            self.auto_attach = true;
+        }
+        let mut f = self.oopifs.clone();
+        f.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(f)
+    }
+
     fn send_cmd(&mut self, method: &str, params: &Value) -> Res<i64> {
+        self.send_to(None, method, params)
+    }
+
+    fn send_to(&mut self, session: Option<&str>, method: &str, params: &Value) -> Res<i64> {
         self.next += 1;
         let id = self.next;
-        let msg = json!({ "id": id, "method": method, "params": params }).to_string();
+        let mut msg = json!({ "id": id, "method": method, "params": params });
+        if let Some(sid) = session {
+            msg["sessionId"] = json!(sid);
+        }
+        let msg = msg.to_string();
         if let Err(e) = self.ws.send(Message::text(msg)) {
             self.dead = true;
             return Err(format!("connection to the page lost: {e}"));
@@ -443,7 +506,12 @@ impl Conn {
 
     /// Send one command and wait for its reply, skipping protocol events.
     pub fn call(&mut self, method: &str, params: Value) -> Res<Value> {
-        let id = self.send_cmd(method, &params)?;
+        self.call_in(None, method, params)
+    }
+
+    /// `call`, addressed to an attached child session (an iframe) when given.
+    pub fn call_in(&mut self, session: Option<&str>, method: &str, params: Value) -> Res<Value> {
+        let id = self.send_to(session, method, &params)?;
         let ms = self.timeout_ms;
         loop {
             let v = self.next_msg(method, ms)?;
@@ -511,6 +579,20 @@ impl Conn {
     pub fn eval(&mut self, expression: &str) -> Res<Value> {
         let ms = self.timeout_ms;
         self.eval_within(expression, ms)
+    }
+
+    /// `eval` inside an attached iframe session.
+    pub fn eval_in(&mut self, session: &str, expression: &str) -> Res<Value> {
+        let r = self.call_in(Some(session), "Runtime.evaluate", json!({
+            "expression": expression, "returnByValue": true, "awaitPromise": true, "userGesture": true,
+        }))?;
+        if let Some(details) = r.get("exceptionDetails") {
+            let text = details.pointer("/exception/description").and_then(Value::as_str)
+                .or_else(|| details.get("text").and_then(Value::as_str))
+                .unwrap_or("evaluation threw");
+            return Err(text.to_string());
+        }
+        Ok(r.pointer("/result/value").cloned().unwrap_or(Value::Null))
     }
 
     /// `eval` for an expression that awaits something in the page, with a

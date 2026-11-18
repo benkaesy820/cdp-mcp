@@ -1,0 +1,29 @@
+<!doctype html><meta charset="utf-8"><title>frames and shadow</title>
+<style>body{margin:0;font:14px sans-serif} iframe{display:block;border:4px solid #888;margin:8px}</style>
+<button onclick="hit('top')">Top button</button>
+<x-card></x-card>
+<iframe id="same" title="Same-origin frame" width="400" height="120" srcdoc="
+  <button onclick=&quot;parent.hit('same-near')&quot;>Inner near</button>
+  <div style='height:400px'></div>
+  <button onclick=&quot;parent.hit('same-far')&quot;>Inner far</button>"></iframe>
+<iframe id="cross" title="Cross-origin frame" width="400" height="120"></iframe>
+<script>
+const H = {}; function hit(k) { H[k] = (H[k] || 0) + 1 }
+addEventListener('message', e => { if (e.data && e.data.hit) hit(e.data.hit) });
+customElements.define('x-card', class extends HTMLElement {
+  constructor() { super(); const r = this.attachShadow({ mode: 'open' });
+    r.innerHTML = '<button id="b">Shadow button</button><x-inner></x-inner>';
+    r.getElementById('b').onclick = () => hit('shadow'); }
+});
+customElements.define('x-inner', class extends HTMLElement {
+  constructor() { super(); const r = this.attachShadow({ mode: 'open' });
+    r.innerHTML = '<a href="#deep">Deep shadow link</a>';
+    r.querySelector('a').onclick = e => { e.preventDefault(); hit('deep') }; }
+});
+// the cross-origin frame is served by the test runner on 127.0.0.1
+// 'localhost' vs '127.0.0.1' is a different SITE, which is what makes
+// Chromium give the frame its own process. Two ports on 127.0.0.1 are the
+// same site, so site isolation never applies and cross-origin code paths
+// go untested.
+cross.src = 'http://localhost:' + (new URLSearchParams(location.search).get('port') || 8765) + '/cross.html';
+</script>

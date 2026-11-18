@@ -239,6 +239,161 @@ fn pick(conn: &mut cdp::Conn, scope: Option<&str>, i: u64, scroll: bool, select:
     Ok(v)
 }
 
+/// Scan the page plus every cross-origin iframe inside it.
+///
+/// The page's own script cannot read across a site boundary — that is site
+/// isolation, not a bug in the scanner — so an embedded widget's buttons are
+/// absent from a normal scan. Chromium exposes each such frame as its own
+/// target with its own session, which is what `Conn::frames` collects.
+///
+/// Every frame's elements are appended after the page's own, so an index still
+/// means one element and every page element keeps the index it already had.
+/// Coordinates are translated into the embedding page's viewport, which is the
+/// space a click is dispatched in.
+fn scan_with_frames(conn: &mut cdp::Conn, scope: Option<&str>) -> Result<Value, String> {
+    let mut scan_v = conn.eval(&scan_js(scope))?;
+    let frames = match conn.frames() {
+        Ok(f) => f,
+        Err(_) => return Ok(scan_v), // older browser: page-only scan is still useful
+    };
+    if frames.is_empty() {
+        return Ok(scan_v);
+    }
+    let mut elements = scan_v.get("elements").and_then(Value::as_array).cloned().unwrap_or_default();
+    let mut added = 0u64;
+    for (_target, session, url) in frames {
+        // Read the frame's own document, then find where its box sits in the
+        // parent so local coordinates can be made absolute.
+        // The frame returns a JSON string: one value in, one value out, and no
+        // surprise about how deep the protocol will serialise.
+        let body = match conn.eval_in(&session, scan::FRAME_ELEMENTS_JS) {
+            Ok(Value::String(body)) => serde_json::from_str::<Value>(&body).unwrap_or(Value::Null),
+            Ok(v) => v,
+            Err(_) => continue, // sandboxed, detached, or no document yet
+        };
+        let kids = body.get("elements").and_then(Value::as_array).cloned().unwrap_or_default();
+        if kids.is_empty() {
+            continue;
+        }
+        let origin = match conn.eval(&format!(
+            "(() => {{ const f = [...document.querySelectorAll('iframe, frame')].find(f => (f.src || '') === {src}); \
+               if (!f) return null; const r = f.getBoundingClientRect(); \
+               return JSON.stringify({{ x: r.left + f.clientLeft, y: r.top + f.clientTop, w: f.clientWidth, h: f.clientHeight }}); }})()",
+            src = serde_json::to_string(&url).unwrap_or_else(|_| "null".into())
+        )) {
+            Ok(Value::String(s)) => serde_json::from_str::<Value>(&s).ok(),
+            _ => None,
+        };
+        let origin = match origin {
+            Some(o) if !o.is_null() => o,
+            _ => continue, // cannot place it on screen, so a click there is a guess
+        };
+        let (ox, oy) = (
+            origin.get("x").and_then(Value::as_f64).unwrap_or(0.0),
+            origin.get("y").and_then(Value::as_f64).unwrap_or(0.0),
+        );
+        let label = url
+            .split("://").nth(1).unwrap_or(&url)
+            .split('/').next().unwrap_or(&url)
+            .chars().take(40).collect::<String>();
+        for mut k in kids {
+            // A frame can be scrolled: only what the parent actually shows is
+            // clickable, so anything outside the frame's box is marked off-screen.
+            let (x, y) = (
+                k.get("x").and_then(Value::as_f64).unwrap_or(0.0),
+                k.get("y").and_then(Value::as_f64).unwrap_or(0.0),
+            );
+            let (w, h) = (
+                k.get("w").and_then(Value::as_f64).unwrap_or(0.0),
+                k.get("h").and_then(Value::as_f64).unwrap_or(0.0),
+            );
+            if let Some(o) = k.as_object_mut() {
+                o.insert("i".into(), json!(elements.len()));
+                o.insert("x".into(), json!((x + ox + w / 2.0).round() as i64));
+                o.insert("y".into(), json!((y + oy + h / 2.0).round() as i64));
+                o.insert("frame".into(), json!(label));
+                o.insert("session".into(), json!(session));
+                // Local centre, which is what a click inside the frame needs.
+                o.insert("lx".into(), json!((x + w / 2.0).round() as i64));
+                o.insert("ly".into(), json!((y + h / 2.0).round() as i64));
+            }
+            let inside = x >= 0.0 && y >= 0.0
+                && x + w <= origin.get("w").and_then(Value::as_f64).unwrap_or(0.0)
+                && y + h <= origin.get("h").and_then(Value::as_f64).unwrap_or(0.0);
+            if !inside {
+                if let Some(o) = k.as_object_mut() {
+                    o.insert("off".into(), json!(true));
+                }
+            }
+            elements.push(k);
+            added += 1;
+            if elements.len() >= 600 {
+                break;
+            }
+        }
+    }
+    if added > 0 {
+        if let Some(o) = scan_v.as_object_mut() {
+            o.insert("elements".into(), Value::Array(elements));
+            o.insert("framesScanned".into(), json!(added));
+        }
+    }
+    Ok(scan_v)
+}
+
+/// If element `i` lives inside a cross-origin frame, where to click it.
+///
+/// Returns `(local x, local y, session)`. Cheap in the common case: one cached
+/// scan lookup, no protocol traffic. It only asks the browser anything when the
+/// element carries a `session`, which `scan_with_frames` sets only for frames.
+fn frame_target(conn: &mut cdp::Conn, i: u64) -> Result<Option<(f64, f64, String)>, String> {
+    let cached = {
+        let cache = scan_cache().lock().unwrap();
+        cache
+            .values()
+            .next()
+            .and_then(|v| v.get("elements").and_then(Value::as_array).cloned())
+    };
+    let el = cached
+        .and_then(|els| els.get(i as usize).cloned())
+        .filter(|e| e.get("session").and_then(Value::as_str).is_some());
+    let el = match el {
+        Some(e) => e,
+        None => return Ok(None),
+    };
+    let session = el.get("session").and_then(Value::as_str).unwrap_or_default().to_string();
+    if session.is_empty() {
+        return Ok(None);
+    }
+    // Ensure the session is attached before using it (a fresh process has never
+    // called frames()).
+    let _ = conn.frames();
+    let x = el.get("lx").and_then(Value::as_f64).unwrap_or(0.0);
+    let y = el.get("ly").and_then(Value::as_f64).unwrap_or(0.0);
+    Ok(Some((x, y, session)))
+}
+
+/// Send one mouse event to a frame's own session, at frame-local coordinates.
+fn frame_click(
+    conn: &mut cdp::Conn,
+    session: &str,
+    x: f64,
+    y: f64,
+    button: &str,
+    count: u64,
+    mods: u32,
+) -> Result<(), String> {
+    conn.call_in(Some(session), "Input.dispatchMouseEvent", json!({
+        "type": "mousePressed", "x": x, "y": y, "button": button,
+        "clickCount": count, "buttons": 1, "modifiers": mods,
+    }))?;
+    conn.call_in(Some(session), "Input.dispatchMouseEvent", json!({
+        "type": "mouseReleased", "x": x, "y": y, "button": button,
+        "clickCount": count, "buttons": 0, "modifiers": mods,
+    }))?;
+    Ok(())
+}
+
 fn fingerprint(e: &Value) -> String {
     format!(
         "{}|{}|{}|{}",
@@ -1111,6 +1266,20 @@ fn run_input(conn: &mut cdp::Conn, actions: &[Value], force: bool, scope: Option
             let mods = mod_mask(c.get("modifiers"));
             if let Some(i) = c.get("i").and_then(Value::as_u64) {
                 let scope = c.get("within").and_then(Value::as_str).or(scope);
+                // An element inside a cross-origin frame lives in another
+                // renderer: a click at its page coordinates lands in the frame's
+                // box but the frame's own document receives it at LOCAL
+                // coordinates, so the event has to be sent to its session.
+                if let Some(target) = frame_target(conn, i)? {
+                    let (lx, ly) = (target.0, target.1);
+                    if button != "left" || count > 1 || mods != 0 {
+                        frame_click(conn, &target.2, lx, ly, &button, count, mods as u32)?;
+                    } else {
+                        frame_click(conn, &target.2, lx, ly, "left", 1, 0)?;
+                    }
+                    log.push(json!({ "clicked": { "i": i, "inFrame": true, "x": lx, "y": ly } }));
+                    continue;
+                }
                 // Resolve first (one evaluation), then check the label before
                 // clicking: a repeat of a final confirmation is the failure that
                 // bites an unattended run.
@@ -1673,7 +1842,7 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
 
             let within = args.get("within").and_then(Value::as_str).map(str::to_string);
             with_conn(&cfg.endpoint, tab, |conn, tab_id| {
-                let scan_v = conn.eval(&scan_js(within.as_deref()))?;
+                let scan_v = scan_with_frames(conn, within.as_deref())?;
                 scope_cache().lock().unwrap().insert(tab_id.to_string(), within.clone());
 
                 let mut all = scan_v.get("elements").and_then(Value::as_array).cloned().unwrap_or_default();

@@ -138,34 +138,80 @@ Options:
 
 ## Tools
 
+Nineteen tools. Every one resolves its own tab, so nothing has to be called
+before anything else.
+
 | Tool | What it does |
 |---|---|
-| `status` | browser version and every open page tab |
-| `tabs` | `{action:"list"}` · `{action:"open",url}` (waits for the document) · `{action:"close",tab}` |
-| `eval` | evaluate a JavaScript expression in the page, return JSON, awaits promises |
-| `elements` | visible interactive elements with `{i, tag, role, label, x, y, w, h}` |
+| `status` | browser version, every open page tab, and a doctor result when CDP is down |
+| `tabs` | `list` · `open {url}` (background, so it never steals focus) · `close {tab}` |
+| `eval` | evaluate JavaScript in the page, return JSON, awaits promises |
+| `elements` | visible interactive elements with `{i, tag, role, label, x, y, w, h}` — **inside shadow roots, same-origin frames and cross-origin frames too**; plus `overlays`, `media`, `scroll` |
 | `input` | real input, in order, in one call |
-| `shot` | PNG screenshot to a path |
+| `flow` | run steps server-side and repeat until a condition holds — N acts for one turn, and it aborts when a note arrives |
+| `idle` | wait with no polling: until a note, until text appears, or until the page stops changing |
+| `images` | every image on the page with its source and size |
+| `image` | `open` / `link` / `copy` — copy puts real pixels on the clipboard for a real Ctrl+V |
+| `link` | `open` a link (or the current page) in a tab, or `copy` its URL |
+| `clip` | agent-owned clipboard: `set` `get` `list` `clear`, and `toSystem` as the one opt-in |
+| `download` | save a resource to a path, including cross-origin ones |
+| `upload` | set a file on an `<input type=file>` |
+| `paste` | type text, or paste an image, into the focused element |
+| `shot` | screenshot to a path — opt-in, because an image costs context |
+| `note` | the human's inbox: `list` (marks seen) and `add` |
+| `report` | file an issue or an idea with version, profile and page attached |
+| `profile` | per-agent settings and a capped memory of what was done |
+| `batch` | several tool calls in one request |
 
-`input` actions:
+`elements` indexes are **absolute and re-resolved at click time**, so they cannot
+go stale between the scan and the click: it scrolls the element into view,
+re-measures, and hit-tests what is actually on top. `within` scopes the scan to a
+subtree; the indexes it returns stay valid for `input`.
+
+### `input` actions
 
 ```json
 [
-  { "click": { "i": 7 } },                    // index from elements, re-resolved
-  { "click": { "x": 400, "y": 320 } },        // or raw coordinates
-  { "insert": "text, typed like a keyboard"  },
-  { "key": "Enter" },                          // Enter Escape Tab Backspace Arrows
-  { "scroll": { "dy": 600 } },
+  { "click": { "i": 7 } },                          // index from elements
+  { "click": { "x": 400, "y": 320 } },              // or raw coordinates
+  { "click": { "i": 3, "button": "right" } },        // right / middle, count:2, modifiers
+  { "hover": { "i": 4 } },
+  { "drag": { "from": { "i": 2 }, "to": { "x": 500 } }, "steps": 12 },
+  { "tap": { "i": 5 } }, { "swipe": { "from": {...}, "to": {...} } },   // touch
+  { "select": { "i": 6, "value": "two" } },
+  { "insert": "text, typed like a keyboard" },
+  { "key": "Control+a" },                           // chords, Escape, Tab, arrows
+  { "scroll": { "dy": 600 } },                      // reports whether it moved
+  { "dismiss": { "prefer": "reject" } },            // closes cookie walls
   { "wait": { "text": "Saved", "ms": 15000 } },
+  { "wait": { "idle": true, "ms": 15000 } },        // network settled
   { "sleep": { "ms": 300 } }
 ]
 ```
 
-A typical flow — read, act, verify, in three calls:
+### What it can see through
+
+A page's own script cannot read across a shadow boundary or a site boundary, so
+a naive scan misses the buttons inside web components (YouTube, Reddit, most
+modern apps) and inside embedded widgets. `elements` covers all three:
+
+| Boundary | How |
+|---|---|
+| open shadow roots, including nested | walks every `shadowRoot` |
+| same-origin iframes | walks `contentDocument` |
+| cross-origin iframes | attaches to the frame's own DevTools target and reads it in its own session |
+
+Cross-origin frame elements come back with a `frame` label, and clicking one
+dispatches the event to that frame's session at frame-local coordinates. A
+cross-origin frame is only separate when it is a different **site** — two ports
+on `127.0.0.1` are one site and stay in one process, which is a real limit of
+site isolation, not of this tool.
+
+### A typical flow, three calls
 
 ```jsonc
 // 1. what is on the page
-{ "name": "elements", "arguments": {} }
+{ "name": "elements", "arguments": { "find": "save" } }
 
 // 2. do several things at once
 { "name": "input", "arguments": { "actions": [
@@ -177,6 +223,14 @@ A typical flow — read, act, verify, in three calls:
 // 3. prove it worked
 { "name": "eval", "arguments": { "expression": "document.body.innerText.includes('Hello')" } }
 ```
+
+### Cost
+
+Measured on this machine (medians): `eval` ~2 ms, a click ~17 ms, a full
+`elements` scan of a large page ~28 ms and ~8 KB of JSON instead of 1.5 MB of
+HTML. `batch` runs several calls in one request. `flow` runs a loop server-side,
+so a hundred clicks cost one model turn. `idle` waits for nothing to happen
+without spending a turn.
 
 ## Security
 
@@ -197,6 +251,17 @@ browser completely — every cookie, every session, everything open.
 - No accessibility tree; `elements` is a flat list of interactive nodes.
 - No network interception or tracing. CDP can do both; this exposes neither.
 - One request at a time per call — deliberately, so there is no async runtime.
+- **A cross-origin frame is only separate when it is a different site.** Two
+  ports on `127.0.0.1`, or a subdomain of the same registrable domain, stay in
+  one renderer, so site isolation never applies and the frame is read as part of
+  the page.
+- **Screenshots need a window the compositor is drawing.** If the browser window
+  is not on a visible workspace, a capture can wait seconds for a frame that
+  never arrives. It says so and gives up; every other tool is unaffected.
+- `paste` is Wayland-only, because it goes through `wl-copy`.
+- Drag is one round trip per interpolation step, deliberately: batching the
+  moves makes Chromium coalesce them into a single jump, and a slider or a
+  signature field needs the path.
 
 ## Licence
 

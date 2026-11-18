@@ -16,6 +16,24 @@ const page = (f, hash = "") => "file://" + join(here, "pages", f) + hash;
 const s = server(bin);
 await s.rpc("initialize", { protocolVersion: "2024-11-05" });
 
+// The cross-origin frame has to be a different SITE, not just a different port:
+// two ports on 127.0.0.1 are the same site, so Chromium keeps them in one
+// process and site isolation never comes into play.
+import { createServer } from "node:http";
+import { readFileSync } from "node:fs";
+let framePort = 0;
+async function serveFrames() {
+  if (framePort) return framePort;
+  const srv = createServer((q, res) => {
+    res.writeHead(200, { "content-type": "text/html" });
+    res.end(readFileSync(join(here, "pages", "cross.html")));
+  });
+  await new Promise(r => srv.listen(0, "0.0.0.0", r));
+  framePort = srv.address().port;
+  process.on("exit", () => srv.close());
+  return framePort;
+}
+
 let failed = 0;
 const check = (name, ok, got) => {
   console.log(`${ok ? "ok  " : "FAIL"}  ${name}${ok ? "" : "  — got " + JSON.stringify(got)}`);
@@ -111,6 +129,54 @@ await withTab(page("gestures.html"), async (tab, ev) => {
   check("paste text", (await ev("ta.value")) === "pasted ✓ 123", await ev("ta.value"));
   await s.tool("paste", { tab, i: I("Paste image"), path: join(here, "pages", "red.png") });
   check("paste an image into an editor that reads clipboard files", (await ev("ed.querySelectorAll('img').length")) === 1, await ev("R.paste"));
+});
+
+// ---- shadow DOM and frames --------------------------------------------
+// A page's own script cannot read across a shadow boundary or a site boundary,
+// so these elements were invisible to `elements` and a click had nothing to
+// aim at. Reported as "the button is there but elements doesn't list it".
+const fport = await serveFrames();
+await withTab(page("frames.html?port=" + fport), async (tab, ev) => {
+  // The cross-origin frame runs in its own process and loads separately; give
+  // it a moment, and prove the frame really is cross-site before blaming the
+  // scanner.
+  let frameReady = false;
+  for (let i = 0; i < 20 && !frameReady; i++) {
+    await sleep(250);
+    frameReady = await ev("(() => { const f = document.getElementById('cross'); return !!(f && f.src && f.src.includes('localhost')); })()");
+  }
+  check("cross-origin frame is embedded from another site", frameReady, await ev("document.getElementById('cross')?.src"));
+  const els = (await s.tool("elements", { tab, limit: 999 })).v.elements;
+  const at = l => els.find(e => (e.label || "").trim() === l);
+  const H = async () => JSON.parse(await ev("JSON.stringify(H)"));
+
+  // Open shadow root: the button only exists inside the custom element.
+  check("shadow DOM button is listed", !!at("Shadow button"), els.map(e => e.label));
+  await s.tool("input", { tab, actions: [{ click: { i: at("Shadow button").i } }] });
+  await sleep(250);
+  check("shadow DOM button is clickable", (await H()).shadow === 1, await H());
+
+  // A nested shadow root inside the first one.
+  check("nested shadow root is listed", !!at("Deep shadow link"), els.map(e => e.label));
+  await s.tool("input", { tab, actions: [{ click: { i: at("Deep shadow link").i } }] });
+  await sleep(250);
+  check("nested shadow root is clickable", (await H()).deep === 1, await H());
+
+  // Same-origin iframe, including a target that needs the frame scrolled.
+  check("same-origin frame button is listed", !!at("Inner near"), els.map(e => e.label));
+  await s.tool("input", { tab, actions: [{ click: { i: at("Inner near").i } }] });
+  await sleep(250);
+  check("same-origin frame button is clickable", (await H())["same-near"] === 1, await H());
+
+  // Cross-origin frame: its own renderer, its own target, its own session.
+  const cross = els.find(e => /Cross far|Reject all/.test(e.label || ""));
+  check("cross-origin frame button is listed", !!cross, els.map(e => e.label));
+  if (cross) {
+    await s.tool("input", { tab, actions: [{ click: { i: cross.i } }] });
+    await sleep(400);
+    const h = await H();
+    check("cross-origin frame button is clickable", !!(h.cross || h["cross-far"]), h);
+  }
 });
 
 s.close();

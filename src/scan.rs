@@ -36,56 +36,127 @@ pub const SCAN_JS: &str = r#"(() => {
   const sel = 'a[href], button, input, select, textarea, summary, [role="button"], [role="link"], [role="tab"], [role="menuitem"], [role="checkbox"], [role="radio"], [role="switch"], [role="combobox"], [contenteditable]:not([contenteditable="false"]), [onclick], [tabindex]:not([tabindex="-1"])';
   const elements = [];
   const refs = [];
-  for (const el of root.querySelectorAll(sel)) {
+  // The same-origin <iframe> chain each element sits in ([] = this document).
+  const chains = [];
+
+  // Where a frame chain's content box is, in this viewport's coordinates, and
+  // the part of it that is actually visible (each frame clips what is inside).
+  const frameBox = (chain) => {
+    let x = 0, y = 0, L = 0, T = 0, R = innerWidth, B = innerHeight;
+    for (const f of chain) {
+      const r = f.getBoundingClientRect();
+      x += r.left + f.clientLeft; y += r.top + f.clientTop;
+      L = Math.max(L, x); T = Math.max(T, y);
+      R = Math.min(R, x + f.clientWidth); B = Math.min(B, y + f.clientHeight);
+    }
+    return { x, y, L, T, R, B };
+  };
+  const placed = (el, fb) => {
     const r = el.getBoundingClientRect();
-    if (!shown(el, r)) continue;
-    const b = boxOf(r);
-    const key = b.x + ',' + b.y + ',' + b.w;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    const rec = { i: elements.length, tag: el.tagName.toLowerCase(), label: labelOf(el) };
-    // Effective role, derived when the element does not carry one: a plain
-    // <a href> *is* a link, and filtering by role would miss every one of them.
-    const explicit = el.getAttribute('role');
-    const t = el.tagName;
-    const derived = t === 'A' ? 'link'
-      : t === 'BUTTON' ? 'button'
-      : t === 'SELECT' ? 'combobox'
-      : t === 'TEXTAREA' ? 'textbox'
-      : t === 'INPUT' ? (el.type === 'checkbox' ? 'checkbox' : el.type === 'radio' ? 'radio'
-                        : el.type === 'submit' ? 'button' : 'textbox')
-      : el.isContentEditable ? 'textbox'
-      : '';
-    const eff = explicit || derived;
-    if (eff) rec.role = eff;
-    if (el.disabled) rec.disabled = true;
-    Object.assign(rec, b);
-    // off-screen targets need scrolling before a coordinate click will land
-    if (r.top < -4 || r.bottom > innerHeight + 4) rec.off = true;
-    elements.push(rec);
-    refs.push(el);
-    if (elements.length >= 600) break;
-    if (PICK && elements.length > PICK.i) break; // later elements cannot shift i
-  }
+    return fb.x || fb.y ? new DOMRect(r.x + fb.x, r.y + fb.y, r.width, r.height) : r;
+  };
+  const full = () => elements.length >= 600 || (PICK && elements.length > PICK.i);
+
+  // Light DOM first, then open shadow roots (web components keep their
+  // buttons there), then same-origin frames. querySelectorAll stops at both
+  // boundaries, which is why these were invisible. The order is fixed, so an
+  // index means the same element on every scan of the same page state.
+  const collect = (node, chain, frameLabel) => {
+    const fb = frameBox(chain);
+    for (const el of node.querySelectorAll(sel)) {
+      if (full()) return;
+      const r = placed(el, fb);
+      if (!shown(el, r)) continue;
+      const b = boxOf(r);
+      const key = b.x + ',' + b.y + ',' + b.w;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const rec = { i: elements.length, tag: el.tagName.toLowerCase(), label: labelOf(el) };
+      // Effective role, derived when the element does not carry one: a plain
+      // <a href> *is* a link, and filtering by role would miss every one of them.
+      const explicit = el.getAttribute('role');
+      const t = el.tagName;
+      const derived = t === 'A' ? 'link'
+        : t === 'BUTTON' ? 'button'
+        : t === 'SELECT' ? 'combobox'
+        : t === 'TEXTAREA' ? 'textbox'
+        : t === 'INPUT' ? (el.type === 'checkbox' ? 'checkbox' : el.type === 'radio' ? 'radio'
+                          : el.type === 'submit' ? 'button' : 'textbox')
+        : el.isContentEditable ? 'textbox'
+        : '';
+      const eff = explicit || derived;
+      if (eff) rec.role = eff;
+      if (el.disabled) rec.disabled = true;
+      if (frameLabel) rec.frame = frameLabel;
+      Object.assign(rec, b);
+      // off-screen (or outside its frame's visible area): needs scrolling
+      // before a coordinate click will land
+      if (r.top < fb.T - 4 || r.bottom > fb.B + 4) rec.off = true;
+      elements.push(rec);
+      refs.push(el);
+      chains.push(chain);
+    }
+    for (const host of node.querySelectorAll('*')) {
+      if (full()) return;
+      if (host.shadowRoot) collect(host.shadowRoot, chain, frameLabel);
+    }
+    for (const f of node.querySelectorAll('iframe, frame')) {
+      if (full()) return;
+      let doc = null;
+      try { doc = f.contentDocument; } catch (e) { /* cross-origin */ }
+      if (!doc || !doc.documentElement || !shown(f, placed(f, fb))) continue;
+      const label = String(f.getAttribute('title') || f.getAttribute('name') || f.id || 'frame').slice(0, 40);
+      collect(doc, chain.concat([f]), label);
+    }
+  };
+  collect(root, [], '');
 
   if (PICK) {
     const el = refs[PICK.i];
     if (!el) return { missing: true, total: elements.length };
-    let r = el.getBoundingClientRect();
+    const chain = chains[PICK.i];
+    let fb = frameBox(chain), r = placed(el, fb);
     let scrolled = false;
-    if (PICK.scroll !== false && (r.top < 0 || r.bottom > innerHeight || r.left < 0 || r.right > innerWidth)) {
+    if (PICK.scroll !== false && (r.top < fb.T || r.bottom > fb.B || r.left < fb.L || r.right > fb.R)) {
       // 'instant' overrides a page's `scroll-behavior: smooth`, which would
-      // otherwise leave the element mid-flight when we measure it.
+      // otherwise leave the element mid-flight when we measure it. It scrolls
+      // every scrollable ancestor, frames included.
       el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
-      r = el.getBoundingClientRect();
+      fb = frameBox(chain); r = placed(el, fb);
       scrolled = true;
     }
     const x = r.x + r.width / 2, y = r.y + r.height / 2;
     const out = { i: PICK.i, tag: elements[PICK.i].tag, label: elements[PICK.i].label,
                   x: Math.round(x), y: Math.round(y), scrolled };
-    // Would a real click at the centre reach this element, or something on top?
-    const top = document.elementFromPoint(x, y);
-    out.hit = !!top && (top === el || el.contains(top) || top.contains(el));
+    // Would a real click at the centre reach this element, or something on
+    // top? Hit-test through shadow roots and same-origin frames, the way the
+    // browser will route the click.
+    const deepAt = (px, py) => {
+      let t = document.elementFromPoint(px, py), ox = 0, oy = 0;
+      for (let k = 0; t && k < 32; k++) {
+        if (t.shadowRoot) {
+          const n = t.shadowRoot.elementFromPoint(px - ox, py - oy);
+          if (n && n !== t) { t = n; continue; }
+        }
+        if (t.tagName === 'IFRAME' || t.tagName === 'FRAME') {
+          let d = null;
+          try { d = t.contentDocument; } catch (e) {}
+          if (d) {
+            const fr = t.getBoundingClientRect();
+            ox += fr.left + t.clientLeft; oy += fr.top + t.clientTop;
+            const n = d.elementFromPoint(px - ox, py - oy);
+            if (n) { t = n; continue; }
+          }
+        }
+        break;
+      }
+      return t;
+    };
+    // `contains` stops at shadow and frame boundaries; walk across them.
+    const up = (n) => n.parentNode || n.host || (n.nodeType === 9 && n.defaultView ? n.defaultView.frameElement : null);
+    const holds = (a, b) => { for (let n = b; n; n = up(n)) if (n === a) return true; return false; };
+    const top = deepAt(x, y);
+    out.hit = !!top && (holds(el, top) || holds(top, el));
     if (!out.hit && top) out.coveredBy = labelOf(top).slice(0, 60) || top.tagName.toLowerCase();
     const a = el.closest('a[href]') || el.querySelector('a[href]');
     if (a) out.href = a.href;
@@ -212,4 +283,50 @@ pub const OVERLAYS_QUICK_JS: &str = r#"(() => {
     if (out.length >= 4) break;
   }
   return out;
+})()"#;
+
+/// What a cross-origin frame offers, in its OWN coordinate space.
+///
+/// Deliberately separate from `SCAN_JS`: a frame's document has no knowledge of
+/// the page around it, and the caller supplies the offset. Kept small — the
+/// interactive set only — because it runs once per frame on every scan.
+pub const FRAME_ELEMENTS_JS: &str = r#"(() => {
+  const sel = 'a[href], button, input, select, textarea, summary, [role="button"], [role="link"], [role="tab"], [role="menuitem"], [role="checkbox"], [role="radio"], [role="switch"], [role="combobox"], [contenteditable]:not([contenteditable="false"]), [onclick], [tabindex]:not([tabindex="-1"])';
+  const out = [];
+  const seen = new Set();
+  const labelOf = (el) => {
+    const aria = el.getAttribute && el.getAttribute('aria-label');
+    const t = (aria || el.innerText || el.value || el.getAttribute('title')
+      || el.getAttribute('placeholder') || el.getAttribute('alt') || '').trim().replace(/\s+/g, ' ');
+    return t.slice(0, 60);
+  };
+  const walk = (root) => {
+    for (const el of root.querySelectorAll(sel)) {
+      if (out.length >= 300) return;
+      const r = el.getBoundingClientRect();
+      if (r.width < 2 || r.height < 2) continue;
+      const st = getComputedStyle(el);
+      if (st.visibility === 'hidden' || st.display === 'none' || st.opacity === '0') continue;
+      const key = Math.round(r.x) + ',' + Math.round(r.y) + ',' + Math.round(r.width);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const explicit = el.getAttribute('role');
+      const tag = el.tagName.toLowerCase();
+      const derived = tag === 'a' ? 'link' : tag === 'button' ? 'button'
+        : tag === 'select' ? 'combobox' : tag === 'textarea' ? 'textbox'
+        : tag === 'input' ? (el.type === 'checkbox' ? 'checkbox' : el.type === 'radio' ? 'radio'
+                            : el.type === 'submit' ? 'button' : 'textbox')
+        : el.isContentEditable ? 'textbox' : '';
+      const rec = { tag, label: labelOf(el), x: Math.round(r.x), y: Math.round(r.y),
+                    w: Math.round(r.width), h: Math.round(r.height) };
+      if (explicit || derived) rec.role = explicit || derived;
+      if (el.disabled) rec.disabled = true;
+      out.push(rec);
+    }
+    for (const host of root.querySelectorAll('*')) {
+      if (host.shadowRoot) walk(host.shadowRoot);
+    }
+  };
+  walk(document);
+  return JSON.stringify({ elements: out, title: document.title.slice(0, 80), url: location.href.slice(0, 200) });
 })()"#;
