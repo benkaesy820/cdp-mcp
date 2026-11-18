@@ -1,0 +1,21 @@
+[dist]
+# cargo-dist: one tag builds Linux, macOS and Windows binaries.
+# Windows/macOS binaries are built on GitHub runners, not on this machine.
+cargo-dist-version = "0.28.0"
+ci = "github"
+installers = ["shell", "powershell"]
+targets = [
+  "x86_64-unknown-linux-musl",
+  "aarch64-unknown-linux-musl",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+]
+# The musl targets give fully static Linux binaries. Measured on this machine:
+# `file` reports "statically linked", `objdump` finds ZERO GLIBC_ symbols, and
+# the static build drives the browser. That is what makes ONE Linux artifact work
+# on Arch, Debian/Ubuntu, Fedora and Alpine alike — a glibc-built binary here
+# required GLIBC_2.39 and would refuse to start on Debian 12 (2.36) or Ubuntu
+# 22.04 (2.35). Cost: 906 KB instead of 787 KB.
+install-path = "CARGO_HOME"
+pr-run-mode = "plan"
