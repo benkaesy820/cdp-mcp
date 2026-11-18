@@ -1,0 +1,16 @@
+<!doctype html><meta charset="utf-8"><title>cdp-mcp bench</title>
+<style>html{scroll-behavior:smooth} body{font:14px sans-serif;margin:0} nav a{display:inline-block;margin:2px}</style>
+<nav id="nav"></nav>
+<main>
+  <button id="near" onclick="bump('near')">Near button</button>
+  <input id="field" placeholder="Type here">
+  <select id="pick"><option value="a">A</option><option value="b">B</option></select>
+  <button id="later" onclick="setTimeout(()=>{const p=document.createElement('p');p.textContent='Arrived ✓';document.body.append(p)},1200)">Make text arrive</button>
+  <div style="height:3000px"></div>
+  <button id="far" onclick="bump('far')">Far button</button>
+</main>
+<pre id="log"></pre>
+<script>
+const c={};function bump(k){c[k]=(c[k]||0)+1;log.textContent=JSON.stringify(c)}
+for(let i=0;i<400;i++){const a=document.createElement('a');a.href='#'+i;a.textContent='Link '+i;a.onclick=e=>{e.preventDefault();bump('link')};nav.append(a)}
+</script>

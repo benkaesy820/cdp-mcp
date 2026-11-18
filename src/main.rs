@@ -2571,3 +2571,85 @@ fn main() {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keys_carry_key_code_and_text() {
+        assert_eq!(key_spec("Enter"), ("Enter".into(), "Enter".into(), 13, Some("\r".into())));
+        assert_eq!(key_spec("a"), ("a".into(), "KeyA".into(), 65, Some("a".into())));
+        assert_eq!(key_spec("7"), ("7".into(), "Digit7".into(), 55, Some("7".into())));
+        assert_eq!(key_spec("F5"), ("F5".into(), "F5".into(), 116, None));
+        assert_eq!(key_spec("escape").0, "Escape");
+        assert_eq!(key_spec("space").1, "Space");
+        // punctuation types itself even without a physical code
+        assert_eq!(key_spec("/").3, Some("/".into()));
+    }
+
+    #[test]
+    fn clip_str_never_splits_a_character() {
+        let s = "é".repeat(10); // two bytes each
+        assert_eq!(clip_str(&s, 5), "éé");
+        assert_eq!(clip_str(&s, 6), "ééé");
+        assert_eq!(clip_str("short", 300), "short");
+    }
+
+    #[test]
+    fn only_loopback_endpoints_are_allowed_by_default() {
+        assert!(is_loopback("http://127.0.0.1:9222"));
+        assert!(is_loopback("http://localhost:9222"));
+        assert!(is_loopback("http://[::1]:9222"));
+        assert!(!is_loopback("http://192.168.1.4:9222"));
+        assert!(!is_loopback("http://example.com:9222"));
+    }
+
+    #[test]
+    fn irreversible_matches_final_confirmations_only() {
+        for l in ["Post", "publish", "Share now", "Send", "Place order", "Delete post"] {
+            assert!(irreversible(l), "{l}");
+        }
+        for l in ["Share", "Postcode", "Sender", "Settings"] {
+            assert!(!irreversible(l), "{l}");
+        }
+    }
+
+    #[test]
+    fn modifier_names_map_to_cdp_bits() {
+        assert_eq!(mod_mask(Some(&json!(["Shift", "ctrl"]))), 8 | 2);
+        assert_eq!(mod_mask(Some(&json!(["Alt", "Meta"]))), 1 | 4);
+        assert_eq!(mod_mask(None), 0);
+    }
+
+    #[test]
+    fn base64_round_trips() {
+        for n in 0..10 {
+            let bytes: Vec<u8> = (0..n * 7 + 1).map(|b| (b * 37) as u8).collect();
+            assert_eq!(b64decode(&b64encode(&bytes)).unwrap(), bytes);
+        }
+        assert!(b64decode("not*base64").is_err());
+    }
+
+    #[test]
+    fn scan_placeholders_are_always_substituted() {
+        // An unsubstituted placeholder is a ReferenceError in the page.
+        for js in [scan_js(None), scan_js(Some("main"))] {
+            assert!(!js.contains("__SCOPE__") && !js.contains("__PICK__"));
+        }
+        assert!(scan_js(Some("main")).contains(r#"const SCOPE = "main";"#));
+    }
+
+    #[test]
+    fn tool_schemas_are_well_formed() {
+        let defs = tool_defs();
+        let names: Vec<&str> = defs.as_array().unwrap().iter()
+            .map(|t| t["name"].as_str().unwrap()).collect();
+        for want in ["status", "tabs", "eval", "elements", "input", "shot", "paste", "flow"] {
+            assert!(names.contains(&want), "{want} missing");
+        }
+        for t in defs.as_array().unwrap() {
+            assert_eq!(t["inputSchema"]["type"], "object", "{}", t["name"]);
+        }
+    }
+}

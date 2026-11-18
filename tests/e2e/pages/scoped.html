@@ -1,0 +1,11 @@
+<!doctype html><meta charset="utf-8"><title>bench 2</title>
+<style>body{margin:0;font:14px sans-serif} #panel{position:fixed;inset:0;overflow:auto} </style>
+<div id="panel">
+  <header><button onclick="hit('header')">Save</button></header>
+  <main><button onclick="hit('main')">Save</button>
+    <select id="sel"><option value="one">One</option><option value="two">Two</option></select>
+    <input id="t" placeholder="combo">
+    <div style="height:4000px"></div><p>panel end</p></main>
+</div>
+<script>const h={};function hit(k){h[k]=(h[k]||0)+1}
+t.addEventListener('keydown',e=>{ if(e.ctrlKey&&e.shiftKey&&e.key.toLowerCase()==='z') h.redo=(h.redo||0)+1 })</script>

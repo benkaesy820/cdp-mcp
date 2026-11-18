@@ -1,0 +1,17 @@
+<!doctype html><meta charset="utf-8"><title>bench 3</title>
+<style>body{margin:0;font:14px sans-serif}#pad{width:300px;height:200px;background:#ddd;touch-action:none}#ta{width:300px;height:60px}#ed{width:300px;min-height:40px;border:1px solid #888}</style>
+<div id="pad" tabindex="0" role="button" aria-label="Pad">pad</div>
+<textarea id="ta" placeholder="Paste text"></textarea>
+<div id="ed" contenteditable="true" aria-label="Paste image"></div>
+<script>
+const R={mouseMoves:0,drag:null,touch:{start:0,move:0,end:0},paste:{}};
+let down=null;
+pad.addEventListener('mousedown',e=>{down=[e.clientX,e.clientY];R.mouseMoves=0});
+pad.addEventListener('mousemove',e=>{if(down)R.mouseMoves++});
+addEventListener('mouseup',e=>{if(down){R.drag={from:down,to:[e.clientX,e.clientY]};down=null}});
+pad.addEventListener('touchstart',e=>{R.touch.start++;R.touch.firstX=e.touches[0].clientX});
+pad.addEventListener('touchmove',e=>{R.touch.move++;R.touch.lastX=e.touches[0].clientX});
+pad.addEventListener('touchend',e=>R.touch.end++);
+addEventListener('paste',e=>{const d=e.clipboardData;R.paste.types=[...d.types];R.paste.files=[...d.files].map(f=>f.type+':'+f.size)});
+ed.addEventListener("paste",e=>{const f=[...e.clipboardData.files][0];if(!f)return;e.preventDefault();const img=new Image();img.src=URL.createObjectURL(f);ed.append(img)});
+</script>
