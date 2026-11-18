@@ -241,20 +241,23 @@ one — the alternative is a second client that has to impersonate the session.
 `conversation-<stamp>.jsonl` archive. Renaming the files without resetting the
 cursor would leave it pointing into a deleted file, so Clear would be a lie.
 
-The older GTK window (`cdp-chat`) (niri: `Mod+Shift+N`) that gives a
-human a way to redirect the agent mid-run without reaching for a terminal. It
-writes `chat.jsonl`; the agent waits on that file with `idle`, which **costs
-nothing while it blocks** — no turns, no polling, no tokens. The reply costs one
-turn. A message is also handed to the running session directly, so it can land
-while the agent is mid-task rather than only at its next wait.
+`Mod+Shift+N` opens the page in your browser. There is no desktop window and no
+helper script: the browser you already have is the client.
 
-`cdp-chat-toggle` starts, raises or stops it (`stop`, `status`). Closing the
-window quits the process: a pidfile checked against the process's own command
-line, never a pattern match.
+### Connections
 
-**Clear deletes the conversation on both sides**, including the agent's read
-cursor, so a cleared chat is not half-remembered by the agent. One archive of the
-whole exchange is kept as `conversation-<stamp>.jsonl`.
+**There is no polling.** The server watches `chat.jsonl` with **inotify** — the
+kernel says when the file is written — and pushes the change to the page over a
+single held-open **Server-Sent Events** connection. The page has no timer and
+makes no repeat requests.
+
+Measured in a real browser: **0 requests in 4 seconds** while the page sat idle,
+and a new message still appeared without one. The first version of this page made
+40 socket connections per 20 polls; the polled version before that made 2 per 1.2 s.
+
+One honest limit: a held-open stream means one thread per connected page. That is
+one browser tab, not one per request, and it is the price of pushing instead of
+asking.
 
 ### Cost
 

@@ -391,25 +391,44 @@
     railMeta.textContent = s.unread ? `${s.size - s.cursor} B queued` : "queue empty";
   }
 
-  async function poll() {
-    try {
-      const [stateRes, msgRes] = await Promise.all([
-        fetch("/api/state", { cache: "no-store" }),
-        fetch("/api/messages", { cache: "no-store" }),
-      ]);
-      if (!stateRes.ok || !msgRes.ok) throw new Error("http " + stateRes.status);
-      renderState(await stateRes.json());
-      const data = await msgRes.json();
+  // ---- push, not poll ----------------------------------------------------
+  // One EventSource, held open. The server writes only when the queue actually
+  // changes, so an idle page costs nothing: no timer, no request, no wakeups.
+  function connect() {
+    const source = new EventSource("/api/events");
+
+    source.onmessage = (ev) => {
+      let data;
+      try { data = JSON.parse(ev.data); } catch { return; }
+      renderState(data);
       render(data.messages || []);
       if (note.dataset.kind === "error") say("");
-    } catch (e) {
-      rail.dataset.state = "idle";
-      railWhat.textContent = "Not connected";
-      railDetail.textContent = "the tool is not serving this page";
-      railMeta.textContent = "";
-      say("Cannot reach the agent's queue: " + e.message, "error");
-    }
+      if (rail.dataset.state !== "offline") return;
+      rail.dataset.state = "waiting";
+    };
+
+    source.onerror = () => {
+      // EventSource reconnects on its own; say so rather than pretending all is
+      // well, and do not start a timer to "retry" — that is polling again.
+      if (source.readyState === EventSource.CLOSED) {
+        rail.dataset.state = "idle";
+        railWhat.textContent = "Not connected";
+        railDetail.textContent = "reconnecting…";
+        say("Lost the connection to the agent's queue; retrying.", "error");
+      }
+    };
+
+    return source;
   }
+
+  let stream = connect();
+  // A hidden tab needs nothing, and the browser throttles it anyway. On return,
+  // the stream is already there; if it died while hidden, reopen it.
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && stream.readyState === EventSource.CLOSED) {
+      stream = connect();
+    }
+  });
 
   form.addEventListener("submit", async (ev) => {
     ev.preventDefault();
@@ -429,7 +448,6 @@
       input.value = "";
       stick = true;
       say("queued — the agent gets it when it waits");
-      await poll();
     } catch (e) {
       say("Not sent: " + e.message, "error");
     } finally {
@@ -445,8 +463,8 @@
       if (!res.ok) throw new Error("http " + res.status);
       const body = await res.json();
       lastRender = "";
+      render([]);
       say(body.archive ? "Cleared — archived " + body.archive : "Cleared");
-      await poll();
     } catch (e) {
       say("Not cleared: " + e.message, "error");
     }
@@ -456,8 +474,6 @@
     stick = log.scrollTop + log.clientHeight >= log.scrollHeight - 60;
   });
 
-  poll();
-  setInterval(poll, 1200);
   input.focus();
 })();
 </script>
