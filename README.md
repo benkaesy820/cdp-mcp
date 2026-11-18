@@ -138,7 +138,7 @@ Options:
 
 ## Tools
 
-Nineteen tools. Every one resolves its own tab, so nothing has to be called
+Eighteen tools. Every one resolves its own tab, so nothing has to be called
 before anything else.
 
 | Tool | What it does |
@@ -148,8 +148,8 @@ before anything else.
 | `eval` | evaluate JavaScript in the page, return JSON, awaits promises |
 | `elements` | visible interactive elements with `{i, tag, role, label, x, y, w, h}` — **inside shadow roots, same-origin frames and cross-origin frames too**; plus `overlays`, `media`, `scroll` |
 | `input` | real input, in order, in one call |
-| `flow` | run steps server-side and repeat until a condition holds — N acts for one turn, and it aborts when a note arrives |
-| `idle` | wait with no polling: until a note, until text appears, or until the page stops changing |
+| `flow` | run steps server-side and repeat until a condition holds — N acts for one turn |
+| `idle` | wait with no polling and no cost while it waits: returns the moment the human types, `untilText` appears, or the page stops changing |
 | `images` | every image on the page with its source and size |
 | `image` | `open` / `link` / `copy` — copy puts real pixels on the clipboard for a real Ctrl+V |
 | `link` | `open` a link (or the current page) in a tab, or `copy` its URL |
@@ -158,7 +158,6 @@ before anything else.
 | `upload` | set a file on an `<input type=file>` |
 | `paste` | type text, or paste an image, into the focused element |
 | `shot` | screenshot to a path — opt-in, because an image costs context |
-| `note` | the human's inbox: `list` (marks seen) and `add` |
 | `report` | file an issue or an idea with version, profile and page attached |
 | `profile` | per-agent settings and a capped memory of what was done |
 | `batch` | several tool calls in one request |
@@ -223,6 +222,23 @@ site isolation, not of this tool.
 // 3. prove it worked
 { "name": "eval", "arguments": { "expression": "document.body.innerText.includes('Hello')" } }
 ```
+
+### Talking to it while it works
+
+`~/.local/bin/cdp-chat` is a small window (niri: `Mod+Shift+N`) that gives a
+human a way to redirect the agent mid-run without reaching for a terminal. It
+writes `chat.jsonl`; the agent waits on that file with `idle`, which **costs
+nothing while it blocks** — no turns, no polling, no tokens. The reply costs one
+turn. A message is also handed to the running session directly, so it can land
+while the agent is mid-task rather than only at its next wait.
+
+`cdp-chat-toggle` starts, raises or stops it (`stop`, `status`). Closing the
+window quits the process: a pidfile checked against the process's own command
+line, never a pattern match.
+
+**Clear deletes the conversation on both sides**, including the agent's read
+cursor, so a cleared chat is not half-remembered by the agent. One archive of the
+whole exchange is kept as `conversation-<stamp>.jsonl`.
 
 ### Cost
 

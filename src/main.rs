@@ -48,103 +48,6 @@ fn data_dir() -> std::path::PathBuf {
         .join("cdp-mcp")
 }
 
-/// How many notes exist, cheaply: a stat(), not a read.
-fn note_count() -> u64 {
-    std::fs::read_to_string(data_dir().join("notes.jsonl"))
-        .map(|b| b.lines().filter(|l| !l.trim().is_empty()).count() as u64)
-        .unwrap_or(0)
-}
-
-/// Messages from the human that this process has not shown the agent yet.
-///
-/// A human typing while the agent works is the whole point of the chat window,
-/// and checking only at the agent's own convenience means a question can sit
-/// unanswered for minutes. So every tool reply carries whatever arrived since
-/// the last one: the agent sees the message attached to the call it was already
-/// about to make, with no extra round trip and nothing to poll.
-///
-/// The cursor is a byte offset into notes.jsonl, and only this function moves
-/// it. A partial final line is not consumed: the writer appends without a lock,
-/// so a half-written line must wait for its newline rather than be read as
-/// truncated JSON and lost.
-fn inbox() -> &'static Mutex<Inbox> {
-    static INBOX: OnceLock<Mutex<Inbox>> = OnceLock::new();
-    INBOX.get_or_init(|| Mutex::new(Inbox { offset: 0, started: false }))
-}
-
-struct Inbox {
-    offset: u64,
-    started: bool,
-}
-
-/// Up to `limit` messages the human has sent since the last call, oldest first.
-fn take_messages(limit: usize) -> Vec<Value> {
-    let path = data_dir().join("notes.jsonl");
-    let body = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(_) => return Vec::new(),
-    };
-    let mut inbox = inbox().lock().unwrap();
-    if !inbox.started {
-        // A cursor file, not "start at the end": the server restarts constantly
-        // (every reload, every crash), and starting at the end threw away
-        // anything typed while it was down — a message delivered to the window
-        // and to this file, and then silently dropped.
-        let cursor = data_dir().join("notes.cursor");
-        inbox.offset = match std::fs::read_to_string(&cursor) {
-            Ok(v) => v.trim().parse::<u64>().unwrap_or(0).min(body.len() as u64),
-            // Genuinely first run: do not replay a day of chat at the agent.
-            Err(_) => body.len() as u64,
-        };
-        inbox.started = true;
-        // Persist the anchor. Without this every restart re-anchors to the end
-        // of the file and silently skips whatever was typed while it was down,
-        // which is the whole reason the cursor exists. Measured: a message
-        // written between two server runs was invisible on the second run.
-        let _ = std::fs::write(&cursor, inbox.offset.to_string());
-        if inbox.offset == body.len() as u64 {
-            return Vec::new();
-        }
-    }
-    if body.len() as u64 <= inbox.offset {
-        // A rotated or truncated file: start over rather than trust the offset.
-        if (body.len() as u64) < inbox.offset {
-            inbox.offset = 0;
-        } else {
-            return Vec::new();
-        }
-    }
-    let tail = &body[inbox.offset as usize..];
-    // Only whole lines: the last chunk without a newline belongs to a writer
-    // that has not finished.
-    let usable = match tail.iter().rposition(|b| *b == b'\n') {
-        Some(n) => n + 1,
-        None => return Vec::new(),
-    };
-    let mut out = Vec::new();
-    for line in String::from_utf8_lossy(&tail[..usable]).lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Ok(v) = serde_json::from_str::<Value>(line) {
-            // Only the human writes here; the agent's own `add` must not be
-            // echoed back to it as a message from the human.
-            if v.get("from").and_then(Value::as_str) == Some("human") {
-                out.push(v);
-            }
-        }
-    }
-    inbox.offset += usable as u64;
-    // Written after the bytes are consumed: a crash between the two replays one
-    // message, which is better than losing it.
-    let _ = std::fs::write(data_dir().join("notes.cursor"), inbox.offset.to_string());
-    if out.len() > limit {
-        out.drain(..out.len() - limit);
-    }
-    out
-}
-
 fn scan_cache() -> &'static Mutex<HashMap<String, Value>> {
     static CACHE: OnceLock<Mutex<HashMap<String, Value>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -248,6 +151,91 @@ fn with_conn<R>(
 /// Set when the client cancels the request being worked on (or goes away).
 /// Long loops check it, so "stop" in the client stops the clicking.
 static CANCELLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The human's line in the chat window, as an offset into `chat.jsonl`.
+///
+/// A blocking call that sleeps on this file costs nothing while it sleeps: no
+/// turns, no polling, no tokens. That is the cheapest possible conversation —
+/// the agent waits in one call, the human types whenever they like, and the wait
+/// returns the moment there is something to read.
+fn chat_offset() -> &'static Mutex<ChatOffset> {
+    static OFF: OnceLock<Mutex<ChatOffset>> = OnceLock::new();
+    OFF.get_or_init(|| Mutex::new(ChatOffset::default()))
+}
+
+#[derive(Default)]
+struct ChatOffset {
+    offset: u64,
+    started: bool,
+}
+
+/// Messages from the window that this process has not returned yet.
+///
+/// The cursor persists in `chat.cursor`, so a restart does not lose a line typed
+/// while it was down, and does not replay history either. A half-written final
+/// line is never consumed: the window appends without a lock.
+fn take_chat(limit: usize) -> Vec<Value> {
+    let path = data_dir().join("chat.jsonl");
+    let body = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    let mut st = chat_offset().lock().unwrap();
+    if !st.started {
+        let cursor = data_dir().join("chat.cursor");
+        st.offset = match std::fs::read_to_string(&cursor) {
+            Ok(v) => v.trim().parse::<u64>().unwrap_or(0).min(body.len() as u64),
+            Err(_) => body.len() as u64,
+        };
+        st.started = true;
+        if st.offset == body.len() as u64 {
+            return Vec::new();
+        }
+    }
+    if (body.len() as u64) < st.offset {
+        st.offset = 0; // the file was replaced
+    }
+    let tail = &body[st.offset as usize..];
+    let usable = match tail.iter().rposition(|b| *b == b'\n') {
+        Some(n) => n + 1,
+        None => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for line in String::from_utf8_lossy(&tail[..usable]).lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(line) {
+            if v.get("from").and_then(Value::as_str) == Some("human") {
+                out.push(v);
+            }
+        }
+    }
+    st.offset += usable as u64;
+    let _ = std::fs::write(data_dir().join("chat.cursor"), st.offset.to_string());
+    if out.len() > limit {
+        out.drain(..out.len() - limit);
+    }
+    out
+}
+
+/// Say something in the chat window. Silent if the window is not installed.
+fn chat_say(text: &str) {
+    use std::io::Write as _;
+    let _ = std::fs::create_dir_all(data_dir());
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_dir().join("talk.jsonl"))
+    {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = writeln!(f, "{}", json!({ "id": ts, "ts": ts, "from": "agent", "text": text }));
+    }
+}
 
 fn check_cancel() -> Result<(), String> {
     if CANCELLED.load(std::sync::atomic::Ordering::Relaxed) {
@@ -621,7 +609,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "idle",
-            "description": "Wait without spinning: sleeps until a note arrives from the human (woke:\"note\"), `untilText` appears (woke:\"text\"), or the page has not changed for `maxIdleMs` (woke:\"idleLimit\"). It does not run forever — the idle bound is what stops it, so a quiet machine costs nothing. Call it between steps of a long unattended run; it is the alternative to sleeping in a loop.",
+            "description": "Wait without spinning, and without costing a turn: a blocking call is free while it blocks. Returns as soon as (a) the human types in the chat window — `woke:\"message\"` with their `message` text, (b) `untilText` appears, or (c) nothing changes for `maxIdleMs` / `timeoutMs` runs out. This is how a conversation works cheaply: wait in one call, answer in one turn.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -629,21 +617,8 @@ fn tool_defs() -> Value {
                     "maxIdleMs": { "type": "integer", "description": "treat the page as idle after this long with no change (defaults to timeoutMs)" },
                     "pollMs": { "type": "integer", "description": "how often to look (default 2000)" },
                     "untilText": { "type": "string", "description": "also wake when this text appears" },
-                    "stopOn": { "type": "string", "enum": ["any", "none"], "description": "whether a human note wakes it (default any)" },
+
                     "tab": { "type": "string" }
-                }
-            }
-        },
-        {
-            "name": "note",
-            "description": "The human's inbox for this agent. `list` (default) returns notes they left while you were working, and marks them seen; `add` writes one. Check it at each step boundary in a long run — it is how they redirect you without interrupting. A plain file, so no web page can reach it.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": { "type": "string", "enum": ["list", "add"], "description": "default list" },
-                    "text": { "type": "string", "description": "for add" },
-                    "limit": { "type": "integer", "description": "for list, default 10" },
-                    "unseen": { "type": "boolean", "description": "for list: only notes not yet read (default true)" }
                 }
             }
         },
@@ -1078,22 +1053,6 @@ fn clip_save() -> Option<(String, Vec<u8>)> {
 
 /// Say something in the chat window. Silent if it is not running: this is a
 /// courtesy, never a dependency.
-pub fn chat_say(text: &str) {
-    use std::io::Write as _;
-    let _ = std::fs::create_dir_all(data_dir());
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(data_dir().join("talk.jsonl"))
-    {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let rec = json!({ "id": ts, "ts": ts, "from": "agent", "text": text });
-        let _ = writeln!(f, "{rec}");
-    }
-}
 
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -1567,21 +1526,8 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
             let mut all = Vec::new();
             let started = std::time::Instant::now();
             let mut hit = false;
-            // A message from the human is a request to stop and look, not
-            // something to discover after fifty more clicks.
-            let notes_at_start = note_count();
             for iteration in 1..=max_iter {
                 check_cancel()?;
-                if note_count() > notes_at_start {
-                    all.push(json!({ "iteration": iteration, "interrupted": "note" }));
-                    return Ok(json!({
-                        "iterations": iteration.saturating_sub(1),
-                        "interrupted": "note",
-                        "elapsedMs": started.elapsed().as_millis() as u64,
-                        "note": "the human sent a message; read it with note{} before continuing",
-                        "trail": all,
-                    }));
-                }
                 let mut iteration_log = Vec::new();
                 for step in &steps {
                     let name = step.get("tool").and_then(Value::as_str).unwrap_or("");
@@ -1641,10 +1587,11 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
             let timeout = args.get("timeoutMs").and_then(Value::as_u64).unwrap_or(600_000);
             let max_idle = args.get("maxIdleMs").and_then(Value::as_u64).unwrap_or(timeout);
             let poll = args.get("pollMs").and_then(Value::as_u64).unwrap_or(2_000).clamp(200, 10_000);
-            let stop_on_note = args.get("stopOn").and_then(Value::as_str).unwrap_or("any") != "none";
+
             let until_text = args.get("untilText").and_then(Value::as_str).map(str::to_string);
             let started = std::time::Instant::now();
-            let notes_at_start = note_count();
+            // Waiting is free: this call costs nothing while it blocks, so the
+            // human can type whenever they like and only the reply costs a turn.
             let mut last_sig = String::new();
             let mut idle_for: u64 = 0;
 
@@ -1662,22 +1609,19 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                     let n = v.get(1).and_then(Value::as_i64).unwrap_or(0);
                     Ok((format!("{url}|{n}"), v.get(2).and_then(Value::as_bool).unwrap_or(false)))
                 }).unwrap_or((String::new(), false));
-                let note_hit = note_count() > notes_at_start;
 
-                // A note is the human speaking: that is the event worth waking
-                // for, and what they said is the whole point of waking. Reading
-                // it here also advances the inbox, so the same message is not
-                // delivered twice.
-                if note_hit && stop_on_note {
-                    let messages = take_messages(20);
-                    chat_say("woken by a note from you");
-                    let text = messages.iter()
+                // The human speaking is the event worth waking for, and their
+                // words are the point of waking.
+                let messages = take_chat(20);
+                if !messages.is_empty() {
+                    let text = messages
+                        .iter()
                         .map(|m| m.get("text").and_then(Value::as_str).unwrap_or("").to_string())
                         .filter(|t| !t.is_empty())
                         .collect::<Vec<_>>()
                         .join("\n");
                     return Ok(json!({
-                        "woke": "note",
+                        "woke": "message",
                         "elapsedMs": started.elapsed().as_millis() as u64,
                         "url": sig.split('|').next().unwrap_or(""),
                         "message": text,
@@ -1707,56 +1651,6 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                     }));
                 }
                 nap(poll)?;
-            }
-        }
-        "note" => {
-            // A human-to-agent inbox. Deliberately a file with normal file
-            // permissions: no port, no socket, nothing a web page can reach.
-            let dir = std::env::var("XDG_DATA_HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|_| std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share"))
-                .join("cdp-mcp");
-            let file = dir.join("notes.jsonl");
-            let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
-            match action {
-                "add" => {
-                    let text = args.get("text").and_then(Value::as_str).ok_or("note needs text")?;
-                    let ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis())
-                        .unwrap_or(0);
-                    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-                    use std::io::Write as _;
-                    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&file)
-                        .map_err(|e| format!("cannot open {}: {e}", file.display()))?;
-                    writeln!(f, "{}", json!({ "id": ts, "ts": ts, "text": text,
-                                               "from": args.get("from").and_then(Value::as_str).unwrap_or("human") }))
-                        .map_err(|e| e.to_string())?;
-                    Ok(json!({ "noted": text, "id": ts }))
-                }
-                "list" => {
-                    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
-                    let unseen_only = args.get("unseen").and_then(Value::as_bool).unwrap_or(true);
-                    let seen_file = dir.join("notes.seen");
-                    let seen: u64 = std::fs::read_to_string(&seen_file).ok()
-                        .and_then(|s| s.trim().parse().ok()).unwrap_or(0);
-                    let body = std::fs::read_to_string(&file).unwrap_or_default();
-                    let mut items: Vec<Value> = body.lines()
-                        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-                        .filter(|v| !unseen_only || v.get("id").and_then(Value::as_u64).unwrap_or(0) > seen)
-                        .collect();
-                    let total = items.len();
-                    let start = total.saturating_sub(limit);
-                    items = items.split_off(start);
-                    // Reading them acknowledges them; the agent says so in its reply.
-                    if let Some(last) = items.last().and_then(|v| v.get("id")).and_then(Value::as_u64) {
-                        std::fs::create_dir_all(&dir).ok();
-                        let _ = std::fs::write(&seen_file, last.to_string());
-                    }
-                    Ok(json!({ "unseen": total, "showing": items.len(), "notes": items,
-                               "path": file.display().to_string() }))
-                }
-                other => Err(format!("unknown note action: {other}")),
             }
         }
         "report" => {
@@ -2850,40 +2744,16 @@ fn main() {
                 if was_cancelled {
                     continue; // the client has stopped listening for this reply
                 }
-                // Whatever the human typed while this call ran rides along with
-                // the reply, so a question never waits for the agent's next
-                // convenient moment. `note` already reports the inbox itself.
-                let pending = if name == "note" { Vec::new() } else { take_messages(20) };
-                let human_note = |blocks: &mut Vec<Value>| {
-                    if pending.is_empty() {
-                        return;
-                    }
-                    let text = pending
-                        .iter()
-                        .map(|m| m.get("text").and_then(Value::as_str).unwrap_or("").to_string())
-                        .filter(|t| !t.is_empty())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    blocks.push(json!({
-                        "type": "text",
-                        "text": format!(
-                            "A message from the human arrived while this ran — read it before continuing, \
-                             and answer it in your next reply:\n{text}"
-                        ),
-                    }));
-                };
                 match result {
                     Ok(v) => {
-                        let mut content = match v.get("__content").and_then(Value::as_array) {
+                        let content = match v.get("__content").and_then(Value::as_array) {
                             Some(blocks) => blocks.clone(),
                             None => vec![json!({ "type": "text", "text": v.to_string() })],
                         };
-                        human_note(&mut content);
                         send(json!({ "jsonrpc": "2.0", "id": id, "result": { "content": content } }));
                     }
                     Err(e) => {
-                        let mut content = vec![json!({ "type": "text", "text": format!("ERROR: {e}") })];
-                        human_note(&mut content);
+                        let content = vec![json!({ "type": "text", "text": format!("ERROR: {e}") })];
                         send(json!({ "jsonrpc": "2.0", "id": id, "result": {
                             "content": content,
                             "isError": true
