@@ -11,41 +11,38 @@ pub const SCAN_JS: &str = r#"(() => {
     el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('title') ||
     el.innerText || el.value || el.getAttribute('name') || ''
   ).trim().replace(/\s+/g, ' ').slice(0, 90);
-  const box = (el) => {
-    const r = el.getBoundingClientRect();
-    return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2),
-             w: Math.round(r.width), h: Math.round(r.height) };
-  };
-  const visible = (el) => {
-    const r = el.getBoundingClientRect();
+  const boxOf = (r) => ({ x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2),
+                          w: Math.round(r.width), h: Math.round(r.height) });
+  const box = (el) => boxOf(el.getBoundingClientRect());
+  const shown = (el, r) => {
     if (r.width < 2 || r.height < 2) return false;
     // checkVisibility is far cheaper than resolving computed style per element
     if (el.checkVisibility && !el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) return false;
     if (r.bottom < -2000 || r.top > innerHeight + 4000) return false;
     return true;
   };
+  const visible = (el) => shown(el, el.getBoundingClientRect());
 
   // ---- interactive elements (absolute index = click target) ----
   // SCOPE limits the scan to a subtree (e.g. "main"), which is the difference
   // between a few dozen candidates and a few thousand on a big page. Overlays
   // below still scan the whole document, because a modal is rarely inside it.
   const SCOPE = __SCOPE__;
+  // PICK = {i, scroll?, select?}: resolve element i of this same scan and act on the
+  // element itself. Indexing by element, not by point, is what makes a click
+  // on something below the fold land: elementFromPoint is null off-screen.
+  const PICK = __PICK__;
   const root = SCOPE ? (document.querySelector(SCOPE) || document) : document;
   const sel = 'a[href], button, input, select, textarea, summary, [role="button"], [role="link"], [role="tab"], [role="menuitem"], [role="checkbox"], [role="radio"], [role="switch"], [role="combobox"], [contenteditable]:not([contenteditable="false"]), [onclick], [tabindex]:not([tabindex="-1"])';
   const elements = [];
   const refs = [];
   for (const el of root.querySelectorAll(sel)) {
-    if (!visible(el)) continue;
-    const b = box(el);
-    const key = [Math.round(b.x), Math.round(b.y), Math.round(b.w)].join(',');
+    const r = el.getBoundingClientRect();
+    if (!shown(el, r)) continue;
+    const b = boxOf(r);
+    const key = b.x + ',' + b.y + ',' + b.w;
     if (seen.has(key)) continue;
     seen.add(key);
-    for (let p = el.parentElement; p; p = p.parentElement) {
-      if (p.getAttribute && (p.getAttribute('role') === 'dialog' || p.getAttribute('aria-modal') === 'true')) {
-        // keep it, but flag it: an element under a dialog is usually not clickable
-        break;
-      }
-    }
     const rec = { i: elements.length, tag: el.tagName.toLowerCase(), label: labelOf(el) };
     // Effective role, derived when the element does not carry one: a plain
     // <a href> *is* a link, and filtering by role would miss every one of them.
@@ -63,12 +60,46 @@ pub const SCAN_JS: &str = r#"(() => {
     if (eff) rec.role = eff;
     if (el.disabled) rec.disabled = true;
     Object.assign(rec, b);
-    const rr = el.getBoundingClientRect();
     // off-screen targets need scrolling before a coordinate click will land
-    if (rr.top < -4 || rr.bottom > innerHeight + 4) rec.off = true;
+    if (r.top < -4 || r.bottom > innerHeight + 4) rec.off = true;
     elements.push(rec);
     refs.push(el);
     if (elements.length >= 600) break;
+    if (PICK && elements.length > PICK.i) break; // later elements cannot shift i
+  }
+
+  if (PICK) {
+    const el = refs[PICK.i];
+    if (!el) return { missing: true, total: elements.length };
+    let r = el.getBoundingClientRect();
+    let scrolled = false;
+    if (PICK.scroll !== false && (r.top < 0 || r.bottom > innerHeight || r.left < 0 || r.right > innerWidth)) {
+      // 'instant' overrides a page's `scroll-behavior: smooth`, which would
+      // otherwise leave the element mid-flight when we measure it.
+      el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+      r = el.getBoundingClientRect();
+      scrolled = true;
+    }
+    const x = r.x + r.width / 2, y = r.y + r.height / 2;
+    const out = { i: PICK.i, tag: elements[PICK.i].tag, label: elements[PICK.i].label,
+                  x: Math.round(x), y: Math.round(y), scrolled };
+    // Would a real click at the centre reach this element, or something on top?
+    const top = document.elementFromPoint(x, y);
+    out.hit = !!top && (top === el || el.contains(top) || top.contains(el));
+    if (!out.hit && top) out.coveredBy = labelOf(top).slice(0, 60) || top.tagName.toLowerCase();
+    const a = el.closest('a[href]') || el.querySelector('a[href]');
+    if (a) out.href = a.href;
+    if (PICK.select !== undefined) {
+      const s = el.tagName === 'SELECT' ? el : el.closest('select');
+      if (!s) { out.selectError = 'not a select'; }
+      else {
+        s.value = PICK.select;
+        s.dispatchEvent(new Event('input', { bubbles: true }));
+        s.dispatchEvent(new Event('change', { bubbles: true }));
+        out.selected = s.value;
+      }
+    }
+    return out;
   }
 
   // ---- overlays: dialogs, alert dialogs, and big fixed/absolute layers ----

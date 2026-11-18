@@ -5,11 +5,11 @@
 //! with no body, so pulling an HTTP stack in would cost more than it saves.
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tungstenite::{connect, stream::MaybeTlsStream, Message, WebSocket};
+use tungstenite::{client::client_with_config, protocol::WebSocketConfig, Message, WebSocket};
 
 pub type Res<T> = Result<T, String>;
 
@@ -239,23 +239,55 @@ pub fn close_tab(endpoint: &str, id: &str) -> Res<()> {
 
 /// An open DevTools connection to one page.
 pub struct Conn {
-    ws: WebSocket<MaybeTlsStream<TcpStream>>,
+    ws: WebSocket<TcpStream>,
     next: i64,
     focus_on: bool,
     timeout_ms: u64,
+    /// The socket itself failed (closed, reset). A timeout does not set this:
+    /// a busy page is still connected and its late reply is skipped by id.
+    pub dead: bool,
+    /// Replies received. `with_conn` compares it across a failure to know
+    /// whether anything reached the page before the socket died, which is the
+    /// only case where running the caller's actions again is safe.
+    pub replies: u64,
+}
+
+fn timeout_from_env() -> u64 {
+    std::env::var("CDP_MCP_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30_000)
 }
 
 impl Conn {
     pub fn open(ws_url: &str) -> Res<Self> {
-        let (ws, _resp) = connect(ws_url).map_err(|e| format!("websocket handshake failed: {e}"))?;
+        // Connect by hand rather than `tungstenite::connect` so every step is
+        // bounded: a wedged browser must fail the call, not hang the server.
+        let authority = ws_url
+            .strip_prefix("ws://")
+            .and_then(|r| r.split('/').next())
+            .ok_or_else(|| format!("unsupported DevTools socket {ws_url}"))?;
+        let addr = authority
+            .to_socket_addrs()
+            .map_err(|e| format!("cannot resolve {authority}: {e}"))?
+            .next()
+            .ok_or_else(|| format!("cannot resolve {authority}"))?;
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+            .map_err(|e| format!("cannot reach {authority}: {e}"))?;
+        stream.set_nodelay(true).ok();
+        stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
+        // Chromium sends a whole screenshot as one frame; the default 16 MiB
+        // frame cap rejects a tall full-page capture.
+        let config = WebSocketConfig::default()
+            .max_message_size(Some(512 << 20))
+            .max_frame_size(Some(512 << 20));
+        let (ws, _resp) = client_with_config(ws_url, stream, Some(config))
+            .map_err(|e| format!("websocket handshake failed: {e}"))?;
         // Bounded so a stuck page cannot hang an agent that was left alone.
         // Configurable per profile with `call_timeout_ms`.
-        let ms = std::env::var("CDP_MCP_TIMEOUT_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(30_000);
-        let mut conn = Conn { ws, next: 0, focus_on: false, timeout_ms: ms };
-        // a page that never answers must not hang the server forever
+        let ms = timeout_from_env();
+        let mut conn = Conn { ws, next: 0, focus_on: false, timeout_ms: ms, dead: false, replies: 0 };
         conn.set_read_timeout(ms);
         // Deliberately NOT calling Runtime.enable / Page.enable: those are
         // per-session state for *events*, which this server ignores. Every
@@ -265,9 +297,53 @@ impl Conn {
     }
 
     fn set_read_timeout(&mut self, ms: u64) {
-        if let MaybeTlsStream::Plain(s) = self.ws.get_mut() {
-            s.set_read_timeout(Some(Duration::from_millis(ms))).ok();
+        self.ws.get_mut().set_read_timeout(Some(Duration::from_millis(ms.max(1)))).ok();
+    }
+
+    /// The next protocol message, answering pings on the way. `waiting` names
+    /// what we are waiting for, so a timeout says which call stalled.
+    fn next_msg(&mut self, waiting: &str, ms: u64) -> Res<Value> {
+        loop {
+            let m = match self.ws.read() {
+                Ok(m) => m,
+                Err(tungstenite::Error::Io(e))
+                    if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) =>
+                {
+                    return Err(format!("{waiting}: no reply within {ms} ms (the page is busy or frozen)"));
+                }
+                Err(e) => {
+                    self.dead = true;
+                    return Err(format!("connection to the page lost: {e}"));
+                }
+            };
+            let v = match m {
+                Message::Text(t) => serde_json::from_str::<Value>(t.as_str()),
+                Message::Binary(b) => serde_json::from_slice::<Value>(&b),
+                Message::Ping(p) => {
+                    let _ = self.ws.send(Message::Pong(p));
+                    continue;
+                }
+                Message::Close(_) => {
+                    self.dead = true;
+                    return Err("the page closed the connection".into());
+                }
+                _ => continue,
+            };
+            if let Ok(v) = v {
+                return Ok(v);
+            }
         }
+    }
+
+    fn send_cmd(&mut self, method: &str, params: &Value) -> Res<i64> {
+        self.next += 1;
+        let id = self.next;
+        let msg = json!({ "id": id, "method": method, "params": params }).to_string();
+        if let Err(e) = self.ws.send(Message::text(msg)) {
+            self.dead = true;
+            return Err(format!("connection to the page lost: {e}"));
+        }
+        Ok(id)
     }
 
     /// Read until a named protocol event arrives, skipping everything else.
@@ -276,28 +352,18 @@ impl Conn {
     /// queued, so this is for a deliberate one-event wait.
     pub fn wait_event(&mut self, method: &str, ms: u64) -> Res<Value> {
         let deadline = std::time::Instant::now() + Duration::from_millis(ms);
-        self.set_read_timeout(ms);
         let out = loop {
-            if std::time::Instant::now() >= deadline {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
                 break Err(format!("no {method} within {ms} ms"));
             }
-            let m = match self.ws.read() {
-                Ok(m) => m,
-                Err(e) => break Err(format!("read failed: {e}")),
-            };
-            let text = match m {
-                Message::Text(t) => t.to_string(),
-                Message::Binary(b) => String::from_utf8_lossy(&b).to_string(),
-                Message::Ping(p) => {
-                    let _ = self.ws.send(Message::Pong(p));
-                    continue;
-                }
-                _ => continue,
-            };
-            if let Ok(v) = serde_json::from_str::<Value>(&text) {
-                if v.get("method").and_then(Value::as_str) == Some(method) {
+            self.set_read_timeout(left.as_millis() as u64);
+            match self.next_msg(method, ms) {
+                Ok(v) if v.get("method").and_then(Value::as_str) == Some(method) => {
                     break Ok(v.get("params").cloned().unwrap_or(Value::Null));
                 }
+                Ok(_) => continue,
+                Err(e) => break Err(e),
             }
         };
         let restore = self.timeout_ms;
@@ -360,32 +426,14 @@ impl Conn {
 
     /// Send one command and wait for its reply, skipping protocol events.
     pub fn call(&mut self, method: &str, params: Value) -> Res<Value> {
-        self.next += 1;
-        let id = self.next;
-        let msg = json!({ "id": id, "method": method, "params": params }).to_string();
-        self.ws
-            .send(Message::text(msg))
-            .map_err(|e| format!("send failed: {e}"))?;
-
+        let id = self.send_cmd(method, &params)?;
+        let ms = self.timeout_ms;
         loop {
-            let m = self.ws.read().map_err(|e| format!("read failed: {e}"))?;
-            let text = match m {
-                Message::Text(t) => t.to_string(),
-                Message::Binary(b) => String::from_utf8_lossy(&b).to_string(),
-                Message::Ping(p) => {
-                    let _ = self.ws.send(Message::Pong(p));
-                    continue;
-                }
-                Message::Close(_) => return Err("the page closed the connection".into()),
-                _ => continue,
-            };
-            let v: Value = match serde_json::from_str(&text) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+            let v = self.next_msg(method, ms)?;
             if v.get("id").and_then(Value::as_i64) != Some(id) {
-                continue; // an event, not our reply
+                continue; // an event, or a late reply to a call that timed out
             }
+            self.replies += 1;
             if let Some(err) = v.get("error") {
                 let m = err.get("message").and_then(Value::as_str).unwrap_or("unknown error");
                 return Err(format!("{method}: {m}"));
@@ -394,51 +442,74 @@ impl Conn {
         }
     }
 
+    /// `call` with its own reply deadline, for a command that legitimately
+    /// takes longer than the default (an in-page wait).
+    pub fn call_within(&mut self, method: &str, params: Value, ms: u64) -> Res<Value> {
+        let saved = self.timeout_ms;
+        self.timeout_ms = ms;
+        self.set_read_timeout(ms);
+        let out = self.call(method, params);
+        self.timeout_ms = saved;
+        self.set_read_timeout(saved);
+        out
+    }
+
     /// Send several commands at once and collect their replies in order.
     /// One round trip instead of one per command: a click is three events, and
     /// waiting for each reply cost more than the events themselves.
     pub fn call_many(&mut self, cmds: &[(&str, Value)]) -> Res<Vec<Value>> {
         let mut ids = Vec::with_capacity(cmds.len());
         for (method, params) in cmds {
-            self.next += 1;
-            let id = self.next;
-            ids.push(id);
-            let msg = json!({ "id": id, "method": method, "params": params }).to_string();
-            self.ws.send(Message::text(msg)).map_err(|e| format!("send failed: {e}"))?;
+            ids.push(self.send_cmd(method, params)?);
         }
-        let mut got: std::collections::HashMap<i64, Value> = std::collections::HashMap::new();
-        while got.len() < ids.len() {
-            let m = self.ws.read().map_err(|e| format!("read failed: {e}"))?;
-            let text = match m {
-                Message::Text(t) => t.to_string(),
-                Message::Binary(b) => String::from_utf8_lossy(&b).to_string(),
-                Message::Ping(pl) => { let _ = self.ws.send(Message::Pong(pl)); continue; }
-                Message::Close(_) => return Err("the page closed the connection".into()),
-                _ => continue,
-            };
-            let v: Value = match serde_json::from_str(&text) { Ok(v) => v, Err(_) => continue };
+        let label = cmds.first().map(|c| c.0).unwrap_or("batched call");
+        let ms = self.timeout_ms;
+        let mut got: Vec<Option<Value>> = vec![None; ids.len()];
+        let mut left = ids.len();
+        let mut first_err: Option<String> = None;
+        while left > 0 {
+            let v = self.next_msg(label, ms)?;
             let Some(id) = v.get("id").and_then(Value::as_i64) else { continue };
-            if !ids.contains(&id) { continue; }
+            let Some(slot) = ids.iter().position(|i| *i == id) else { continue };
+            if got[slot].is_some() {
+                continue;
+            }
+            self.replies += 1;
+            left -= 1;
+            // Drain every reply before failing, so none of them is left on the
+            // socket to be mistaken for the answer to a later call.
             if let Some(err) = v.get("error") {
                 let m = err.get("message").and_then(Value::as_str).unwrap_or("unknown error");
-                return Err(format!("batched call: {m}"));
+                first_err.get_or_insert_with(|| format!("{label}: {m}"));
             }
-            got.insert(id, v.get("result").cloned().unwrap_or(Value::Null));
+            got[slot] = Some(v.get("result").cloned().unwrap_or(Value::Null));
         }
-        Ok(ids.iter().map(|i| got.get(i).cloned().unwrap_or(Value::Null)).collect())
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        Ok(got.into_iter().map(Option::unwrap_or_default).collect())
     }
 
     /// Evaluate JS in the page and return the value as JSON.
     pub fn eval(&mut self, expression: &str) -> Res<Value> {
-        let r = self.call(
-            "Runtime.evaluate",
-            json!({
-                "expression": expression,
-                "returnByValue": true,
-                "awaitPromise": true,
-                "userGesture": true,
-            }),
-        )?;
+        let ms = self.timeout_ms;
+        self.eval_within(expression, ms)
+    }
+
+    /// `eval` for an expression that awaits something in the page, with a
+    /// reply deadline to match.
+    pub fn eval_within(&mut self, expression: &str, ms: u64) -> Res<Value> {
+        let params = json!({
+            "expression": expression,
+            "returnByValue": true,
+            "awaitPromise": true,
+            "userGesture": true,
+        });
+        let r = if ms == self.timeout_ms {
+            self.call("Runtime.evaluate", params)?
+        } else {
+            self.call_within("Runtime.evaluate", params, ms)?
+        };
         if let Some(details) = r.get("exceptionDetails") {
             let text = details
                 .get("exception")
@@ -449,10 +520,5 @@ impl Conn {
             return Err(text.to_string());
         }
         Ok(r.pointer("/result/value").cloned().unwrap_or(Value::Null))
-    }
-
-    pub fn text(&mut self) -> Res<String> {
-        let v = self.eval("(document.body ? document.body.innerText : \"\")")?;
-        Ok(v.as_str().unwrap_or_default().to_string())
     }
 }
