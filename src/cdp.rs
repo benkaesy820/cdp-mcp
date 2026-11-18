@@ -175,6 +175,49 @@ pub fn is_owned(id: &str) -> bool {
     OWNED.lock().map(|s| s.contains(id)).unwrap_or(false)
 }
 
+/// One browser-level connection, kept for the life of the process: opening a
+/// tab used to cost an HTTP lookup and a fresh websocket handshake each time.
+static BROWSER: std::sync::Mutex<Option<Conn>> = std::sync::Mutex::new(None);
+
+/// Run one browser-level command (Target.*) on the shared connection,
+/// reconnecting once if the browser restarted. A retry happens only when the
+/// old socket died before the browser answered, so nothing runs twice.
+fn browser_call(endpoint: &str, method: &str, params: Value) -> Res<Value> {
+    let mut slot = BROWSER.lock().map_err(|_| "browser connection lock poisoned")?;
+    if let Some(conn) = slot.as_mut() {
+        let before = conn.replies;
+        match conn.call(method, params.clone()) {
+            Ok(v) => return Ok(v),
+            Err(e) if !conn.dead => return Err(e),
+            Err(e) if conn.replies != before => {
+                *slot = None;
+                return Err(e);
+            }
+            Err(_) => *slot = None,
+        }
+    }
+    let version = http_json(endpoint, "/json/version", "GET")?;
+    let ws_url = version
+        .get("webSocketDebuggerUrl")
+        .and_then(Value::as_str)
+        .ok_or("the browser exposed no DevTools socket")?
+        .to_string();
+    let mut conn = Conn::open(&ws_url)?;
+    let out = conn.call(method, params);
+    if !conn.dead {
+        *slot = Some(conn);
+    }
+    out
+}
+
+/// The DevTools socket of a page target. Chromium serves every target at
+/// `/devtools/page/<id>`, so a tab we just created is reachable at once,
+/// without waiting for `/json/list` to catch up and report it.
+pub fn page_ws_url(endpoint: &str, id: &str) -> Res<String> {
+    let (authority, base) = split_endpoint(endpoint)?;
+    Ok(format!("ws://{authority}{base}/devtools/page/{id}"))
+}
+
 /// Create a page tab without taking the keyboard away from the human.
 ///
 /// `/json/new` activates the tab it creates, which raises the browser window:
@@ -183,17 +226,7 @@ pub fn is_owned(id: &str) -> bool {
 /// `background: true` creates the tab and leaves the focused window alone.
 /// `foreground: true` is the deliberate exception (show this to the human).
 pub fn new_tab(endpoint: &str, url: &str, foreground: bool) -> Res<String> {
-    let version = http_json(endpoint, "/json/version", "GET")?;
-    let ws_url = version
-        .get("webSocketDebuggerUrl")
-        .and_then(Value::as_str)
-        .ok_or("the browser exposed no DevTools socket")?
-        .to_string();
-    let mut conn = Conn::open(&ws_url)?;
-    let res = conn.call(
-        "Target.createTarget",
-        json!({ "url": url, "background": !foreground }),
-    )?;
+    let res = browser_call(endpoint, "Target.createTarget", json!({ "url": url, "background": !foreground }))?;
     let id = res
         .get("targetId")
         .and_then(Value::as_str)
@@ -201,15 +234,6 @@ pub fn new_tab(endpoint: &str, url: &str, foreground: bool) -> Res<String> {
         .to_string();
     if id.is_empty() {
         return Err(format!("the browser created no target for {url}"));
-    }
-    // The target exists before `/json/list` reports it, and the very next call
-    // resolves it by id: wait the few milliseconds instead of failing with
-    // "tab not found" on a tab the browser has already opened.
-    for _ in 0..50 {
-        if targets(endpoint)?.iter().any(|t| t.id == id) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
     }
     if let Ok(mut owned) = OWNED.lock() {
         owned.insert(id.clone());
@@ -223,14 +247,7 @@ pub fn new_tab(endpoint: &str, url: &str, foreground: bool) -> Res<String> {
 /// next tab and activates the window: measured, focus left the chat window for
 /// Helium on every close. `Target.closeTarget` tears the target down instead.
 pub fn close_tab(endpoint: &str, id: &str) -> Res<()> {
-    let version = http_json(endpoint, "/json/version", "GET")?;
-    let ws_url = version
-        .get("webSocketDebuggerUrl")
-        .and_then(Value::as_str)
-        .ok_or("the browser exposed no DevTools socket")?
-        .to_string();
-    let mut conn = Conn::open(&ws_url)?;
-    conn.call("Target.closeTarget", json!({ "targetId": id }))?;
+    browser_call(endpoint, "Target.closeTarget", json!({ "targetId": id }))?;
     if let Ok(mut owned) = OWNED.lock() {
         owned.remove(id);
     }

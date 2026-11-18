@@ -131,16 +131,24 @@ fn with_conn<R>(
         }
     }
 
-    // cold path: one HTTP lookup, then connect and keep it
-    let target = cdp::resolve(endpoint, tab)?;
-    let mut conn = cdp::Conn::open(&target.ws_url)?;
-    if cdp::is_owned(&target.id) {
+    // cold path: one HTTP lookup, then connect and keep it. A tab this server
+    // opened is connected to directly: its address is known, and `/json/list`
+    // can lag behind a target created a moment ago.
+    let (id, ws_url) = match tab.filter(|t| cdp::is_owned(t)) {
+        Some(t) => (t.to_string(), cdp::page_ws_url(endpoint, t)?),
+        None => {
+            let target = cdp::resolve(endpoint, tab)?;
+            (target.id, target.ws_url)
+        }
+    };
+    let mut conn = cdp::Conn::open(&ws_url)?;
+    if cdp::is_owned(&id) {
         let _ = conn.set_focus_emulation(true);
     }
-    let out = f(&mut conn, &target.id);
-    *last_tab().lock().unwrap() = Some(target.id.clone());
+    let out = f(&mut conn, &id);
+    *last_tab().lock().unwrap() = Some(id.clone());
     if !conn.dead {
-        conn_cache().lock().unwrap().insert(target.id, conn);
+        conn_cache().lock().unwrap().insert(id, conn);
     }
     out
 }
@@ -1619,7 +1627,7 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                         } else if conn.dead {
                             break;
                         }
-                        nap(100)?;
+                        nap(20)?; // a fresh tab is about:blank for a few ms
                     }
                     Ok(())
                 });
@@ -1629,7 +1637,10 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                 if args.get("idle").and_then(Value::as_bool).unwrap_or(false) {
                     let _ = with_conn(&cfg.endpoint, Some(&id), |conn, _| wait_idle(conn, 20_000, 300));
                 }
-                let final_url = cdp::resolve(&cfg.endpoint, Some(&id)).map(|t| t.url).unwrap_or_default();
+                let final_url = with_conn(&cfg.endpoint, Some(&id), |conn, _| conn.eval("location.href"))
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_default();
                 Ok(json!({ "tab": id, "url": final_url, "readyState": ready }))
             }
             "close" => {
