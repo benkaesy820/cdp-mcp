@@ -387,6 +387,16 @@ fn frame_click(
     Ok(())
 }
 
+/// Is this empty scan more likely a page that has not painted yet?
+///
+/// A React app mid-hydration and a genuinely empty document both return no
+/// elements. What tells them apart is how much DOM exists: a page still being
+/// built has nodes but no interactive ones yet, while a truly empty document has
+/// almost nothing at all.
+fn suspect_render(total: u64, nodes: u64) -> bool {
+    total < 3 && nodes < 400
+}
+
 fn fingerprint(e: &Value) -> String {
     format!(
         "{}|{}|{}|{}",
@@ -1871,9 +1881,10 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                     // A near-empty scan on a document with almost nothing in it
                     // is usually a page that has not painted yet, not an empty
                     // page. Saying so costs one field and saves a retry.
-                    "suspect": if total < 3
-                        && scan_v.get("nodes").and_then(Value::as_u64).unwrap_or(0) < 400
-                    {
+                    "suspect": if suspect_render(
+                        total as u64,
+                        scan_v.get("nodes").and_then(Value::as_u64).unwrap_or(0),
+                    ) {
                         json!("page may still be rendering: few nodes, no elements")
                     } else {
                         Value::Null
@@ -2787,6 +2798,19 @@ mod tests {
         assert_eq!(mod_mask(Some(&json!(["Shift", "ctrl"]))), 8 | 2);
         assert_eq!(mod_mask(Some(&json!(["Alt", "Meta"]))), 1 | 4);
         assert_eq!(mod_mask(None), 0);
+    }
+
+    #[test]
+    fn a_bare_document_is_suspected_but_a_loaded_one_is_not() {
+        // Truly empty document: nothing to scan and nothing to hold it up.
+        assert!(suspect_render(0, 2));
+        assert!(suspect_render(0, 399));
+        // A loaded page with no interactive elements (an article, a scoped scan
+        // that matched nothing): many nodes, so this is a real answer.
+        assert!(!suspect_render(0, 812));
+        assert!(!suspect_render(2, 900));
+        // Elements found: never suspect, regardless of node count.
+        assert!(!suspect_render(5, 100));
     }
 
     #[test]
