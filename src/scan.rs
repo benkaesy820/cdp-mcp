@@ -258,6 +258,11 @@ pub const SCAN_JS: &str = r#"(() => {
     media,
     title: document.title.slice(0, 120),
     total: elements.length,
+    // How many nodes the document actually holds, and whether the parser is
+    // done. A React app mid-hydration and a genuinely empty page return the
+    // same empty element list; the node count is what tells them apart.
+    nodes: document.querySelectorAll('*').length,
+    ready: document.readyState,
     overlays,
     elements,
   };

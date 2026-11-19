@@ -138,7 +138,7 @@ Options:
 
 ## Tools
 
-Eighteen tools. Every one resolves its own tab, so nothing has to be called
+Nineteen tools. Every one resolves its own tab, so nothing has to be called
 before anything else.
 
 | Tool | What it does |
@@ -147,9 +147,10 @@ before anything else.
 | `tabs` | `list` · `open {url}` (background, so it never steals focus) · `close {tab}` |
 | `eval` | evaluate JavaScript in the page, return JSON, awaits promises |
 | `elements` | visible interactive elements with `{i, tag, role, label, x, y, w, h}` — **inside shadow roots, same-origin frames and cross-origin frames too**; plus `overlays`, `media`, `scroll` |
+| `text` | the page as readable text, top to bottom; `within` a selector, `limit` characters |
 | `input` | real input, in order, in one call |
 | `flow` | run steps server-side and repeat until a condition holds — N acts for one turn |
-| `idle` | wait with no polling and no cost while it waits: returns the moment the human types, `untilText` appears, or the page stops changing |
+| `idle` | wait with no polling: returns when `untilSelector` matches, `untilText` appears, or the page stops changing |
 | `images` | every image on the page with its source and size |
 | `image` | `open` / `link` / `copy` — copy puts real pixels on the clipboard for a real Ctrl+V |
 | `link` | `open` a link (or the current page) in a tab, or `copy` its URL |
@@ -187,6 +188,18 @@ subtree; the indexes it returns stay valid for `input`.
   { "sleep": { "ms": 300 } }
 ]
 ```
+
+### Knowing a page is still loading
+
+`elements` reports `nodes` (how many DOM nodes exist) and a `suspect` field. When
+a scan finds almost no elements on a document with almost no nodes, `suspect`
+says *"page may still be rendering"* instead of returning an empty list as
+fact. A React app mid-hydration and a genuinely empty page look identical
+otherwise, and the difference cost a retry every time.
+
+`idle { untilSelector: "input[name=email]" }` is the matching wait: it returns
+the moment that element exists, so a form that mounts after navigation does not
+need a guess or a sleep.
 
 ### What it can see through
 

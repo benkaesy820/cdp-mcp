@@ -131,6 +131,21 @@ await withTab(page("gestures.html"), async (tab, ev) => {
   check("paste an image into an editor that reads clipboard files", (await ev("ed.querySelectorAll('img').length")) === 1, await ev("R.paste"));
 });
 
+// ---- reading a page as text, and waiting for a selector -----------------
+// Both were missing and every agent had to hand-write the same JS instead.
+await withTab(page("basic.html"), async (tab, ev) => {
+  const t = (await s.tool("text", { tab })).v;
+  check("text returns what the page says", /Far button/.test(t.text || ""), (t.text || "").slice(0, 60));
+  check("text reports its own size", (t.chars || 0) > 20, t.chars);
+
+  // A selector that is already there must wake immediately, not burn the timeout.
+  const t0 = Date.now();
+  const w = (await s.tool("idle", { tab, untilSelector: "#near", timeoutMs: 8000, pollMs: 300 })).v;
+  const ms = Date.now() - t0;
+  check("idle {untilSelector} wakes on an existing element", w.woke === "selector", w);
+  check("idle {untilSelector} does not wait out the timeout", ms < 2000, ms + " ms");
+});
+
 // ---- shadow DOM and frames --------------------------------------------
 // A page's own script cannot read across a shadow boundary or a site boundary,
 // so these elements were invisible to `elements` and a click had nothing to

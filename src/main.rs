@@ -532,6 +532,7 @@ fn tool_defs() -> Value {
                     "maxIdleMs": { "type": "integer", "description": "treat the page as idle after this long with no change (defaults to timeoutMs)" },
                     "pollMs": { "type": "integer", "description": "how often to look (default 2000)" },
                     "untilText": { "type": "string", "description": "also wake when this text appears" },
+                    "untilSelector": { "type": "string", "description": "also wake when this CSS selector matches something, e.g. input[name=email] or [role=dialog]" },
 
                     "tab": { "type": "string" }
                 }
@@ -587,7 +588,8 @@ fn tool_defs() -> Value {
                     "url": { "type": "string", "description": "for action=open" },
                     "idle": { "type": "boolean", "description": "for action=open: also wait for loading to settle (single-page apps paint after readyState)" },
                     "foreground": { "type": "boolean", "description": "for action=open: bring the tab to the front and focus the browser. Default false, because activating a tab takes the keyboard away from whoever is typing." },
-                    "tab": { "type": "string", "description": "for action=close" }
+                    "tab": { "type": "string", "description": "for action=close" },
+                    "all": { "type": "boolean", "description": "for action=list: include chrome-extension:// pages (default false)" }
                 },
                 "required": ["action"]
             }
@@ -622,6 +624,18 @@ fn tool_defs() -> Value {
                     "unique": { "type": "boolean", "description": "collapse elements that share a label (repeated nav links)" },
                     "within": { "type": "string", "description": "CSS selector to scope the scan, e.g. \"main\" — much cheaper on big pages" },
                     "role": { "type": "string", "description": "only elements with this aria role or tag, e.g. button, link, input" }
+                }
+            }
+        },
+        {
+            "name": "text",
+            "description": "The page as readable text, top to bottom: headings, labels, paragraphs, list items. Use this to find out what a page says or to confirm a sentence is there; use `elements` for what can be clicked. `within` scopes it to a CSS selector (main, article, [role=dialog]); `limit` caps characters (default 4000).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "within": { "type": "string", "description": "CSS selector to read, default body" },
+                    "limit": { "type": "integer", "description": "max characters to return (default 4000)" },
+                    "tab": { "type": "string" }
                 }
             }
         },
@@ -1504,6 +1518,9 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
             let poll = args.get("pollMs").and_then(Value::as_u64).unwrap_or(2_000).clamp(200, 10_000);
 
             let until_text = args.get("untilText").and_then(Value::as_str).map(str::to_string);
+            // Waiting for a thing to exist is the common case a text search
+            // cannot express: a form that has mounted, a dialog that has opened.
+            let until_selector = args.get("untilSelector").and_then(Value::as_str).map(str::to_string);
             let started = std::time::Instant::now();
             let mut last_sig = String::new();
             let mut idle_for: u64 = 0;
@@ -1513,16 +1530,26 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                 // One evaluation per poll: where the page is, how much text it
                 // has, and whether the awaited text is there.
                 let probe = format!(
-                    "[location.href, document.body ? document.body.innerText.length : 0, {}]",
-                    until_text.as_deref().map(has_text_js).unwrap_or_else(|| "false".into())
+                    "[location.href, document.body ? document.body.innerText.length : 0, {}, {}]",
+                    until_text.as_deref().map(has_text_js).unwrap_or_else(|| "false".into()),
+                    until_selector.as_deref().map(|sel| format!(
+                        "(() => {{ try {{ return !!document.querySelector({sel}); }} catch (e) {{ return false; }} }})()",
+                        sel = serde_json::to_string(sel).unwrap_or_else(|_| "null".into())
+                    )).unwrap_or_else(|| "false".into())
                 );
-                let (sig, text_hit) = with_conn(&cfg.endpoint, tab, |conn, _| {
+                let (sig, text_hit, sel_hit) = with_conn(&cfg.endpoint, tab, |conn, _| {
                     let v = conn.eval(&probe)?;
                     let url = v.get(0).and_then(Value::as_str).unwrap_or_default();
                     let n = v.get(1).and_then(Value::as_i64).unwrap_or(0);
-                    Ok((format!("{url}|{n}"), v.get(2).and_then(Value::as_bool).unwrap_or(false)))
-                }).unwrap_or((String::new(), false));
+                    Ok((format!("{url}|{n}"),
+                        v.get(2).and_then(Value::as_bool).unwrap_or(false),
+                        v.get(3).and_then(Value::as_bool).unwrap_or(false)))
+                }).unwrap_or((String::new(), false, false));
 
+                if sel_hit {
+                    return Ok(json!({ "woke": "selector", "untilSelector": until_selector,
+                                      "elapsedMs": started.elapsed().as_millis() as u64 }));
+                }
                 if text_hit {
                     return Ok(json!({ "woke": "text", "untilText": until_text,
                                       "elapsedMs": started.elapsed().as_millis() as u64 }));
@@ -1656,7 +1683,8 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                     let mut out = base;
                     out["browser"] = version.get("Browser").cloned().unwrap_or(Value::Null);
                     out["protocol"] = version.get("Protocol-Version").cloned().unwrap_or(Value::Null);
-                    out["tabs"] = json!(tabs.iter().map(|t| json!({ "tab": t.id, "title": t.title, "url": t.url })).collect::<Vec<_>>());
+                    let pages: Vec<_> = tabs.iter().filter(|t| !t.url.starts_with("chrome-extension://")).collect();
+                    out["tabs"] = json!(pages.iter().map(|t| json!({ "tab": t.id, "title": t.title, "url": t.url })).collect::<Vec<_>>());
                     if tabs.is_empty() {
                         out["hint"] = json!("the browser is running but has no page tabs — open one with tabs {action:\"open\"}");
                     }
@@ -1673,7 +1701,14 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
         "tabs" => match args.get("action").and_then(Value::as_str).unwrap_or("list") {
             "list" => {
                 let tabs = cdp::targets(&cfg.endpoint)?;
-                Ok(json!(tabs.iter().map(|t| json!({ "tab": t.id, "title": t.title, "url": t.url })).collect::<Vec<_>>()))
+                // Extension pages are targets of type "page" but are not
+                // browsing tabs: two of them showed up in every list and had to
+                // be filtered by hand. `all: true` asks for them on purpose.
+                let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
+                Ok(json!(tabs.iter()
+                    .filter(|t| all || !t.url.starts_with("chrome-extension://"))
+                    .map(|t| json!({ "tab": t.id, "title": t.title, "url": t.url }))
+                    .collect::<Vec<_>>()))
             }
             "open" => {
                 let url = args.get("url").and_then(Value::as_str).ok_or("open needs url")?;
@@ -1832,6 +1867,17 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                     // Absent would read as "none", which is a lie when it is
                     // non-zero, so it is always present.
                     "framesScanned": scan_v.get("framesScanned").cloned().unwrap_or(json!(0)),
+                    "nodes": scan_v.get("nodes").cloned().unwrap_or(json!(0)),
+                    // A near-empty scan on a document with almost nothing in it
+                    // is usually a page that has not painted yet, not an empty
+                    // page. Saying so costs one field and saves a retry.
+                    "suspect": if total < 3
+                        && scan_v.get("nodes").and_then(Value::as_u64).unwrap_or(0) < 400
+                    {
+                        json!("page may still be rendering: few nodes, no elements")
+                    } else {
+                        Value::Null
+                    },
                     "elements": shown,
                 });
 
@@ -1844,6 +1890,37 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                     { "type": "image", "data": b64encode(&bytes), "mimeType": mime },
                     { "type": "text", "text": format!("(attached {shot_mode} capture, {} bytes{})", bytes.len(), if clipped { ", clipped to 8000px" } else { "" }) }
                 ]}))
+            })
+        }
+        "text" => {
+            // What the page says, as text. `elements` answers "what can I click";
+            // this answers "what does it say", which is the other half of reading
+            // a page and had no tool until now - every agent call was writing the
+            // same innerText extraction by hand.
+            let within = args.get("within").and_then(Value::as_str).unwrap_or("body").to_string();
+            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(4000) as usize;
+            with_conn(&cfg.endpoint, tab, |conn, tab_id| {
+                let js = format!(
+                    "(() => {{ \
+                       let r = null; \
+                       try {{ r = document.querySelector({sel}); }} catch (e) {{ return null; }} \
+                       r = r || document.body; \
+                       if (!r) return null; \
+                       const t = (r.innerText || '').replace(/\\n{{3,}}/g, '\\n\\n').trim(); \
+                       return t.slice(0, {lim}); \
+                     }})()",
+                    sel = serde_json::to_string(&within).unwrap_or_else(|_| "\"body\"".into()),
+                    lim = limit
+                );
+                let v = conn.eval(&js)?;
+                let text = v.as_str().unwrap_or("").to_string();
+                Ok(json!({
+                    "tab": tab_id,
+                    "within": within,
+                    "chars": text.chars().count(),
+                    "truncated": text.chars().count() >= limit,
+                    "text": text,
+                }))
             })
         }
         "input" => {
