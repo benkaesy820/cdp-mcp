@@ -1716,6 +1716,7 @@ fn wait_page_settled_inner(
         }
     };
     let mut installed = false;
+    let mut first_install = true;
     let mut failing_since: Option<std::time::Instant> = None;
     let mut last_event = started;
 
@@ -1744,6 +1745,15 @@ fn wait_page_settled_inner(
                     Some("installed") => {
                         installed = true;
                         failing_since = None;
+                        // A recovery starts a new quiet clock once the watcher
+                        // is armed. The first arm keeps the clock from the
+                        // wait's start, or a few milliseconds of install time
+                        // would stop `maxIdleMs == timeoutMs` ever being met.
+                        if first_install {
+                            first_install = false;
+                        } else {
+                            last_event = std::time::Instant::now();
+                        }
                         // The size at install is the baseline for textDelta and
                         // for the last-look before calling the page quiet.
                         if let Some(c) = v.get("chars").and_then(Value::as_i64) {
@@ -1821,12 +1831,16 @@ fn wait_page_settled_inner(
                 }
                 Look::NoBinding => {
                     // The page cannot wake us any more. Reinstall rather than
-                    // run the rest of the wait blind, and restart the quiet
-                    // clock: it was measured while nothing could report.
-                    conn.binding = None;
-                    installed = false;
-                    last_event = std::time::Instant::now();
-                    continue;
+                    // run the rest of the wait blind, but not after the
+                    // deadline: that would spend a round trip on a wait that is
+                    // already over. The quiet clock restarts when the watcher is
+                    // actually armed again, not here, so a slow reinstall is not
+                    // counted as quiet time.
+                    if now < deadline {
+                        conn.binding = None;
+                        installed = false;
+                        continue;
+                    }
                 }
                 Look::Miss => {}
             }
@@ -3104,7 +3118,9 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                                 // checking is how a silent no-op passed before.
                                 conn.eval_within(PASTE_SNAP_JS, 1_500)?;
                                 conn.call("Input.insertText", json!({ "text": t }))?;
-                                let v = conn.eval_within(PASTE_LANDED_JS, 1_500)?;
+                                let v = conn
+                                    .eval_within(PASTE_LANDED_JS, 1_500)
+                                    .map_err(|e| format!("the text was inserted, but reading it back failed: {e}"))?;
                                 let ok = v.get("changed").and_then(Value::as_bool).unwrap_or(false);
                                 if !ok {
                                     return Err("the editor did not take the inserted text; a beforeinput handler may be blocking it".into());
