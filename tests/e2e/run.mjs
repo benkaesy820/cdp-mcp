@@ -298,6 +298,18 @@ await withTab(page("chatty.html"), async (tab, ev) => {
   check("a hit on a chatty page is still immediate",
         hit.woke === "selector" && ms < 900 && (hit.appeared || []).some(a => a.label === "Chatty dialog"),
         { woke: hit.woke, ms, appeared: hit.appeared });
+
+  // A text hit on a page that never stops moving: the 50 ms cap must not stop
+  // the wake, only the number of layouts it costs.
+  const tText2 = Date.now();
+  await s.tool("eval", {
+    tab,
+    expression: "(() => { setTimeout(() => { const p = document.createElement('p'); p.textContent = 'Chatty text arrived'; document.body.appendChild(p); }, 220); })()",
+  });
+  const th = (await s.tool("idle", { tab, untilText: "Chatty text arrived", timeoutMs: 4000 })).v;
+  const thMs = Date.now() - tText2;
+  check("a text hit on a moving page still lands quickly",
+        th.woke === "text" && thMs < 900, { woke: th.woke, ms: thMs });
 });
 
 // A cancelled wait used to leave its MutationObserver in the page: it kept
@@ -370,6 +382,58 @@ await withTab(page("basic.html"), async (tab, ev) => {
   const defMs = Date.now() - tDef;
   check("a reveal inside the text-check window is not swallowed",
         def.woke === "text" && defMs < 1200, { woke: def.woke, ms: defMs });
+
+  // A report that lands inside the 80 ms window must be flushed, not dropped:
+  // the last text change is otherwise invisible, and the quiet check then waits
+  // a second full maxIdleMs before it believes the page has stopped.
+  await s.tool("eval", {
+    tab,
+    expression: `(() => {
+      const add = (t) => { const p = document.createElement('p'); p.textContent = t; document.body.appendChild(p); };
+      setTimeout(() => add('tail one'), 120);
+      setTimeout(() => add('tail two'), 150);
+    })()`,
+  });
+  const tTail = Date.now();
+  const tail = (await s.tool("idle", { tab, maxIdleMs: 500, timeoutMs: 4000 })).v;
+  const tailMs = Date.now() - tTail;
+  const tailTexts = (tail.appeared || []).map(a => a.text);
+  check("a report inside the coalescing window is flushed, not dropped",
+        tailTexts.includes("tail one") && tailTexts.includes("tail two") && tailMs < 950,
+        { ms: tailMs, woke: tail.woke, appeared: tailTexts });
+
+  // `checked` is a property, not an attribute: no MutationObserver record. The
+  // last look at the boundary is the only thing that can see it, and it has to
+  // name the element.
+  await s.tool("eval", {
+    tab,
+    expression: `(() => {
+      const i = document.createElement('input');
+      i.type = 'checkbox'; i.id = 'agree'; i.name = 'agree';
+      document.body.appendChild(i);
+      setTimeout(() => { i.checked = true; }, 300);
+    })()`,
+  });
+  const tSel = Date.now();
+  const sel = (await s.tool("idle", { tab, untilSelector: "#agree:checked", maxIdleMs: 700, timeoutMs: 3000 })).v;
+  const selMs = Date.now() - tSel;
+  check("a selector matched by a property change wakes at the boundary",
+        sel.woke === "selector" && selMs < 1600 && (sel.appeared || []).some(a => a.label === "agree"),
+        { woke: sel.woke, ms: selMs, appeared: sel.appeared });
+
+  // Indentation and the whitespace between tags must not eat the label budget.
+  await s.tool("eval", {
+    tab,
+    expression: `(() => {
+      const d = document.createElement('div'); d.id = 'pretty';
+      d.innerHTML = '<div>\\n</div>'.repeat(120) + '<span>Deep label</span>';
+      document.body.appendChild(d);
+    })()`,
+  });
+  const pretty = (await s.tool("idle", { tab, untilSelector: "#pretty", timeoutMs: 3000 })).v;
+  check("a label survives leading whitespace nodes",
+        (pretty.appeared || []).some(a => a.text === "Deep label"),
+        (pretty.appeared || []).map(a => a.text));
 });
 
 s.close();

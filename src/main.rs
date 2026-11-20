@@ -1279,7 +1279,11 @@ fn watch_js(name: &str, until_text: Option<&str>, until_selector: Option<&str>) 
                     const n = w.currentNode;
                     const p = n.parentElement;
                     if (p && p.closest('script,style,noscript,template')) continue;
-                    const t = (n.nodeValue || '').replace(/\s+/g, ' ');
+                    // Trim first: indentation and the whitespace between tags
+                    // otherwise eats the whole budget before the label starts.
+                    const t = (n.nodeValue || '').replace(/\s+/g, ' ').trim();
+                    if (!t) continue;
+                    if (out && out.charAt(out.length - 1) !== ' ') {{ out += ' '; left -= 1; }}
                     out += t.slice(0, Math.max(0, left));
                     left -= t.length;
                 }}
@@ -1319,12 +1323,16 @@ fn watch_js(name: &str, until_text: Option<&str>, until_selector: Option<&str>) 
                 return !!b && (b.innerText || '').indexOf(WANT) >= 0;
             }};
             let stopped = false, added = [], addedCount = 0, removed = 0, obs = null;
-            let lastSent = 0, lastText = 0, textTimer = 0;
+            // Negative, not zero: `performance.now()` restarts at 0 on a
+            // navigation, so a first check compared against 0 could be
+            // suppressed for the first 80 ms of the new document.
+            let lastSent = -1e9, lastText = -1e9, textTimer = 0, sendTimer = 0, dirty = false;
             const send = (o) => {{ try {{ window[NAME](JSON.stringify(o)); }} catch (e) {{}} }};
             const stop = () => {{
                 stopped = true;
                 try {{ if (obs) obs.disconnect(); }} catch (e) {{}}
                 try {{ if (textTimer) clearTimeout(textTimer); }} catch (e) {{}}
+                try {{ if (sendTimer) clearTimeout(sendTimer); }} catch (e) {{}}
                 window.__cdpWatch = null;
             }};
             const snapshot = (t, extra) => {{
@@ -1359,33 +1367,42 @@ fn watch_js(name: &str, until_text: Option<&str>, until_selector: Option<&str>) 
                 if (stopped) return;
                 if (hitSel()) return finish('selector');
                 const now = window.performance ? performance.now() : Date.now();
-                if (!attrOnly) {{
-                    if (hitText()) return finish('text');
-                }} else {{
-                    // An attribute-only batch can reveal text (`hidden` removed,
-                    // a class that un-hides a panel) without any childList
-                    // record. Checking it means reading `innerText`, which
-                    // forces a layout, so it is capped, and a skipped check is
-                    // deferred rather than dropped: if the reveal is the last
-                    // mutation there is nothing else to wake it.
-                    if (WANT !== false) {{
-                        if (now - lastText >= 50) {{
-                            lastText = now;
-                            if (hitText()) return finish('text');
-                        }} else if (!textTimer) {{
-                            textTimer = setTimeout(() => {{
-                                textTimer = 0;
-                                if (stopped) return;
-                                lastText = window.performance ? performance.now() : Date.now();
-                                if (hitText()) finish('text');
-                            }}, 50);
-                        }}
+                if (WANT !== false) {{
+                    const wait = 50 - (now - lastText);
+                    if (wait <= 0) {{
+                        lastText = now;
+                        if (hitText()) return finish('text');
+                    }} else if (!textTimer) {{
+                        textTimer = setTimeout(() => {{
+                            textTimer = 0;
+                            if (stopped) return;
+                            lastText = window.performance ? performance.now() : Date.now();
+                            if (hitText()) finish('text');
+                        }}, Math.max(1, wait));
                     }}
-                    // Attribute churn is not a change. Reporting it would keep a
-                    // page that only toggles classes from ever reaching maxIdleMs.
+                }}
+                // Attribute churn is not a change. Reporting it would keep a
+                // page that only toggles classes from ever reaching maxIdleMs.
+                if (attrOnly) return;
+                const left = 80 - (now - lastSent);
+                if (left > 0) {{
+                    dirty = true;
+                    if (!sendTimer) {{
+                        sendTimer = setTimeout(() => {{
+                            sendTimer = 0;
+                            if (stopped || !dirty) return;
+                            dirty = false;
+                            lastSent = window.performance ? performance.now() : Date.now();
+                            send(snapshot('change'));
+                            added = [];
+                            addedCount = 0;
+                            removed = 0;
+                        }}, Math.max(1, left));
+                    }}
                     return;
                 }}
-                if (now - lastSent < 80) return;
+                if (sendTimer) {{ clearTimeout(sendTimer); sendTimer = 0; }}
+                dirty = false;
                 lastSent = now;
                 send(snapshot('change'));
                 // The payload carries this window's additions, and the server
@@ -1621,18 +1638,23 @@ fn wait_page_settled_inner(
     conn.enable_runtime()?;
 
     let mut settled = Settled::default();
-    // A text wake can be missed if the page's recheck timer was throttled or a
-    // capped check was the last one, so the decision points ask directly
-    // instead of trusting the observer to have spoken.
-    let text_on_page = |conn: &mut cdp::Conn| -> bool {
-        match until_text {
-            Some(w) => conn
-                .eval_within(&has_text_js(w), 1_500)
-                .ok()
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            None => false,
+    // One direct look at each decision point, reusing the installer: on a hit it
+    // names the element and installs nothing, otherwise it replaces the watcher
+    // (which the exit below stops). A wake can be missed when a deferred check
+    // was the last one, or when a selector matches through a property such as
+    // `checked` or `disabled`, which fires no mutation at all.
+    let last_look = |conn: &mut cdp::Conn| -> Option<(String, Value)> {
+        if until_text.is_none() && until_selector.is_none() {
+            return None;
         }
+        let v = conn
+            .eval_within(&watch_js(NAME, until_text, until_selector), 2_000)
+            .ok()?;
+        let kind = v.get("r").and_then(Value::as_str)?;
+        if !(kind == "hit:text" || kind == "hit:selector") {
+            return None;
+        }
+        Some((kind[4..].to_string(), v.get("snap").cloned().unwrap_or(Value::Null)))
     };
     let mut installed = false;
     let mut failing_since: Option<std::time::Instant> = None;
@@ -1727,13 +1749,15 @@ fn wait_page_settled_inner(
         // every quiet default wait report `woke: "timeout"` and claim the page
         // never matched anything.
         if quiet >= max_idle_ms {
-            // A text wake can be missed while the page is throttled; ask once
-            // before calling it quiet, because the answer is visible now.
-            if text_on_page(conn) {
+            // One direct look before calling it quiet: a deferred check whose
+            // page then went silent, or a selector matched through a property
+            // change, would otherwise be reported as a still page.
+            if let Some((kind, snap)) = last_look(conn) {
+                if snap.is_object() {
+                    settled.absorb(&snap);
+                }
                 stop_watch(conn);
-                let mut o = settled.report("text", &started, &last_event);
-                o["note"] = json!("the text was on the page at the quiet decision");
-                return Ok(o);
+                return Ok(settled.report(&kind, &started, &last_event));
             }
             // Last look before calling it quiet: a shadow root or an attribute
             // toggle can move the visible text without a light-DOM record, and
@@ -1760,13 +1784,14 @@ fn wait_page_settled_inner(
             return Ok(o);
         }
         if now >= deadline {
-            // The same last look at the deadline: a wake missed while the page
-            // was throttled must not be reported as "never matched".
-            if text_on_page(conn) {
+            // The same look at the deadline: a missed wake must not be
+            // reported as "the page never matched".
+            if let Some((kind, snap)) = last_look(conn) {
+                if snap.is_object() {
+                    settled.absorb(&snap);
+                }
                 stop_watch(conn);
-                let mut o = settled.report("text", &started, &last_event);
-                o["note"] = json!("the text was on the page when the wait ended");
-                return Ok(o);
+                return Ok(settled.report(&kind, &started, &last_event));
             }
             stop_watch(conn);
             let mut o = settled.report("timeout", &started, &last_event);
