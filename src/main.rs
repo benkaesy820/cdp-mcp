@@ -75,11 +75,45 @@ fn last_tab() -> &'static Mutex<Option<String>> {
 /// answered anything: `f` is usually a list of clicks and keystrokes, and
 /// re-running one that got half-way would click and type twice. Any other
 /// failure is the page's answer, and is returned as it is.
+/// How a dead socket may be retried.
+#[derive(PartialEq)]
+enum Retry {
+    /// Re-run only if nothing reached the page. A half-finished click or key
+    /// sequence must never be repeated.
+    IfUntouched,
+    /// Re-run once on a fresh connection. For a read-only wait nothing can be
+    /// repeated, and starting over is better than failing a ten-minute wait
+    /// because the browser was restarted under it.
+    Always,
+}
+
 fn with_conn<R>(
     endpoint: &str,
     tab: Option<&str>,
+    f: impl FnMut(&mut cdp::Conn, &str) -> Result<R, String>,
+) -> Result<R, String> {
+    with_conn_retry(endpoint, tab, Retry::IfUntouched, f)
+}
+
+/// `with_conn` for a call with no side effects.
+fn with_conn_readonly<R>(
+    endpoint: &str,
+    tab: Option<&str>,
+    f: impl FnMut(&mut cdp::Conn, &str) -> Result<R, String>,
+) -> Result<R, String> {
+    with_conn_retry(endpoint, tab, Retry::Always, f)
+}
+
+fn with_conn_retry<R>(
+    endpoint: &str,
+    tab: Option<&str>,
+    retry: Retry,
     mut f: impl FnMut(&mut cdp::Conn, &str) -> Result<R, String>,
 ) -> Result<R, String> {
+    // A retry must land on the page the first attempt was talking to. With no
+    // tab named, `resolve` would pick whichever page is first in the list, so a
+    // wait that died could silently resume on a different tab.
+    let mut pinned: Option<String> = None;
     let cached_key = {
         let cache = conn_cache().lock().unwrap();
         match tab {
@@ -95,6 +129,7 @@ fn with_conn<R>(
     };
 
     if let Some(k) = cached_key {
+        pinned = Some(k.clone());
         let mut cache = conn_cache().lock().unwrap();
         if let Some(conn) = cache.get_mut(&k) {
             if cdp::is_owned(&k) {
@@ -111,7 +146,7 @@ fn with_conn<R>(
                 }
                 Err(e) if !conn.dead => return Err(e),
                 Err(e) => {
-                    let untouched = conn.replies == before;
+                    let untouched = retry == Retry::Always || conn.replies == before;
                     cache.remove(&k);
                     if !untouched {
                         return Err(format!(
@@ -127,10 +162,11 @@ fn with_conn<R>(
     // cold path: one HTTP lookup, then connect and keep it. A tab this server
     // opened is connected to directly: its address is known, and `/json/list`
     // can lag behind a target created a moment ago.
-    let (id, ws_url) = match tab.filter(|t| cdp::is_owned(t)) {
+    let want = tab.or(pinned.as_deref());
+    let (id, ws_url) = match want.filter(|t| cdp::is_owned(t)) {
         Some(t) => (t.to_string(), cdp::page_ws_url(endpoint, t)?),
         None => {
-            let target = cdp::resolve(endpoint, tab)?;
+            let target = cdp::resolve(endpoint, want)?;
             (target.id, target.ws_url)
         }
     };
@@ -534,13 +570,12 @@ fn tool_defs() -> Value {
         },
         {
             "name": "idle",
-            "description": "Wait without spinning: returns as soon as `untilText` appears, or when the page has stopped changing for `maxIdleMs`. A blocking call is free while it blocks, so use it instead of a sleep loop when waiting for a page.",
+            "description": "Wait without spinning and without asking: a MutationObserver inside the page calls back the moment something changes, so a still page costs no traffic at all and a change is noticed within a few milliseconds instead of on a timer. Returns when `untilText` or `untilSelector` matches, or when the page has been still for `maxIdleMs`. The result names what changed (`appeared`, `dialogs`, `changes`, `textChars`/`textDelta`, `url`, `navigated`), so you usually do not need to scan the page afterwards. Use it instead of a sleep loop when waiting for a page.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "timeoutMs": { "type": "integer", "description": "stop waiting after this long, message or not (default 600000 = 10 min, max 900000)" },
                     "maxIdleMs": { "type": "integer", "description": "treat the page as idle after this long with no change (defaults to timeoutMs)" },
-                    "pollMs": { "type": "integer", "description": "how often to look (default 2000)" },
                     "untilText": { "type": "string", "description": "also wake when this text appears" },
                     "untilSelector": { "type": "string", "description": "also wake when this CSS selector matches something, e.g. input[name=email] or [role=dialog]" },
 
@@ -1145,9 +1180,11 @@ fn drag_path(conn: &mut cdp::Conn, from: (f64, f64), to: (f64, f64), steps: u32)
 /// JS: does the page's text contain `want`? Evaluated in the page, so only a
 /// boolean crosses the socket instead of the whole body text.
 fn has_text_js(want: &str) -> String {
+    // `innerText` only: `textContent` includes inline <script> source, so a wait
+    // for a word the page's own code mentions matched before it was ever shown.
     format!(
         "(() => {{ const w = {w}; const b = document.body; \
-         return !!b && ((b.innerText || '').includes(w) || (b.textContent || '').includes(w)); }})()",
+         return !!b && (b.innerText || '').includes(w); }})()",
         w = Value::String(want.to_string())
     )
 }
@@ -1166,7 +1203,7 @@ fn wait_for_text(conn: &mut cdp::Conn, want: &str, ms: u64) -> Result<bool, Stri
             r#"new Promise((done) => {{
                 const w = {w};
                 const has = () => {{ const b = document.body;
-                    return !!b && ((b.innerText || '').includes(w) || (b.textContent || '').includes(w)); }};
+                    return !!b && (b.innerText || '').includes(w); }};
                 if (has()) return done(true);
                 let queued = false, over = false;
                 const fin = (v) => {{ if (over) return; over = true; obs.disconnect(); clearTimeout(t); done(v); }};
@@ -1189,6 +1226,449 @@ fn wait_for_text(conn: &mut cdp::Conn, want: &str, ms: u64) -> Result<bool, Stri
         }
         if started.elapsed().as_millis() >= ms as u128 {
             return Ok(false);
+        }
+    }
+}
+
+/// Visible size of the page: light-DOM `innerText` plus the text inside shadow
+/// roots, which `innerText` never reaches. Used at install and at the quiet
+/// decision, so both sides compare the same thing.
+const VISIBLE_JS: &str = r#"(() => {
+    const b = document.body;
+    let s = 0;
+    const walk = (r) => {
+        const l = r.querySelectorAll('*');
+        for (let i = 0; i < l.length; i++) {
+            const sr = l[i].shadowRoot;
+            if (sr) { s += (sr.textContent || '').length; walk(sr); }
+        }
+    };
+    walk(document);
+    return [b ? (b.innerText || '').length : 0, s];
+})()"#;
+
+/// The page-side half of `idle`: watch the document and call a binding when
+/// something happens. Nothing here is polled from outside. `MutationObserver`
+/// pushes, and the server only ever reads a socket.
+///
+/// Returns `{r: ...}` because a hit at install time has to hand back a snapshot
+/// in the same reply: a binding call made here would arrive before the command's
+/// own answer and be discarded by `call`, and a report saying "selector" with
+/// nothing else is exactly the case where naming the element is most useful.
+///
+/// One install per wait, and again after a navigation, because the observer dies
+/// with the document while the binding itself survives it (both measured). The
+/// binding is checked rather than assumed, so a browser that drops it is caught
+/// here instead of turning every later wait into a silent timeout.
+fn watch_js(name: &str, until_text: Option<&str>, until_selector: Option<&str>) -> String {
+    let want = until_text.map(|t| Value::String(t.to_string())).unwrap_or(Value::Bool(false));
+    let sel = until_selector.map(|s| Value::String(s.to_string())).unwrap_or(Value::Bool(false));
+    format!(
+        r#"(() => {{
+            const NAME = {name}, WANT = {want}, SEL = {sel};
+            const root = document.documentElement;
+            if (!root) return {{r:'not-ready'}};
+            const SKIP = new Set(['script','style','noscript','template','link','meta','title']);
+            const words = (el) => (el.textContent || '').replace(/\s+/g, ' ').trim();
+            const dialogs = () => document.querySelectorAll('[role="dialog"],[role="alertdialog"],[aria-modal="true"],dialog[open]').length;
+            const describe = (el) => {{
+                if (!el || el.nodeType !== 1) return null;
+                const tag = el.tagName.toLowerCase();
+                if (SKIP.has(tag)) return null;
+                const o = {{ tag: tag }};
+                const role = el.getAttribute('role');
+                if (role) o.role = role;
+                const label = el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('name');
+                if (label) o.label = label.slice(0, 40);
+                const text = words(el).slice(0, 70);
+                if (text) o.text = text;
+                const fields = [];
+                for (const f of el.querySelectorAll('input,select,textarea')) {{
+                    const name = f.getAttribute('name') || f.getAttribute('placeholder') || f.getAttribute('type');
+                    if (name && fields.indexOf(name) < 0) fields.push(name);
+                    if (fields.length >= 4) break;
+                }}
+                if (fields.length) o.fields = fields;
+                return o;
+            }};
+            const hitSel = () => {{
+                if (SEL === false) return false;
+                try {{ return !!document.querySelector(SEL); }} catch (e) {{ return false; }}
+            }};
+            const hitText = () => {{
+                if (WANT === false) return false;
+                const b = document.body;
+                // `innerText`, not `textContent`: textContent includes inline
+                // <script> source, so a search for a word the page's own code
+                // mentions matched before the page ever showed it.
+                return !!b && (b.innerText || '').indexOf(WANT) >= 0;
+            }};
+            let stopped = false, added = [], addedCount = 0, removed = 0, obs = null;
+            const send = (o) => {{ try {{ window[NAME](JSON.stringify(o)); }} catch (e) {{}} }};
+            const stop = () => {{ stopped = true; try {{ if (obs) obs.disconnect(); }} catch (e) {{}} window.__cdpWatch = null; }};
+            const snapshot = (t, extra) => {{
+                const b = document.body;
+                const list = extra || added;
+                return {{ t: t, url: location.href, title: document.title,
+                          chars: b ? (b.innerText || '').length : 0,
+                          added: list, addedCount: extra ? list.length : addedCount,
+                          removed: removed, dialogs: dialogs() }};
+            }};
+            // A hit is a change too: it carries what appeared with it, so a
+            // caller that only wanted to know "a dialog opened" is already done.
+            const finish = (kind) => {{ stop(); send(snapshot(kind)); }};
+            const flush = () => {{
+                if (stopped) return;
+                if (hitSel()) return finish('selector');
+                if (hitText()) return finish('text');
+                send(snapshot('change'));
+            }};
+            // Already there: answer now, and name the thing that matched.
+            if (hitSel()) {{
+                let el = null;
+                try {{ el = document.querySelector(SEL); }} catch (e) {{}}
+                const d = describe(el);
+                return {{ r: 'hit:selector', snap: snapshot('selector', d ? [d] : []) }};
+            }}
+            if (hitText()) return {{ r: 'hit:text', snap: snapshot('text', []) }};
+            // Without the binding nothing could ever wake this wait, and the only
+            // symptom would be a timeout that looks like a quiet page.
+            if (typeof window[NAME] !== 'function') return {{ r: 'nobinding' }};
+            const prev = window.__cdpWatch;
+            if (prev) {{ try {{ prev.stop(); }} catch (e) {{}} window.__cdpWatch = null; }}
+            obs = new MutationObserver((records) => {{
+                added = []; removed = 0;
+                let moved = false;
+                for (const r of records) {{
+                    if (r.type === 'attributes') continue;
+                    const t = r.target && r.target.nodeType === 1 ? r.target : (r.target ? r.target.parentElement : null);
+                    if (t && t.closest && t.closest('script,style,noscript,template')) continue;
+                    moved = true;
+                    addedCount += r.addedNodes.length;
+                    removed += r.removedNodes.length;
+                    for (const n of r.addedNodes) {{
+                        if (added.length >= 6) break;
+                        const d = describe(n);
+                        if (d) added.push(d);
+                    }}
+                }}
+                // An attribute change can be what makes SEL start matching, so it
+                // is only ignored when nothing is being watched for.
+                if (!moved && SEL === false) return;
+                // Flushed straight from the microtask, not on a timer: a
+                // MutationObserver callback is a microtask, while `setTimeout` in
+                // a tab nobody is looking at is throttled (a 200 ms timer measured
+                // 345 ms in a background tab), which would eat the whole win.
+                flush();
+            }});
+            obs.observe(root, {{ subtree: true, childList: true, characterData: true, attributes: true }});
+            window.__cdpWatch = {{ text: WANT, sel: SEL, stop: stop }};
+            const vis = {vis};
+            return {{ r: 'installed', chars: vis[0], shadow: vis[1] }};
+        }})()"#,
+        name = Value::String(name.to_string()),
+        want = want,
+        sel = sel,
+        vis = VISIBLE_JS,
+    )
+}
+
+/// What the wait noticed, accumulated across every pushed change so the caller
+/// does not have to observe the page again afterwards.
+#[derive(Default)]
+struct Settled {
+    changes: u64,
+    appeared: Vec<Value>,
+    seen: std::collections::HashSet<String>,
+    added_count: i64,
+    removed: i64,
+    dialogs: i64,
+    url: String,
+    title: String,
+    chars: i64,
+    /// `None` until the first payload: a baseline of 0 is a real value, and could
+    /// not be told apart from "not measured yet" when this was a plain i64.
+    first_chars: Option<i64>,
+    /// Characters inside shadow roots, which `innerText` cannot see.
+    shadow_chars: i64,
+    navigated: bool,
+}
+
+impl Settled {
+    /// Fold one payload from the page into the running report.
+    fn absorb(&mut self, p: &Value) {
+        self.changes += 1;
+        if let Some(u) = p.get("url").and_then(Value::as_str) {
+            if !self.url.is_empty() && self.url != u {
+                self.navigated = true;
+            }
+            if !u.is_empty() {
+                self.url = u.to_string();
+            }
+        }
+        if let Some(t) = p.get("title").and_then(Value::as_str) {
+            self.title = t.to_string();
+        }
+        if let Some(c) = p.get("chars").and_then(Value::as_i64) {
+            self.chars = c;
+            if self.first_chars.is_none() {
+                self.first_chars = Some(c);
+            }
+        }
+        self.added_count += p.get("addedCount").and_then(Value::as_i64).unwrap_or(0);
+        self.removed += p.get("removed").and_then(Value::as_i64).unwrap_or(0);
+        self.dialogs = self.dialogs.max(p.get("dialogs").and_then(Value::as_i64).unwrap_or(0));
+        if let Some(arr) = p.get("added").and_then(Value::as_array) {
+            for a in arr {
+                // Eight named elements is the token budget for this report; past
+                // that the caller wants a scan, not a list, and `addedCount`
+                // still tells it how many actually arrived.
+                if self.appeared.len() >= 8 {
+                    break;
+                }
+                let key = format!(
+                    "{}|{}|{}",
+                    a.get("tag").and_then(Value::as_str).unwrap_or(""),
+                    a.get("label").and_then(Value::as_str).unwrap_or(""),
+                    a.get("text").and_then(Value::as_str).unwrap_or("")
+                );
+                if self.seen.insert(key) {
+                    self.appeared.push(a.clone());
+                }
+            }
+        }
+    }
+
+    /// Forget the old document. A report about a page that has been navigated
+    /// away from is worse than no report.
+    fn reset_document(&mut self) {
+        self.appeared.clear();
+        self.seen.clear();
+        self.added_count = 0;
+        self.removed = 0;
+        self.dialogs = 0;
+        self.url.clear();
+        self.title.clear();
+        self.chars = 0;
+        self.first_chars = None;
+        self.shadow_chars = 0;
+    }
+
+    fn report(&self, woke: &str, started: &std::time::Instant, last: &std::time::Instant) -> Value {
+        let mut o = json!({
+            "woke": woke,
+            "elapsedMs": started.elapsed().as_millis() as u64,
+            "quietMs": last.elapsed().as_millis() as u64,
+            "changes": self.changes,
+        });
+        if self.navigated {
+            o["navigated"] = json!(true);
+        }
+        if !self.url.is_empty() {
+            o["url"] = json!(self.url);
+        }
+        if !self.title.is_empty() {
+            o["title"] = json!(self.title);
+        }
+        if self.chars > 0 {
+            o["textChars"] = json!(self.chars);
+            if let Some(first) = self.first_chars {
+                if first > 0 && self.chars != first {
+                    o["textDelta"] = json!(self.chars - first);
+                }
+            }
+        }
+        if self.dialogs > 0 {
+            o["dialogs"] = json!(self.dialogs);
+        }
+        if !self.appeared.is_empty() {
+            o["appeared"] = json!(self.appeared);
+        }
+        if self.added_count > self.appeared.len() as i64 {
+            o["addedCount"] = json!(self.added_count);
+        }
+        if self.removed > 0 {
+            o["removed"] = json!(self.removed);
+        }
+        o
+    }
+}
+
+/// Wait for a page to move, woken by the page itself and never asked.
+///
+/// The page installs one `MutationObserver` and calls a CDP binding when
+/// anything appears; this loop just reads the socket. Three consequences:
+/// a page that changes nothing costs zero messages, the wake lands within a few
+/// milliseconds of the mutation (measured 1.4 to 4.8 ms for the event itself),
+/// and every change arrives with what it added, so a caller that only wants to
+/// know "what appeared" never has to scan the page again.
+///
+/// The quiet clock lives here, not in the page: a read timeout is the cheapest
+/// timer there is, and Chromium throttles timers in tabs nobody is looking at.
+///
+/// `started` and `deadline` come from the caller, so a retry after a dropped
+/// socket spends what is left of the wait instead of granting a fresh one.
+fn wait_page_settled(
+    conn: &mut cdp::Conn,
+    until_text: Option<&str>,
+    until_selector: Option<&str>,
+    started: std::time::Instant,
+    deadline: std::time::Instant,
+    max_idle_ms: u64,
+) -> Result<Value, String> {
+    const NAME: &str = "__cdpMCP";
+    // A navigation that happened before this wait says nothing about it.
+    conn.contexts_cleared = false;
+    conn.enable_runtime()?;
+
+    let mut settled = Settled::default();
+    let mut installed = false;
+    let mut failing_since: Option<std::time::Instant> = None;
+    let mut last_event = started;
+
+    // The watcher must not outlive the wait: a live observer keeps pushing into
+    // a socket nobody is reading, and the next tool on this tab pays for it.
+    let stop_watch = |conn: &mut cdp::Conn| {
+        let _ = conn.eval("try{window.__cdpWatch&&window.__cdpWatch.stop()}catch(e){}0");
+    };
+
+    loop {
+        check_cancel()?;
+
+        // Install on the first pass, and again after a document swap: the
+        // observer died with the old document, the binding did not.
+        if !installed || conn.contexts_cleared {
+            if conn.contexts_cleared {
+                conn.contexts_cleared = false;
+                settled.navigated = true;
+                settled.reset_document();
+                last_event = std::time::Instant::now();
+            }
+            // Cached, so this is free unless the page lost it.
+            conn.add_binding(NAME)?;
+            match conn.eval(&watch_js(NAME, until_text, until_selector)) {
+                Ok(v) => match v.get("r").and_then(Value::as_str) {
+                    Some("installed") => {
+                        installed = true;
+                        failing_since = None;
+                        // The size at install is the baseline for textDelta and
+                        // for the last-look before calling the page quiet.
+                        if let Some(c) = v.get("chars").and_then(Value::as_i64) {
+                            settled.chars = c;
+                            if settled.first_chars.is_none() {
+                                settled.first_chars = Some(c);
+                            }
+                        }
+                        settled.shadow_chars = v.get("shadow").and_then(Value::as_i64).unwrap_or(0);
+                    }
+                    Some(kind @ ("hit:text" | "hit:selector")) => {
+                        let kind = kind.to_string();
+                        if let Some(snap) = v.get("snap") {
+                            settled.absorb(snap);
+                            // It was already there when the wait began; that is
+                            // not a change that happened during it.
+                            settled.changes = 0;
+                        }
+                        return Ok(settled.report(&kind[4..], &started, &last_event));
+                    }
+                    Some("nobinding") => {
+                        // The connection believes it installed one; the page says
+                        // otherwise. Re-add on the next pass.
+                        conn.binding = None;
+                        installed = false;
+                        let since = *failing_since.get_or_insert_with(std::time::Instant::now);
+                        if since.elapsed().as_millis() > 5_000 {
+                            return Err("the page would not accept a wake-up binding".into());
+                        }
+                        nap(20)?;
+                        continue;
+                    }
+                    _ => {
+                        // `not-ready`: the new document has not parsed yet.
+                        installed = false;
+                        let since = *failing_since.get_or_insert_with(std::time::Instant::now);
+                        if since.elapsed().as_millis() > 5_000 {
+                            return Err("the page never became ready to watch".into());
+                        }
+                        nap(20)?;
+                        continue;
+                    }
+                },
+                Err(e) if conn.dead => return Err(e),
+                Err(_) => {
+                    installed = false;
+                    let since = *failing_since.get_or_insert_with(std::time::Instant::now);
+                    if since.elapsed().as_millis() > 5_000 {
+                        return Err("the page never became ready to watch".into());
+                    }
+                    nap(20)?;
+                    continue;
+                }
+            }
+        }
+
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            stop_watch(conn);
+            let mut o = settled.report("timeout", &started, &last_event);
+            o["note"] = json!("waited the full timeout; the page never matched what was asked for");
+            return Ok(o);
+        }
+        let quiet = last_event.elapsed().as_millis() as u64;
+        if quiet >= max_idle_ms {
+            // Last look before calling it quiet: a shadow root or an attribute
+            // toggle can move the visible text without a light-DOM record, and
+            // reporting idle mid-render is worse than one extra read.
+            // `innerText` never reaches a shadow root, so a component painting
+            // on its own would look like a still page. Walk them too, once, at
+            // the decision point only.
+            if let Some(a) = conn.eval(VISIBLE_JS).ok().filter(|v| v.is_array()) {
+                let len = a.get(0).and_then(Value::as_i64).unwrap_or(settled.chars);
+                let shadow = a.get(1).and_then(Value::as_i64).unwrap_or(settled.shadow_chars);
+                if (len > 0 && len != settled.chars) || shadow != settled.shadow_chars {
+                    settled.chars = len;
+                    settled.shadow_chars = shadow;
+                    if settled.first_chars.is_none() {
+                        settled.first_chars = Some(len);
+                    }
+                    last_event = std::time::Instant::now();
+                    continue;
+                }
+            }
+            stop_watch(conn);
+            let mut o = settled.report("idleLimit", &started, &last_event);
+            o["note"] = json!("nothing changed for maxIdleMs");
+            return Ok(o);
+        }
+
+        // A local read timeout is the cancellation check and the quiet timer at
+        // once, and it sends nothing: 250 ms with no traffic on a still page.
+        let slice = std::time::Duration::from_millis(250)
+            .min(deadline.saturating_duration_since(now))
+            .min(std::time::Duration::from_millis(max_idle_ms.saturating_sub(quiet)))
+            .as_millis()
+            .max(1) as u64;
+        if let Some(payload) = conn.wait_binding(NAME, slice)? {
+            let p: Value = match payload {
+                Value::String(s) => serde_json::from_str(&s).unwrap_or(Value::Null),
+                other => other,
+            };
+            match p.get("t").and_then(Value::as_str) {
+                Some("text") => {
+                    settled.absorb(&p);
+                    return Ok(settled.report("text", &started, &last_event));
+                }
+                Some("selector") => {
+                    settled.absorb(&p);
+                    return Ok(settled.report("selector", &started, &last_event));
+                }
+                Some("change") => {
+                    settled.absorb(&p);
+                    last_event = std::time::Instant::now();
+                }
+                // An unknown payload is still evidence the page moved.
+                _ => last_event = std::time::Instant::now(),
+            }
         }
     }
 }
@@ -1517,74 +1997,40 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
             }))
         }
         "idle" => {
-            // A wait that can last a long time without spinning and without
-            // hanging forever: it sleeps, and gives up only when the page has
-            // not changed for `maxIdleMs`. Ending early is the caller's business.
             // Two different limits, and conflating them was a bug: how long to
             // wait at all (`timeoutMs`), and how quiet the page must be before
             // describing it as idle (`maxIdleMs`). A page that keeps ticking
             // must not turn a 10-minute wait into an instant one.
             let timeout = args.get("timeoutMs").and_then(Value::as_u64).unwrap_or(600_000);
             let max_idle = args.get("maxIdleMs").and_then(Value::as_u64).unwrap_or(timeout);
-            let poll = args.get("pollMs").and_then(Value::as_u64).unwrap_or(2_000).clamp(200, 10_000);
-
             let until_text = args.get("untilText").and_then(Value::as_str).map(str::to_string);
             // Waiting for a thing to exist is the common case a text search
             // cannot express: a form that has mounted, a dialog that has opened.
             let until_selector = args.get("untilSelector").and_then(Value::as_str).map(str::to_string);
+            // One connection for the whole wait, and a retry if it dies: the wait
+            // clicks nothing, so starting again is always safe. The deadline is
+            // fixed here so a retry spends what is left of it rather than
+            // granting itself a fresh ten minutes.
             let started = std::time::Instant::now();
-            let mut last_sig = String::new();
-            let mut idle_for: u64 = 0;
-
-            loop {
-                check_cancel()?;
-                // One evaluation per poll: where the page is, how much text it
-                // has, and whether the awaited text is there.
-                let probe = format!(
-                    "[location.href, document.body ? document.body.innerText.length : 0, {}, {}]",
-                    until_text.as_deref().map(has_text_js).unwrap_or_else(|| "false".into()),
-                    until_selector.as_deref().map(|sel| format!(
-                        "(() => {{ try {{ return !!document.querySelector({sel}); }} catch (e) {{ return false; }} }})()",
-                        sel = serde_json::to_string(sel).unwrap_or_else(|_| "null".into())
-                    )).unwrap_or_else(|| "false".into())
-                );
-                let (sig, text_hit, sel_hit) = with_conn(&cfg.endpoint, tab, |conn, _| {
-                    let v = conn.eval(&probe)?;
-                    let url = v.get(0).and_then(Value::as_str).unwrap_or_default();
-                    let n = v.get(1).and_then(Value::as_i64).unwrap_or(0);
-                    Ok((format!("{url}|{n}"),
-                        v.get(2).and_then(Value::as_bool).unwrap_or(false),
-                        v.get(3).and_then(Value::as_bool).unwrap_or(false)))
-                }).unwrap_or((String::new(), false, false));
-
-                if sel_hit {
-                    return Ok(json!({ "woke": "selector", "untilSelector": until_selector,
-                                      "elapsedMs": started.elapsed().as_millis() as u64 }));
-                }
-                if text_hit {
-                    return Ok(json!({ "woke": "text", "untilText": until_text,
-                                      "elapsedMs": started.elapsed().as_millis() as u64 }));
-                }
-                if sig == last_sig {
-                    idle_for += poll;
-                    if idle_for >= max_idle {
-                        return Ok(json!({ "woke": "idleLimit", "idleMs": idle_for,
-                                          "elapsedMs": started.elapsed().as_millis() as u64,
-                                          "note": "nothing changed for maxIdleMs; the page or the run is quiet" }));
-                    }
-                } else {
-                    last_sig = sig;
-                    idle_for = 0;
-                }
-                if started.elapsed().as_millis() as u64 >= timeout {
-                    return Ok(json!({
-                        "woke": "timeout",
-                        "elapsedMs": started.elapsed().as_millis() as u64,
-                        "note": "waited the full timeout with nothing to report",
-                    }));
-                }
-                nap(poll)?;
+            let deadline = started + std::time::Duration::from_millis(timeout);
+            let mut v = with_conn_readonly(&cfg.endpoint, tab, |conn, _| {
+                wait_page_settled(
+                    conn,
+                    until_text.as_deref(),
+                    until_selector.as_deref(),
+                    started,
+                    deadline,
+                    max_idle,
+                )
+            })?;
+            // Echo the question: `woke: "selector"` alone does not say which one.
+            if let Some(t) = &until_text {
+                v["untilText"] = json!(t);
             }
+            if let Some(sel) = &until_selector {
+                v["untilSelector"] = json!(sel);
+            }
+            Ok(v)
         }
         "report" => {
             let action = args.get("action").and_then(Value::as_str).unwrap_or("add");

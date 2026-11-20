@@ -152,10 +152,78 @@ await withTab(page("basic.html"), async (tab, ev) => {
 
   // A selector that is already there must wake immediately, not burn the timeout.
   const t0 = Date.now();
-  const w = (await s.tool("idle", { tab, untilSelector: "#near", timeoutMs: 8000, pollMs: 300 })).v;
+  const w = (await s.tool("idle", { tab, untilSelector: "#near", timeoutMs: 8000 })).v;
   const ms = Date.now() - t0;
   check("idle {untilSelector} wakes on an existing element", w.woke === "selector", w);
-  check("idle {untilSelector} does not wait out the timeout", ms < 2000, ms + " ms");
+  check("idle {untilSelector} does not wait out the timeout", ms < 1000, ms + " ms");
+
+  // The page pushes; nothing is polled. A change 600 ms out has to come back
+  // within a few ms of it, so any poll interval at all fails this.
+  await ev("(() => { setTimeout(() => { const d = document.createElement('div'); d.id = 'late'; d.textContent = 'arrived late'; document.body.appendChild(d); }, 600); })()");
+  const t1 = Date.now();
+  const late = (await s.tool("idle", { tab, untilSelector: "#late", timeoutMs: 8000 })).v;
+  const waited = Date.now() - t1;
+  check("idle wakes on a selector that appears mid-wait", late.woke === "selector", late);
+  check("idle wakes within 250 ms of the change, not on a poll tick", waited >= 540 && waited - 600 < 250, waited + " ms");
+  check("idle reports what appeared, so no second scan is needed",
+    JSON.stringify(late.appeared || []).includes("arrived late"), late.appeared);
+
+  // A popup: the report has to name it and its role without a rescan, which is
+  // the whole point of streaming the change back.
+  await ev("(() => { setTimeout(() => { const d = document.createElement('div'); d.id = 'confirm'; d.setAttribute('role','dialog'); d.setAttribute('aria-label','Confirm booking'); d.textContent = 'Are you sure?'; document.body.appendChild(d); }, 400); })()");
+  const pop = (await s.tool("idle", { tab, untilSelector: "[role=dialog]", timeoutMs: 8000 })).v;
+  check("idle wakes on a dialog by role", pop.woke === "selector", pop);
+  check("idle counts the dialog", (pop.dialogs || 0) >= 1, pop);
+  check("idle names the dialog and its label",
+    JSON.stringify(pop.appeared || []).includes("Confirm booking"), pop.appeared);
+
+  await ev("(() => { setTimeout(() => { document.getElementById('late').textContent = 'needle-is-here'; }, 400); })()");
+  const t2 = Date.now();
+  const txt = (await s.tool("idle", { tab, untilText: "needle-is-here", timeoutMs: 8000 })).v;
+  const waited2 = Date.now() - t2;
+  check("idle {untilText} wakes on text that appears mid-wait", txt.woke === "text", txt);
+  check("idle {untilText} wakes promptly too", waited2 >= 360 && waited2 - 400 < 250, waited2 + " ms");
+
+  // A bulk insert has to be summarised: the report is capped, but the count
+  // still says how much actually arrived.
+  await ev("(() => { setTimeout(() => { const ul = document.createElement('ul'); ul.id = 'bulk'; document.body.appendChild(ul); for (let i = 0; i < 40; i++) { const li = document.createElement('li'); li.textContent = 'row ' + i; ul.appendChild(li); } }, 300); })()");
+  const bulk = (await s.tool("idle", { tab, untilSelector: "#bulk", timeoutMs: 8000 })).v;
+  check("idle settles a bulk insert", bulk.woke === "selector", bulk.woke);
+  check("idle names at most eight elements", (bulk.appeared || []).length <= 8, (bulk.appeared || []).length);
+  check("idle still says how many arrived", (bulk.addedCount || 0) >= 40, bulk.addedCount);
+
+  // The quiet clock is the server's own read timeout on a socket, so a limit of
+  // any size is honoured exactly. This is the case an internal slice would break.
+  const q = (await s.tool("idle", { tab, maxIdleMs: 3000, timeoutMs: 8000 })).v;
+  check("idle {maxIdleMs} reports an idle page", q.woke === "idleLimit", q);
+  check("idle {maxIdleMs} above one second is honoured", (q.quietMs || 0) >= 3000 && (q.quietMs || 0) < 3400, q);
+  // A last-look that always thinks something changed would spend a second whole
+  // period before answering.
+  check("idle {maxIdleMs} answers once, not twice", (q.elapsedMs || 0) < 3400, q.elapsedMs);
+  check("idle {maxIdleMs} says nothing changed", q.changes === 0, q.changes);
+
+  // A watcher that outlives its wait keeps pushing into a socket nobody reads,
+  // and the next tool on this tab pays for it.
+  check("idle tears its watcher down when it gives up", (await ev("String(window.__cdpWatch)")) === "null", await ev("typeof window.__cdpWatch"));
+
+  // A shadow root renders without any light-DOM record. Reporting "idle" while
+  // a component is still painting is worse than one extra read, so the quiet
+  // decision looks once before it is made.
+  await ev("(() => { const host = document.createElement('div'); host.id = 'comp'; const root = host.attachShadow({mode:'open'}); root.innerHTML = '<span>starting</span>'; document.body.appendChild(host); setTimeout(() => { root.querySelector('span').textContent = 'component finished rendering'; }, 120); })()");
+  const sh = (await s.tool("idle", { tab, maxIdleMs: 200, timeoutMs: 6000 })).v;
+  // Without the last look it would call the page idle at ~200 ms, before the
+  // component had painted.
+  check("idle does not call a page idle mid-render in a shadow root", sh.woke === "idleLimit" && (sh.elapsedMs || 0) >= 350, { woke: sh.woke, elapsedMs: sh.elapsedMs, textChars: sh.textChars });
+
+  // A navigation destroys the observer. The wait has to resume in the new
+  // document rather than sitting out the timeout.
+  const target = page("scoped.html");
+  await ev(`(() => { setTimeout(() => { location.href = ${JSON.stringify(target)}; }, 400); })()`);
+  const t3 = Date.now();
+  const nav = (await s.tool("idle", { tab, untilSelector: "#panel", timeoutMs: 8000 })).v;
+  const waited3 = Date.now() - t3;
+  check("idle survives a navigation mid-wait", nav.woke === "selector", nav);
+  check("idle resumes in the new document instead of timing out", waited3 < 3000, waited3 + " ms");
 });
 
 // ---- shadow DOM and frames --------------------------------------------

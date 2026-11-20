@@ -273,6 +273,17 @@ pub struct Conn {
     /// page's own script cannot see into them; each needs its own session.
     oopifs: Vec<(String, String, String)>,
     auto_attach: bool,
+    /// `Runtime.enable` has been called on this connection.
+    runtime_on: bool,
+    /// The binding this connection has installed, so it is added once.
+    pub binding: Option<String>,
+    /// Set by `next_msg` when a read hit its deadline rather than failing. A
+    /// timeout and a broken socket must not be told apart by a string.
+    pub timed_out: bool,
+    /// Set when the page announced that its execution contexts are gone
+    /// (`Runtime.executionContextsCleared`, which is what a navigation sends).
+    /// Everything installed in the document died with it.
+    pub contexts_cleared: bool,
 }
 
 fn timeout_from_env() -> u64 {
@@ -311,12 +322,12 @@ impl Conn {
         // Configurable per profile with `call_timeout_ms`.
         let ms = timeout_from_env();
         let mut conn = Conn { ws, next: 0, focus_on: false, timeout_ms: ms, dead: false, replies: 0,
-                              oopifs: Vec::new(), auto_attach: false };
+                              oopifs: Vec::new(), auto_attach: false, runtime_on: false,
+                              binding: None, timed_out: false, contexts_cleared: false };
         conn.set_read_timeout(ms);
-        // Deliberately NOT calling Runtime.enable / Page.enable: those are
-        // per-session state for *events*, which this server ignores. Every
-        // command used here works without them, and each enable costs a round
-        // trip on connect.
+        // No domain is enabled on connect: each enable costs a round trip, and
+        // most commands do not need one. `enable_runtime` turns on the Runtime
+        // domain the first time a wait needs its events, and only then.
         Ok(conn)
     }
 
@@ -327,12 +338,14 @@ impl Conn {
     /// The next protocol message, answering pings on the way. `waiting` names
     /// what we are waiting for, so a timeout says which call stalled.
     fn next_msg(&mut self, waiting: &str, ms: u64) -> Res<Value> {
+        self.timed_out = false;
         loop {
             let m = match self.ws.read() {
                 Ok(m) => m,
                 Err(tungstenite::Error::Io(e))
                     if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) =>
                 {
+                    self.timed_out = true;
                     return Err(format!("{waiting}: no reply within {ms} ms (the page is busy or frozen)"));
                 }
                 Err(e) => {
@@ -388,6 +401,10 @@ impl Conn {
                     }
                 }
             }
+            // A navigation, or a document swap. Everything the page was holding
+            // for us is gone, including any observer. The binding itself
+            // survives (measured), so only the installer has to run again.
+            Some("Runtime.executionContextsCleared") => self.contexts_cleared = true,
             _ => {}
         }
     }
@@ -483,6 +500,76 @@ impl Conn {
 
     pub fn stop_frames(&mut self) {
         let _ = self.call("Page.stopScreencast", json!({}));
+    }
+
+    /// Turn the Runtime domain on once per connection.
+    ///
+    /// Enabling costs a round trip (measured 16 ms on first call) and then makes
+    /// the page's own events flow: `Runtime.bindingCalled` is how a wait is
+    /// woken without asking anything, and `executionContextsCleared` is how a
+    /// navigation announces that the page's state is gone.
+    pub fn enable_runtime(&mut self) -> Res<()> {
+        if !self.runtime_on {
+            self.call("Runtime.enable", json!({}))?;
+            self.runtime_on = true;
+        }
+        Ok(())
+    }
+
+    /// Install a page-side binding the page can call to wake this server.
+    ///
+    /// Added once and never removed: the probe showed it survives navigation
+    /// (`typeof window.__name === 'function'` in the new document), so a rename
+    /// is the only reason to pay the 8 ms again.
+    pub fn add_binding(&mut self, name: &str) -> Res<()> {
+        if self.binding.as_deref() == Some(name) {
+            return Ok(());
+        }
+        self.call("Runtime.addBinding", json!({ "name": name }))?;
+        self.binding = Some(name.to_string());
+        Ok(())
+    }
+
+    /// Block until the page calls `name`, with nothing sent to the page.
+    ///
+    /// `Ok(None)` means the wait elapsed. That return value is the clock the
+    /// caller uses for "the page has gone quiet", so the page never has to run a
+    /// timer of its own and a page that changes nothing costs zero traffic: this
+    /// is a local read timeout on a socket, not a question.
+    pub fn wait_binding(&mut self, name: &str, ms: u64) -> Res<Option<Value>> {
+        let deadline = std::time::Instant::now() + Duration::from_millis(ms.max(1));
+        let out = loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break Ok(None);
+            }
+            let left = left.as_millis().max(1) as u64;
+            self.set_read_timeout(left);
+            match self.next_msg(name, left) {
+                Ok(v) => {
+                    if v.get("method").and_then(Value::as_str) == Some("Runtime.bindingCalled")
+                        && v.pointer("/params/name").and_then(Value::as_str) == Some(name)
+                    {
+                        break Ok(Some(v.pointer("/params/payload").cloned().unwrap_or(Value::Null)));
+                    }
+                    // A document swap means whatever the caller installed is
+                    // gone. Returning now lets it reinstall immediately instead
+                    // of sitting out the whole read timeout first.
+                    if self.contexts_cleared {
+                        break Ok(None);
+                    }
+                    // Any other event: keep waiting for ours.
+                }
+                // A read timeout is the clock, not a failure. Any other error is
+                // a real one: mistaking it for "the wait elapsed" would report
+                // success where the connection had actually gone.
+                Err(_) if self.timed_out => break Ok(None),
+                Err(e) => break Err(e),
+            }
+        };
+        let restore = self.timeout_ms;
+        self.set_read_timeout(restore);
+        out
     }
 
     /// Tell Chromium to keep this tab rendering while it is not the one on
