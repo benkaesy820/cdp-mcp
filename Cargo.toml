@@ -1,6 +1,6 @@
 [package]
 name = "cdp-mcp"
-version = "0.10.6"
+version = "0.10.7"
 edition = "2021"
 description = "A tiny MCP server that drives your own Chromium browser over the DevTools protocol."
 license = "MIT"
@@ -20,3 +20,8 @@ lto = true
 codegen-units = 1
 panic = "abort"
 opt-level = "z"
+
+[features]
+# Off by default. Enables the two options a careful deployment should not need:
+# non-loopback CDP endpoints and the system clipboard paste. See README, Security.
+experimental = []

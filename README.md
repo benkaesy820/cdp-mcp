@@ -58,39 +58,34 @@ default profile, so give it a dedicated `--user-data-dir` if the flag is ignored
 
 ## Install
 
-**Prebuilt (recommended).** One static binary, no runtime:
+v1 ships as source. There are no release binaries or installer scripts yet.
+
+**From source** (Rust 1.88+):
 
 ```sh
-# Linux / macOS
-curl -LsSf https://github.com/benkaesy/cdp-mcp/releases/latest/download/cdp-mcp-installer.sh | sh
-
-# Windows (PowerShell)
-irm https://github.com/benkaesy/cdp-mcp/releases/latest/download/cdp-mcp-installer.ps1 | iex
+git clone https://github.com/benkaesy820/cdp-mcp
+cd cdp-mcp
+cargo build --release --target x86_64-unknown-linux-musl
+install -m 755 target/x86_64-unknown-linux-musl/release/cdp-mcp ~/.local/bin/cdp-mcp
 ```
 
-**With Cargo** (Rust 1.88+):
+**With Cargo:**
 
 ```sh
-cargo install cdp-mcp
-```
-
-**From source**, if you want to read it first:
-
-```sh
-git clone https://github.com/benkaesy/cdp-mcp && cd cdp-mcp
-cargo build --release      # target/release/cdp-mcp
+cargo install --git https://github.com/benkaesy820/cdp-mcp
 ```
 
 That is the whole install. One binary, no runtime, nothing to keep updated.
+v1 is Linux x86-64. The browser may be on any platform; the tool itself is not.
 
 ### What is verified, and what is not
 
 | platform | status |
 |---|---|
-| **Linux x86_64 — Arch, Debian/Ubuntu, Fedora, Alpine** | **one static binary, used daily; everything below measured here** |
-| Linux aarch64 | builds in CI; not run by hand |
-| macOS | builds in CI; **never run** |
-| Windows | builds in CI; **never run** |
+| **Linux x86_64 (Arch, Debian/Ubuntu, Fedora, Alpine)** | **one static musl binary, used daily; everything below measured here** |
+| Linux aarch64 | not built |
+| macOS | not built or run |
+| Windows | not built or run |
 
 ### Why one Linux binary covers every distro
 
@@ -254,13 +249,31 @@ without spending a turn.
 **CDP has no authentication.** Anything that can reach the port controls the
 browser completely — every cookie, every session, everything open.
 
-- The default endpoint is loopback, and a non-loopback endpoint is **refused**
-  unless you pass `--allow-remote`.
+- The default endpoint is loopback, and a non-loopback endpoint is **refused**.
+  `--allow-remote` exists only in an experimental build, and CDP has no auth.
 - Never expose the port: no tunnel route, no reverse proxy, no
   `--remote-debugging-address=0.0.0.0`. If you are using Cloudflare Tunnel or
   ngrok, do not add a route to `127.0.0.1:9222`.
 - Close the browser when you are done if the machine is shared, or start it
   without the flag when you are not automating.
+
+## Builds
+
+The default build is the careful one:
+
+- a non-loopback CDP endpoint is refused, and `--allow-remote` exits with an
+  error;
+- `paste { method: "system" }` is refused; page paste works everywhere.
+
+Some features are real but easy to misuse, so they live in an experimental build
+you make yourself:
+
+```sh
+cargo build --release --features experimental
+```
+
+That build accepts `--allow-remote` and the system clipboard paste. Read
+Security first. Nothing experimental is published as a release.
 
 ## Limits
 
@@ -291,6 +304,11 @@ browser completely — every cookie, every session, everything open.
 - Drag is one round trip per interpolation step, deliberately: batching the
   moves makes Chromium coalesce them into a single jump, and a slider or a
   signature field needs the path.
+
+## Fork it, make it yours
+
+Fork it and change it for your machine: your browser, your desktop, your tools.
+Go wild with it. The only ask is a star on the repo if it saves you time.
 
 ## Licence
 

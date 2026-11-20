@@ -452,7 +452,7 @@ fn help() -> String {
          USAGE:\n  cdp-mcp [--cdp URL] [--allow-remote]\n\n\
          OPTIONS:\n\
          \x20 --cdp URL        DevTools endpoint (default {DEFAULT_ENDPOINT})\n\
-         \x20 --allow-remote   permit a non-loopback endpoint (dangerous: CDP has no auth)\n\
+         \x20 --allow-remote   permit a non-loopback endpoint (experimental builds only; CDP has no auth)\n\
          \x20 -h, --help       print this\n\
          \x20 -V, --version    print the version\n\n\
          The browser must be started with --remote-debugging-port=9222.\n"
@@ -533,6 +533,13 @@ fn is_loopback(endpoint: &str) -> bool {
         .map(|(h, _)| h)
         .unwrap_or("");
     matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1")
+}
+
+/// A non-loopback endpoint is refused unless the build opted into the
+/// experimental feature and the caller passed the flag. CDP has no auth, so
+/// this is the one guard that must not be on by default.
+fn remote_allowed(loopback: bool, requested: bool) -> bool {
+    loopback || (requested && cfg!(feature = "experimental"))
 }
 
 /* ------------------------------- the tools ------------------------------- */
@@ -2981,6 +2988,13 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
             if method != "page" && method != "system" {
                 return Err(format!("unknown paste method {method:?} (page or system)"));
             }
+            if method == "system" && !cfg!(feature = "experimental") {
+                return Err(
+                    "method:system is only in experimental builds; use method:page, or build with \
+                     --features experimental"
+                        .into(),
+                );
+            }
             let mime = match path.as_deref() {
                 Some(p) => {
                     let ext = std::path::Path::new(p).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
@@ -3387,11 +3401,18 @@ fn main() {
             }
         }
     }
-    if !is_loopback(&endpoint) && !allow_remote {
+    if allow_remote && !cfg!(feature = "experimental") {
+        eprintln!(
+            "cdp-mcp: --allow-remote is an experimental build feature.\n\
+             CDP has no authentication, so this build refuses non-loopback endpoints.\n\
+             Build with `cargo build --features experimental` if you mean it."
+        );
+        std::process::exit(3);
+    }
+    if !remote_allowed(is_loopback(&endpoint), allow_remote) {
         eprintln!(
             "cdp-mcp: refusing non-loopback endpoint {endpoint}.\n\
-             CDP has no authentication: anything that can reach it controls your browser.\n\
-             Pass --allow-remote if you genuinely mean it."
+             CDP has no authentication: anything that can reach it controls your browser."
         );
         std::process::exit(3);
     }
@@ -3552,6 +3573,14 @@ mod tests {
         for l in ["Share", "Postcode", "Sender", "Settings"] {
             assert!(!irreversible(l), "{l}");
         }
+    }
+
+    #[test]
+    fn a_non_loopback_endpoint_needs_the_experimental_feature() {
+        assert!(remote_allowed(true, false));
+        assert!(remote_allowed(true, true));
+        assert!(!remote_allowed(false, false));
+        assert_eq!(remote_allowed(false, true), cfg!(feature = "experimental"));
     }
 
     #[test]

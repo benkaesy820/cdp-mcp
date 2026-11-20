@@ -5,7 +5,7 @@ Every number and line here is a measured fact, typeset rather than filmed, so th
 text stays crisp at X's bitrate and nothing is faked to look like a capture.
 
 Needs: python3, rsvg-convert, ffmpeg, Noto Sans Mono.
-Output: video/out/cdp-mcp-0.10.6.mp4 (32 s, 1920x1080, 30 fps, silent).
+Output: video/out/cdp-mcp-0.10.7.mp4 (1920x1080, 30 fps, silent).
 """
 
 import html
@@ -17,7 +17,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 OUT = HERE / "out"
 CARDS = OUT / "cards"
-MP4 = OUT / "cdp-mcp-0.10.6.mp4"
+MP4 = OUT / "cdp-mcp-0.10.7.mp4"
+VERSION = "0.10.7"
 
 BG = "#0e1012"
 FG = "#f2f4f6"
@@ -28,10 +29,11 @@ X = 160
 FONT = "Noto Sans Mono, monospace"
 
 
-def el(s, size, fill, x=X, y=0, weight="normal"):
+def el(s, size, fill, x=X, y=0, weight="normal", anchor="start"):
     return (
         f'<text x="{x}" y="{y}" font-family="{FONT}" font-size="{size}" '
-        f'font-weight="{weight}" fill="{fill}">{html.escape(s)}</text>'
+        f'font-weight="{weight}" fill="{fill}" text-anchor="{anchor}" '
+        f'xml:space="preserve">{html.escape(s)}</text>'
     )
 
 
@@ -41,7 +43,7 @@ def frame(kicker, title, body, caption, diagram=False, tools=False):
         f'<rect x="0" y="0" width="1920" height="4" fill="{ACCENT}"/>',
         el(kicker, 26, ACCENT, y=150),
         el(title, 88, FG, y=270, weight="600"),
-        el("cdp-mcp 0.10.6", 22, MUTED, y=1036),
+        el(f"cdp-mcp {VERSION}", 22, MUTED, y=1036),
         f'<text x="1760" y="1036" text-anchor="end" font-family="{FONT}" '
         f'font-size="22" fill="{MUTED}">v1 · Linux x86-64</text>',
     ]
@@ -61,14 +63,15 @@ def frame(kicker, title, body, caption, diagram=False, tools=False):
         parts.append(el("one change: one wake, named", 30, MID, y=756))
     elif tools:
         names = [
-            "tabs", "eval", "elements",
-            "input", "upload", "shot",
-            "paste", "idle", "flow",
-            "status", "report",
+            "flow", "idle", "report", "batch",
+            "status", "tabs", "eval", "elements",
+            "text", "input", "upload", "paste",
+            "images", "clip", "link", "image",
+            "download", "profile", "shot",
         ]
         for i, name in enumerate(names):
-            col, row = i % 3, i // 3
-            parts.append(el(name, 38, MID, x=X + col * 540, y=400 + row * 76))
+            col, row = i % 4, i // 4
+            parts.append(el(name, 30, MID, x=X + col * 420, y=380 + row * 68))
     else:
         for line in body:
             parts.append(el(line, 38, MID, y=y))
@@ -82,41 +85,49 @@ def frame(kicker, title, body, caption, diagram=False, tools=False):
 
 CARDS_SPEC = [
     dict(
-        id="01-title", dur=3.2, kicker="01 / THE TOOL", title="cdp-mcp 0.10.6",
+        id="01-title", dur=3.0, kicker="01 / THE TOOL", title=f"cdp-mcp {VERSION}",
         body=["a browser tool for agents,", "as one binary"],
         caption="MCP over stdio · drives a real browser over CDP",
     ),
     dict(
-        id="02-binary", dur=3.6, kicker="02 / THE BINARY", title="1,111,616 bytes",
+        id="02-binary", dur=3.5, kicker="02 / THE BINARY", title="1,111,616 bytes",
         body=["static-pie · stripped · musl · x86-64",
               "no Node · no Playwright · no extension"],
-        caption="One file. The browser is already logged in.",
+        caption="One file. Nothing to install beside it.",
     ),
     dict(
-        id="03-idle", dur=3.6, kicker="03 / AT REST", title="1.3 MB resident",
+        id="03-attached", dur=3.5, kicker="03 / ATTACHED", title="your browser",
+        body=["already logged in", "no new profile · no extension"],
+        caption="Every session is already there.",
+    ),
+    dict(
+        id="04-idle", dur=3.5, kicker="04 / AT REST", title="1.3 MB resident",
         body=["1 process", "0.0% CPU between calls"],
         caption="It sits still until a page moves.",
     ),
     dict(
-        id="04-waits", dur=5.0, kicker="04 / WAITS", title="the page pushes",
+        id="05-waits", dur=5.0, kicker="05 / WAITS", title="the page pushes",
         body=[], diagram=True,
         caption="A still page sends zero messages.",
     ),
     dict(
-        id="05-tools", dur=3.8, kicker="05 / TOOLS", title="11 tools",
+        id="06-tools", dur=4.0, kicker="06 / TOOLS", title="19 tools",
         body=[], tools=True,
-        caption="One MCP server, one browser.",
+        caption="Every tool resolves its own tab. Nothing to thread through.",
     ),
     dict(
-        id="06-built", dur=4.0, kicker="06 / BUILT ON", title="one laptop",
-        body=["CachyOS · Wayland · kernel 7.3.4",
-              "niri-git · Noctalia 5.5.0",
-              "Helium 0.21.3.1 · Chromium 157",
-              "Ryzen 5 PRO 4650U · 7.1 GiB"],
-        caption="Benchmarked on the machine it runs on.",
+        id="07-built", dur=3.5, kicker="07 / BUILT ON", title="CachyOS · Wayland",
+        body=["niri-git · Noctalia 5.5.0",
+              "Helium 0.21.3.1 · Chromium 157"],
+        caption="A Linux desktop, not a server farm.",
     ),
     dict(
-        id="07-limits", dur=6.0, kicker="07 / LIMITS", title="v1, stated plainly",
+        id="08-install", dur=4.0, kicker="08 / INSTALL", title="one MCP entry",
+        body=['"cdp": {', '  "command": ["cdp-mcp"]', "}"],
+        caption="stdio · no extension · no relay",
+    ),
+    dict(
+        id="09-limits", dur=6.0, kicker="09 / LIMITS", title="v1, stated plainly",
         body=[
             "Linux x86-64 only",
             "one browser endpoint, real profile",
@@ -128,11 +139,9 @@ CARDS_SPEC = [
         caption="Network tracking is the next known gap.",
     ),
     dict(
-        id="08-now", dur=2.8, kicker="08 / NOW", title="first version",
-        body=["running on one PC today",
-              "other Linux distros should work",
-              "other OSes next"],
-        caption="static binary · Chromium-family browser",
+        id="10-yours", dur=3.5, kicker="10 / YOURS", title="fork it, go wild",
+        body=["tweak it for your machine", "one ask: a star"],
+        caption="github.com/benkaesy820/cdp-mcp",
     ),
 ]
 
@@ -161,14 +170,16 @@ def main():
             check=True,
         )
         lines += [f"file '{png_path}'", f"duration {spec['dur']}"]
+    total = sum(spec["dur"] for spec in CARDS_SPEC)
     list_path = OUT / "list.txt"
     list_path.write_text("\n".join(lines) + "\n")
-    total = sum(spec["dur"] for spec in CARDS_SPEC)
     subprocess.run(
         [
             "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_path),
-            "-vf", "fps=30,format=yuv420p", "-tune", "stillimage",
-            "-t", f"{total:.3f}",
+            "-vf",
+            f"fps=30,format=yuv420p,drawbox=x=0:y=1074:w='iw*t/{total}':h=4:"
+            "color=#7ee787@0.55:t=fill",
+            "-tune", "stillimage", "-t", f"{total:.3f}",
             "-c:v", "libx264", "-preset", "slow", "-crf", "19",
             "-movflags", "+faststart", "-an", str(MP4),
         ],
