@@ -1,6 +1,6 @@
 [package]
 name = "cdp-mcp"
-version = "0.10.4"
+version = "0.10.5"
 edition = "2021"
 description = "A tiny MCP server that drives your own Chromium browser over the DevTools protocol."
 license = "MIT"
