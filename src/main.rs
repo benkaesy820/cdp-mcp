@@ -1415,10 +1415,14 @@ fn watch_js(name: &str, until_text: Option<&str>, until_selector: Option<&str>, 
                 removed = 0;
             }};
             // A previous wait that ended badly can leave its observer running.
-            // Stop it before the hit checks below, which return early and would
-            // otherwise never reach the install that replaces it.
-            const prev = window.__cdpWatch;
-            if (prev) {{ try {{ prev.stop(); }} catch (e) {{}} window.__cdpWatch = null; }}
+            // Stop it before the hit checks, which return early and would
+            // otherwise never reach the install that replaces it. Probe mode
+            // must not run this: it would kill the watcher it is checking for,
+            // and a miss returns without installing a new one.
+            if ({install}) {{
+                const prev = window.__cdpWatch;
+                if (prev) {{ try {{ prev.stop(); }} catch (e) {{}} window.__cdpWatch = null; }}
+            }}
             // Already there: answer now, and name the thing that matched.
             if (hitSel()) {{
                 let el = null;
@@ -1614,6 +1618,22 @@ const PASTE_LANDED_JS: &str = r#"(() => {
     delete window.__cdpPaste;
     if (!p) return { changed: false };
     return { changed: read(el) !== p.text || (p.sel === 'range' && sel(el) === 'caret') };
+})()"#;
+
+/// Snapshot the focused editor before an insert, so the next
+/// `PASTE_LANDED_JS` can tell whether the text actually landed.
+const PASTE_SNAP_JS: &str = r#"(() => {
+    let el = document.activeElement || document.body;
+    while (el && el.shadowRoot && el.shadowRoot.activeElement) el = el.shadowRoot.activeElement;
+    const read = (n) => (n && n.isContentEditable) ? ((n.innerText) || '')
+        : ((n && typeof n.value === 'string') ? n.value : '');
+    const sel = (n) => {
+        if (n && typeof n.selectionStart === 'number') return n.selectionEnd > n.selectionStart ? 'range' : 'caret';
+        const s = window.getSelection();
+        return s && !s.isCollapsed ? 'range' : 'caret';
+    };
+    window.__cdpPaste = { text: read(el), sel: sel(el) };
+    return true;
 })()"#;
 
 /// Wait for a page to move, woken by the page itself and never asked.
@@ -2938,6 +2958,9 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
             if path.is_none() && text.is_none() {
                 return Err("paste needs path (a file) or text".into());
             }
+            if text.as_deref() == Some("") {
+                return Err("paste text is empty".into());
+            }
             let method = args.get("method").and_then(Value::as_str).unwrap_or("page").to_string();
             if method != "page" && method != "system" {
                 return Err(format!("unknown paste method {method:?} (page or system)"));
@@ -3028,7 +3051,7 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                             // treat a collapsed range as a replacement even when
                             // the text came out identical.
                             const changed = read(el) !== before || (selBefore === 'range' && sel(el) === 'caret');
-                            if (handled && text !== null && !changed) window.__cdpPaste = {{ text: before, sel: selBefore }};
+                            if (editable && handled && text !== null && !changed) window.__cdpPaste = {{ text: before, sel: selBefore }};
                             const out = {{ handled, target: el.tagName.toLowerCase(), changed, editable }};
                             // A file nobody took as a paste: offer it as a drop,
                             // which is how most upload areas accept files.
@@ -3077,7 +3100,19 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                             if landed {
                                 how = "paste event (delayed)";
                             } else {
+                                // Verify the insert: a beforeinput handler can
+                                // block it, and reporting success without
+                                // checking is how a silent no-op passed before.
+                                conn.eval_within(PASTE_SNAP_JS, 1_500)?;
                                 conn.call("Input.insertText", json!({ "text": t }))?;
+                                let ok = conn
+                                    .eval_within(PASTE_LANDED_JS, 1_500)
+                                    .ok()
+                                    .and_then(|v| v.get("changed").and_then(Value::as_bool))
+                                    .unwrap_or(false);
+                                if !ok {
+                                    return Err("the editor did not take the inserted text; a beforeinput handler may be blocking it".into());
+                                }
                                 how = "inserted as typed text";
                             }
                         } else if r.get("dropped").and_then(Value::as_bool) == Some(true) {

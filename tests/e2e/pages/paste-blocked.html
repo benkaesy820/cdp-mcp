@@ -1,0 +1,12 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>paste blocked</title>
+<!-- insertText reaches the page but a beforeinput handler refuses it. The tool
+     must report that, not claim the text landed. -->
+<body>
+<div id="ed" contenteditable="true">start</div>
+<script>
+  document.getElementById('ed').addEventListener('beforeinput', (e) => {
+    if (e.inputType === 'insertText') e.preventDefault();
+  });
+</script>

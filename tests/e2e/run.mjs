@@ -421,6 +421,26 @@ await withTab(page("basic.html"), async (tab, ev) => {
         sel.woke === "selector" && selMs < 1600 && (sel.appeared || []).some(a => a.label === "agree"),
         { woke: sel.woke, ms: selMs, appeared: sel.appeared });
 
+  // The boundary probe must leave the watcher alive. A shadow-root change is
+  // invisible to the light-DOM observer, so the quiet check looks, finds it and
+  // continues; the later light-DOM change must still wake the same wait.
+  await s.tool("eval", {
+    tab,
+    expression: `(() => {
+      const host = document.createElement('div'); host.id = 'shadowhost';
+      const sr = host.attachShadow({ mode: 'open' });
+      sr.innerHTML = '<span>one</span>';
+      document.body.appendChild(host);
+      setTimeout(() => { sr.querySelector('span').textContent = 'two-two-two'; }, 350);
+      setTimeout(() => { const d = document.createElement('div'); d.setAttribute('role','dialog'); d.setAttribute('aria-label','After probe'); document.body.appendChild(d); }, 700);
+    })()`,
+  });
+  const tProbe = Date.now();
+  const probeHit = (await s.tool("idle", { tab, untilSelector: "[aria-label='After probe']", maxIdleMs: 500, timeoutMs: 3000 })).v;
+  const probeMs = Date.now() - tProbe;
+  check("the boundary probe leaves the watcher alive",
+        probeHit.woke === "selector" && probeMs < 860, { woke: probeHit.woke, ms: probeMs });
+
   // Indentation and the whitespace between tags must not eat the label budget.
   await s.tool("eval", {
     tab,
@@ -478,6 +498,15 @@ await withTab(page("paste-async.html"), async (tab, ev) => {
   check("an async paste handler is not double-pasted",
         r.via === "paste event (delayed)" && got === "startby the async handler",
         { via: r.via, got });
+});
+
+// The insert can be blocked after the paste event was refused. Success must
+// mean the text actually landed.
+await withTab(page("paste-blocked.html"), async (tab, ev) => {
+  await ev("document.getElementById('ed').focus()");
+  const bad = await s.tool("paste", { tab, text: "will not land" });
+  check("a blocked insert is an error, not a fake success",
+        !bad.ok && /did not take/.test(String(bad.v)), { ok: bad.ok, v: String(bad.v).slice(0, 140) });
 });
 
 s.close();
