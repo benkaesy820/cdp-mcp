@@ -671,6 +671,7 @@ fn tool_defs() -> Value {
                 "properties": {
                     "path": { "type": "string", "description": "absolute local path" },
                     "selector": { "type": "string", "description": "CSS selector for the file input (default input[type=file])" },
+                    "index": { "type": "integer", "description": "which match to use when several inputs share the selector (default 0). An avatar and a banner on one form are the common case." },
                     "tab": { "type": "string" }
                 },
                 "required": ["path"]
@@ -2251,22 +2252,30 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
         "upload" => {
             let path = args.get("path").and_then(Value::as_str).ok_or("upload needs path")?.to_string();
             let selector = args.get("selector").and_then(Value::as_str).unwrap_or("input[type=file]").to_string();
+            // Pages often carry several identical file inputs (an avatar and a
+            // banner on the same form). Picking the first match silently uploads
+            // to the wrong one, so the caller can name which.
+            let index = args.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
             if !std::path::Path::new(&path).exists() {
                 return Err(format!("no such file: {path}"));
             }
             with_conn(&cfg.endpoint, tab, |conn, tab_id| {
                 let doc = conn.call("DOM.getDocument", json!({ "depth": 0, "pierce": true }))?;
                 let root = doc.pointer("/root/nodeId").and_then(Value::as_u64).ok_or("no document")?;
-                let found = conn.call("DOM.querySelector", json!({ "nodeId": root, "selector": selector }));
-                let node = found.ok().and_then(|v| v.get("nodeId").and_then(Value::as_u64)).unwrap_or(0);
+                let found = conn.call("DOM.querySelectorAll", json!({ "nodeId": root, "selector": selector }));
+                let node = found
+                    .ok()
+                    .and_then(|v| v.get("nodeIds").and_then(Value::as_array).cloned())
+                    .and_then(|ids| ids.get(index).and_then(Value::as_u64))
+                    .unwrap_or(0);
                 if node == 0 {
                     let n = conn.eval("document.querySelectorAll('input[type=file]').length")
                         .ok().and_then(|v| v.as_i64()).unwrap_or(0);
-                    return Err(format!("no element matched {selector} ({n} file inputs on the page). \
+                    return Err(format!("no element matched {selector} at index {index} ({n} file inputs on the page). \
                         If the picker only exists after clicking a button, click it first."));
                 }
                 conn.call("DOM.setFileInputFiles", json!({ "nodeId": node, "files": [path] }))?;
-                Ok(json!({ "tab": tab_id, "uploaded": path, "selector": selector, "ok": true }))
+                Ok(json!({ "tab": tab_id, "uploaded": path, "selector": selector, "index": index, "ok": true }))
             })
         }
         "paste" => {

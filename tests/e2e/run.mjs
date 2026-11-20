@@ -131,6 +131,18 @@ await withTab(page("gestures.html"), async (tab, ev) => {
   check("paste an image into an editor that reads clipboard files", (await ev("ed.querySelectorAll('img').length")) === 1, await ev("R.paste"));
 });
 
+// ---- choosing which file input receives an upload ---------------------
+// A form with an avatar and a banner has two identical file inputs. Picking the
+// first match silently uploads to the wrong one.
+await withTab(page("upload.html"), async (tab, ev) => {
+  const r = (await s.tool("upload", {
+    tab, path: join(here, "pages", "red.png"), selector: "input[type=file]", index: 1,
+  })).v;
+  const counts = await ev("[...document.querySelectorAll('input[type=file]')].map(i => i.files.length)");
+  check("upload honours the index when several inputs match", JSON.stringify(counts) === "[0,1]", counts);
+  check("upload reports which index it used", r.index === 1, r);
+});
+
 // ---- reading a page as text, and waiting for a selector -----------------
 // Both were missing and every agent had to hand-write the same JS instead.
 await withTab(page("basic.html"), async (tab, ev) => {
