@@ -1821,9 +1821,11 @@ fn wait_page_settled_inner(
                 }
                 Look::NoBinding => {
                     // The page cannot wake us any more. Reinstall rather than
-                    // run the rest of the wait blind.
+                    // run the rest of the wait blind, and restart the quiet
+                    // clock: it was measured while nothing could report.
                     conn.binding = None;
                     installed = false;
+                    last_event = std::time::Instant::now();
                     continue;
                 }
                 Look::Miss => {}
@@ -3091,11 +3093,8 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                             let mut landed = false;
                             if handled {
                                 nap(50)?;
-                                landed = conn
-                                    .eval_within(PASTE_LANDED_JS, 2_000)
-                                    .ok()
-                                    .and_then(|v| v.get("changed").and_then(Value::as_bool))
-                                    .unwrap_or(false);
+                                let v = conn.eval_within(PASTE_LANDED_JS, 2_000)?;
+                                landed = v.get("changed").and_then(Value::as_bool).unwrap_or(false);
                             }
                             if landed {
                                 how = "paste event (delayed)";
@@ -3105,11 +3104,8 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                                 // checking is how a silent no-op passed before.
                                 conn.eval_within(PASTE_SNAP_JS, 1_500)?;
                                 conn.call("Input.insertText", json!({ "text": t }))?;
-                                let ok = conn
-                                    .eval_within(PASTE_LANDED_JS, 1_500)
-                                    .ok()
-                                    .and_then(|v| v.get("changed").and_then(Value::as_bool))
-                                    .unwrap_or(false);
+                                let v = conn.eval_within(PASTE_LANDED_JS, 1_500)?;
+                                let ok = v.get("changed").and_then(Value::as_bool).unwrap_or(false);
                                 if !ok {
                                     return Err("the editor did not take the inserted text; a beforeinput handler may be blocking it".into());
                                 }
