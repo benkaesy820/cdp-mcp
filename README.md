@@ -58,7 +58,20 @@ default profile, so give it a dedicated `--user-data-dir` if the flag is ignored
 
 ## Install
 
-v1 ships as source. There are no release binaries or installer scripts yet.
+**Interactive installer (recommended):**
+
+```sh
+git clone https://github.com/benkaesy820/cdp-mcp
+cd cdp-mcp
+./install.sh
+```
+
+It finds OpenCode and Claude Code, asks whether to install for every project or
+only one, then installs the binary, the MCP entry, and the skill for each harness.
+Non-interactive: `./install.sh --global --yes` or `./install.sh --project DIR --yes`.
+
+The manual path, if you want it:
+
 
 **From source** (Rust 1.88+):
 

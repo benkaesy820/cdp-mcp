@@ -26,16 +26,23 @@ every login is already there.
 
 ## Install
 
-From source (no release binaries yet):
+From the checkout, run the installer:
 
 ```sh
-git clone https://github.com/benkaesy820/cdp-mcp
-cd cdp-mcp
+./install.sh
+```
+
+It finds OpenCode and Claude Code, asks whether to install for every project or
+only one, then installs the binary, the MCP entry, and this skill. For scripts:
+`./install.sh --global --yes` or `./install.sh --project DIR --yes`.
+
+Manual fallback:
+`cargo install --git https://github.com/benkaesy820/cdp-mcp`, or build and copy:
+
+```sh
 cargo build --release --target x86_64-unknown-linux-musl
 install -m 755 target/x86_64-unknown-linux-musl/release/cdp-mcp ~/.local/bin/cdp-mcp
 ```
-
-Or: `cargo install --git https://github.com/benkaesy820/cdp-mcp`.
 
 ## Configure the agent
 
