@@ -304,21 +304,42 @@ await withTab(page("chatty.html"), async (tab, ev) => {
 // reading innerText on every mutation and pushing into a socket nobody read,
 // for the rest of the tab's life.
 await withTab(page("basic.html"), async (tab, ev) => {
+  // The main server is inside the wait, and it is single-threaded, so a second
+  // MCP process is the only honest way to observe the page mid-wait.
+  const probe = server(bin);
+  await probe.rpc("initialize", { protocolVersion: "2024-11-05" });
+  const watching = async () => (await probe.tool("eval", { tab, expression: "!!window.__cdpWatch" })).v?.value;
+
   const id = s.nextId();
   s.p.stdin.write(JSON.stringify({
     jsonrpc: "2.0", id, method: "tools/call",
     params: { name: "idle", arguments: { tab, untilSelector: "[data-never]", timeoutMs: 30000 } },
   }) + "\n");
   await sleep(300);
+  const armed = await watching();
+  check("the cancelled wait had installed its observer", armed === true, armed);
   s.notify("notifications/cancelled", { requestId: id });
   await sleep(800);
   const left = await ev("!!window.__cdpWatch");
   check("a cancelled wait leaves no observer behind", left === false, left);
+  probe.close();
 
   // maxIdleMs defaults to timeoutMs, so both thresholds land on the same pass.
   const still = (await s.tool("idle", { tab, maxIdleMs: 400, timeoutMs: 400 })).v;
   check("a quiet wait at the timeout boundary says idle, not timeout",
-        still.woke === "idleLimit" && still.changes === 0, still);
+        still.woke === "idleLimit" && still.changes === 0 && still.elapsedMs >= 380, still);
+
+  // Attribute churn is not activity: a text wait used to treat every toggled
+  // class as a change, so a page that only churns attributes could never reach
+  // maxIdleMs and ran to the full timeout instead.
+  await s.tool("eval", {
+    tab,
+    expression: "(() => { const d = document.createElement('div'); d.id = 'churn'; document.body.appendChild(d); window.__churn = setInterval(() => d.setAttribute('data-n', String(Date.now())), 20); })()",
+  });
+  const churn = (await s.tool("idle", { tab, untilText: "never appears here", maxIdleMs: 800, timeoutMs: 4000 })).v;
+  check("attribute churn is not activity for a text wait",
+        churn.woke === "idleLimit" && churn.elapsedMs < 2000, churn);
+  await s.tool("eval", { tab, expression: "clearInterval(window.__churn)" });
 
   // Text that appears by removing an attribute produces no childList record.
   const tText = Date.now();
@@ -330,6 +351,25 @@ await withTab(page("basic.html"), async (tab, ev) => {
   const revMs = Date.now() - tText;
   check("text revealed by an attribute wakes the wait",
         rev.woke === "text" && revMs < 1200, { woke: rev.woke, ms: revMs });
+
+  // The reveal can land inside the 50 ms window opened by unrelated attribute
+  // churn. A skipped check must be deferred, not dropped: when the reveal is
+  // the last mutation, nothing else would ever wake the wait.
+  const tDef = Date.now();
+  await s.tool("eval", {
+    tab,
+    expression: `(() => {
+      const d = document.createElement('div');
+      d.id = 'deferred'; d.hidden = true; d.textContent = 'Deferred reveal';
+      document.body.appendChild(d);
+      setTimeout(() => d.setAttribute('data-noise', '1'), 200);
+      setTimeout(() => { d.hidden = false; }, 220);
+    })()`,
+  });
+  const def = (await s.tool("idle", { tab, untilText: "Deferred reveal", timeoutMs: 3000 })).v;
+  const defMs = Date.now() - tDef;
+  check("a reveal inside the text-check window is not swallowed",
+        def.woke === "text" && defMs < 1200, { woke: def.woke, ms: defMs });
 });
 
 s.close();

@@ -570,12 +570,12 @@ fn tool_defs() -> Value {
         },
         {
             "name": "idle",
-            "description": "Wait without spinning and without asking: a MutationObserver inside the page calls back the moment something changes, so a still page costs no traffic at all and a change is noticed within a few milliseconds instead of on a timer. Returns when `untilText` or `untilSelector` matches, or when the page has been still for `maxIdleMs`. The result names what changed (`appeared`, `dialogs`, `changes`, `textChars`/`textDelta`, `url`, `navigated`), so you usually do not need to scan the page afterwards. Use it instead of a sleep loop when waiting for a page.",
+            "description": "Wait without spinning and without asking: a MutationObserver inside the page calls back the moment something changes, so a still page costs no traffic at all and a change is noticed within a few milliseconds instead of on a timer. Returns when `untilText` or `untilSelector` matches, or when the page has been still for `maxIdleMs`. The result names what changed (`appeared`, `dialogs`, `changes`, `textChars`/`textDelta`, `url`, `navigated`), so you usually do not need to scan the page afterwards. `changes` counts reports from the page, coalesced to at most one per 80 ms while it is moving, so read it as activity rather than as a mutation count. Use it instead of a sleep loop when waiting for a page.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "timeoutMs": { "type": "integer", "description": "stop waiting after this long, message or not (default 600000 = 10 min, max 900000)" },
-                    "maxIdleMs": { "type": "integer", "description": "treat the page as idle after this long with no change (defaults to timeoutMs)" },
+                    "maxIdleMs": { "type": "integer", "description": "treat the page as idle after this long with no change (defaults to timeoutMs). Values below about 100 ms are approximate: reports are coalesced" },
                     "untilText": { "type": "string", "description": "also wake when this text appears" },
                     "untilSelector": { "type": "string", "description": "also wake when this CSS selector matches something, e.g. input[name=email] or [role=dialog]" },
 
@@ -1319,9 +1319,14 @@ fn watch_js(name: &str, until_text: Option<&str>, until_selector: Option<&str>) 
                 return !!b && (b.innerText || '').indexOf(WANT) >= 0;
             }};
             let stopped = false, added = [], addedCount = 0, removed = 0, obs = null;
-            let lastSent = 0, lastText = 0;
+            let lastSent = 0, lastText = 0, textTimer = 0;
             const send = (o) => {{ try {{ window[NAME](JSON.stringify(o)); }} catch (e) {{}} }};
-            const stop = () => {{ stopped = true; try {{ if (obs) obs.disconnect(); }} catch (e) {{}} window.__cdpWatch = null; }};
+            const stop = () => {{
+                stopped = true;
+                try {{ if (obs) obs.disconnect(); }} catch (e) {{}}
+                try {{ if (textTimer) clearTimeout(textTimer); }} catch (e) {{}}
+                window.__cdpWatch = null;
+            }};
             const snapshot = (t, extra) => {{
                 const b = document.body;
                 const list = extra || added;
@@ -1332,7 +1337,19 @@ fn watch_js(name: &str, until_text: Option<&str>, until_selector: Option<&str>) 
             }};
             // A hit is a change too: it carries what appeared with it, so a
             // caller that only wanted to know "a dialog opened" is already done.
-            const finish = (kind) => {{ stop(); send(snapshot(kind)); }};
+            const finish = (kind) => {{
+                stop();
+                const o = snapshot(kind);
+                // A hit should name what matched even when unrelated additions
+                // filled the slots collected for this window.
+                if (kind === 'selector') {{
+                    try {{
+                        const el = describe(document.querySelector(SEL));
+                        if (el) o.added = [el].concat(o.added || []).slice(0, 8);
+                    }} catch (e) {{}}
+                }}
+                send(o);
+            }};
             // A hit must be immediate. A plain "the page moved" report is worth
             // at most one message per 80 ms: a streaming page produces a batch
             // every frame, and each one used to cost a forced layout plus a CDP
@@ -1342,14 +1359,31 @@ fn watch_js(name: &str, until_text: Option<&str>, until_selector: Option<&str>) 
                 if (stopped) return;
                 if (hitSel()) return finish('selector');
                 const now = window.performance ? performance.now() : Date.now();
-                // An attribute-only batch can reveal text (`hidden` removed, a
-                // class that un-hides a panel) without any childList record. It
-                // is checked, but capped, because checking it means reading
-                // `innerText`, which forces a layout.
-                if (!attrOnly) {{ if (hitText()) return finish('text'); }}
-                else if (WANT !== false && now - lastText >= 50) {{
-                    lastText = now;
+                if (!attrOnly) {{
                     if (hitText()) return finish('text');
+                }} else {{
+                    // An attribute-only batch can reveal text (`hidden` removed,
+                    // a class that un-hides a panel) without any childList
+                    // record. Checking it means reading `innerText`, which
+                    // forces a layout, so it is capped, and a skipped check is
+                    // deferred rather than dropped: if the reveal is the last
+                    // mutation there is nothing else to wake it.
+                    if (WANT !== false) {{
+                        if (now - lastText >= 50) {{
+                            lastText = now;
+                            if (hitText()) return finish('text');
+                        }} else if (!textTimer) {{
+                            textTimer = setTimeout(() => {{
+                                textTimer = 0;
+                                if (stopped) return;
+                                lastText = window.performance ? performance.now() : Date.now();
+                                if (hitText()) finish('text');
+                            }}, 50);
+                        }}
+                    }}
+                    // Attribute churn is not a change. Reporting it would keep a
+                    // page that only toggles classes from ever reaching maxIdleMs.
+                    return;
                 }}
                 if (now - lastSent < 80) return;
                 lastSent = now;
@@ -1534,6 +1568,11 @@ impl Settled {
     }
 }
 
+/// Stop the page-side watcher. Bounded: a cancelled wait usually means the page
+/// is wedged, and a default 30 s eval would make "stop" slower than the wait it
+/// is stopping. The two literals used to be duplicated here and in the wrapper.
+const STOP_WATCH_JS: &str = "try{window.__cdpWatch&&window.__cdpWatch.stop()}catch(e){}0";
+
 /// Wait for a page to move, woken by the page itself and never asked.
 ///
 /// The page installs one `MutationObserver` and calls a CDP binding when
@@ -1559,11 +1598,11 @@ fn wait_page_settled(
     let out = wait_page_settled_inner(conn, until_text, until_selector, started, deadline, max_idle_ms);
     if out.is_err() {
         // Every early return used to leave the page's observer running: a
-        // cancellation, a dropped socket, or a page that refused the binding.
-        // It then read `innerText` on every mutation and pushed into a socket
-        // nobody was reading, for the rest of that tab's life. Stopping it is
-        // one eval, and a dead connection answers it immediately.
-        let _ = conn.eval("try{window.__cdpWatch&&window.__cdpWatch.stop()}catch(e){}0");
+        // cancellation, or a page that refused the binding. It then read
+        // `innerText` on every mutation and pushed into a socket nobody was
+        // reading, for the rest of that tab's life. A dead socket cannot be
+        // cleaned this way; the next wait's `prev.stop()` covers that one.
+        let _ = conn.eval_within(STOP_WATCH_JS, 500);
     }
     out
 }
@@ -1582,6 +1621,19 @@ fn wait_page_settled_inner(
     conn.enable_runtime()?;
 
     let mut settled = Settled::default();
+    // A text wake can be missed if the page's recheck timer was throttled or a
+    // capped check was the last one, so the decision points ask directly
+    // instead of trusting the observer to have spoken.
+    let text_on_page = |conn: &mut cdp::Conn| -> bool {
+        match until_text {
+            Some(w) => conn
+                .eval_within(&has_text_js(w), 1_500)
+                .ok()
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            None => false,
+        }
+    };
     let mut installed = false;
     let mut failing_since: Option<std::time::Instant> = None;
     let mut last_event = started;
@@ -1589,7 +1641,7 @@ fn wait_page_settled_inner(
     // The watcher must not outlive the wait: a live observer keeps pushing into
     // a socket nobody is reading, and the next tool on this tab pays for it.
     let stop_watch = |conn: &mut cdp::Conn| {
-        let _ = conn.eval("try{window.__cdpWatch&&window.__cdpWatch.stop()}catch(e){}0");
+        let _ = conn.eval_within(STOP_WATCH_JS, 2_000);
     };
 
     loop {
@@ -1675,13 +1727,21 @@ fn wait_page_settled_inner(
         // every quiet default wait report `woke: "timeout"` and claim the page
         // never matched anything.
         if quiet >= max_idle_ms {
+            // A text wake can be missed while the page is throttled; ask once
+            // before calling it quiet, because the answer is visible now.
+            if text_on_page(conn) {
+                stop_watch(conn);
+                let mut o = settled.report("text", &started, &last_event);
+                o["note"] = json!("the text was on the page at the quiet decision");
+                return Ok(o);
+            }
             // Last look before calling it quiet: a shadow root or an attribute
             // toggle can move the visible text without a light-DOM record, and
             // reporting idle mid-render is worse than one extra read.
             // `innerText` never reaches a shadow root, so a component painting
             // on its own would look like a still page. Walk them too, once, at
             // the decision point only.
-            if let Some(a) = conn.eval(VISIBLE_JS).ok().filter(|v| v.is_array()) {
+            if let Some(a) = conn.eval_within(VISIBLE_JS, 1_500).ok().filter(|v| v.is_array()) {
                 let len = a.get(0).and_then(Value::as_i64).unwrap_or(settled.chars);
                 let shadow = a.get(1).and_then(Value::as_i64).unwrap_or(settled.shadow_chars);
                 if (len > 0 && len != settled.chars) || shadow != settled.shadow_chars {
@@ -1700,6 +1760,14 @@ fn wait_page_settled_inner(
             return Ok(o);
         }
         if now >= deadline {
+            // The same last look at the deadline: a wake missed while the page
+            // was throttled must not be reported as "never matched".
+            if text_on_page(conn) {
+                stop_watch(conn);
+                let mut o = settled.report("text", &started, &last_event);
+                o["note"] = json!("the text was on the page when the wait ended");
+                return Ok(o);
+            }
             stop_watch(conn);
             let mut o = settled.report("timeout", &started, &last_event);
             o["note"] = json!("waited the full timeout; the page never matched what was asked for");
