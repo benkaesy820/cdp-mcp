@@ -2952,9 +2952,13 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                                 for (let k = 0; k < bin.length; k++) u8[k] = bin.charCodeAt(k);
                                 dt.items.add(new File([u8], {name}, {{ type: {mime} }}));
                             }}
+                            const read = (n) => (n && typeof n.value === 'string') ? n.value : ((n && n.innerText) || '');
+                            const before = read(el);
+                            const editable = !!(el && (el.isContentEditable || typeof el.value === 'string'));
                             const ev = new ClipboardEvent('paste', {{ clipboardData: dt, bubbles: true, cancelable: true, composed: true }});
                             const handled = !el.dispatchEvent(ev);
-                            const out = {{ handled, target: el.tagName.toLowerCase() }};
+                            const out = {{ handled, target: el.tagName.toLowerCase(),
+                                          changed: read(el) !== before, editable }};
                             // A file nobody took as a paste: offer it as a drop,
                             // which is how most upload areas accept files.
                             if (!handled && text === null) {{
@@ -2972,11 +2976,22 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                     );
                     let r = conn.eval(&js)?;
                     let handled = r.get("handled").and_then(Value::as_bool).unwrap_or(false);
-                    let mut how = if handled { "paste event" } else { "" };
-                    if !handled {
+                    let changed = r.get("changed").and_then(Value::as_bool).unwrap_or(false);
+                    let editable = r.get("editable").and_then(Value::as_bool).unwrap_or(false);
+                    // A handler can accept the paste and insert nothing: Quill
+                    // (Gemini's editor) does exactly that, and the tool used to
+                    // report success. Trust the editor, not the event.
+                    let took = handled && (text.is_none() || changed);
+                    let mut how = if took { "paste event" } else { "" };
+                    if !took {
                         if let Some(t) = &text {
-                            // Nobody intercepted the paste, so do what the
-                            // browser would: insert the text, as real input.
+                            if !editable {
+                                return Err(format!(
+                                    "the page swallowed the pasted text and the focused element <{}> is not editable",
+                                    r.get("target").and_then(Value::as_str).unwrap_or("?")
+                                ));
+                            }
+                            // Nobody inserted it, so do what the browser would.
                             conn.call("Input.insertText", json!({ "text": t }))?;
                             how = "inserted as typed text";
                         } else if r.get("dropped").and_then(Value::as_bool) == Some(true) {

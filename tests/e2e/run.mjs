@@ -436,6 +436,17 @@ await withTab(page("basic.html"), async (tab, ev) => {
         (pretty.appeared || []).map(a => a.text));
 });
 
+// A rich editor can accept a paste event and insert nothing; the tool used to
+// report success anyway. Gemini's Quill editor does exactly this.
+await withTab(page("paste-eater.html"), async (tab, ev) => {
+  await ev("document.getElementById('ed').focus()");
+  const r = (await s.tool("paste", { tab, text: "pasted by the fallback" })).v;
+  const got = await ev("document.getElementById('ed').innerText");
+  check("a swallowed paste falls back to typed input",
+        /inserted as typed text/.test(r.via || "") && got.includes("pasted by the fallback"),
+        { via: r.via, got });
+});
+
 s.close();
 console.log(failed ? `\n${failed} failed` : "\nall passed");
 process.exit(failed ? 1 : 0);

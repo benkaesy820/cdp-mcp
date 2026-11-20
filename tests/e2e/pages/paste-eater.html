@@ -1,0 +1,10 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>paste eater</title>
+<!-- A rich editor that accepts every paste event and inserts nothing, which
+     is what Gemini's Quill editor does. The tool must notice and fall back. -->
+<body>
+<div id="ed" contenteditable="true">start</div>
+<script>
+  document.getElementById('ed').addEventListener('paste', (e) => e.preventDefault());
+</script>
