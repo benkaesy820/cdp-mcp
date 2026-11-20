@@ -10,6 +10,11 @@ agent starts working.
 
 ---
 
+![cdp-mcp: one binary, a real browser, a live status](docs/preview.gif)
+
+A 33-second cut with the installer session and a synthesized sound bed is in
+`video/`; rebuild it with `python3 video/build.py`.
+
 ## Why another browser MCP
 
 Three decisions, each of which fixes something that made the alternatives

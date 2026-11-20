@@ -67,7 +67,7 @@ Claude Code:
 claude mcp add cdp -- /home/YOU/.local/bin/cdp-mcp --profile default
 ```
 
-Restart or reload the agent after editing MCP config. Use a different
+Restart or reload the agent after editing MCP config. A Claude Code project-scoped server needs one approval on next launch. Use a different
 `--profile` per agent if they should not share the last-used tab.
 
 ## Verify

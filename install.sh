@@ -102,7 +102,7 @@ if [ -z "$HARNESSES" ]; then
         seen=${DETECTED[*]:-none}
         default=$(IFS=,; printf '%s' "${DETECTED[*]:-opencode,claude}")
         say "Harnesses found: $seen"
-        read -r -p "Install for [$default] (opencode,claude): " HARNESSES
+        read -r -p "Install for [$default]: " HARNESSES
         HARNESSES=${HARNESSES:-$default}
     fi
 fi
@@ -271,6 +271,7 @@ for h in ${HARNESSES//,/ }; do
                     (cd "$PROJECT" && claude mcp add --scope project cdp -- "$BIN" --profile "$PROFILE" >/dev/null 2>&1) ||
                         warn "claude mcp add failed; add cdp to $PROJECT/.mcp.json by hand"
                     say "config: Claude Code (project scope, $PROJECT)"
+                    say "note  : Claude Code asks once to approve the project server on next launch"
                 fi
             elif [ "$SCOPE" = project ]; then
                 merge_claude_json "$PROJECT/.mcp.json"
