@@ -274,6 +274,64 @@ await withTab(page("frames.html?port=" + fport), async (tab, ev) => {
   }
 });
 
+// A wait on a page that never stops moving used to pay a forced layout and a
+// CDP message for every mutation batch. The report must stay useful, but the
+// message rate is capped; a hit is still immediate.
+await withTab(page("chatty.html"), async (tab, ev) => {
+  const before = Number(await ev("window.__ticks")) || 0;
+  const r = (await s.tool("idle", { tab, maxIdleMs: 1500, timeoutMs: 4000 })).v;
+  const after = Number(await ev("window.__ticks")) || 0;
+  const moved = after - before;
+  check("a chatty page keeps the wait awake",
+        r.woke === "timeout" && moved > 15 && r.elapsedMs >= 3900,
+        { woke: r.woke, moved, elapsedMs: r.elapsedMs });
+  const cap = Math.ceil(r.elapsedMs / 80) + 3;
+  check("mutation reports are coalesced", r.changes <= cap && r.changes >= 3, { changes: r.changes, cap, moved });
+
+  const t0 = Date.now();
+  await s.tool("eval", {
+    tab,
+    expression: "(() => { setTimeout(() => { const d = document.createElement('div'); d.setAttribute('role','dialog'); d.setAttribute('aria-label','Chatty dialog'); document.body.appendChild(d); }, 300); })()",
+  });
+  const hit = (await s.tool("idle", { tab, untilSelector: "[role=dialog]", timeoutMs: 4000 })).v;
+  const ms = Date.now() - t0;
+  check("a hit on a chatty page is still immediate",
+        hit.woke === "selector" && ms < 900 && (hit.appeared || []).some(a => a.label === "Chatty dialog"),
+        { woke: hit.woke, ms, appeared: hit.appeared });
+});
+
+// A cancelled wait used to leave its MutationObserver in the page: it kept
+// reading innerText on every mutation and pushing into a socket nobody read,
+// for the rest of the tab's life.
+await withTab(page("basic.html"), async (tab, ev) => {
+  const id = s.nextId();
+  s.p.stdin.write(JSON.stringify({
+    jsonrpc: "2.0", id, method: "tools/call",
+    params: { name: "idle", arguments: { tab, untilSelector: "[data-never]", timeoutMs: 30000 } },
+  }) + "\n");
+  await sleep(300);
+  s.notify("notifications/cancelled", { requestId: id });
+  await sleep(800);
+  const left = await ev("!!window.__cdpWatch");
+  check("a cancelled wait leaves no observer behind", left === false, left);
+
+  // maxIdleMs defaults to timeoutMs, so both thresholds land on the same pass.
+  const still = (await s.tool("idle", { tab, maxIdleMs: 400, timeoutMs: 400 })).v;
+  check("a quiet wait at the timeout boundary says idle, not timeout",
+        still.woke === "idleLimit" && still.changes === 0, still);
+
+  // Text that appears by removing an attribute produces no childList record.
+  const tText = Date.now();
+  await s.tool("eval", {
+    tab,
+    expression: "(() => { const d = document.createElement('div'); d.id='reveal'; d.hidden = true; d.textContent = 'Revealed by attribute'; document.body.appendChild(d); setTimeout(() => { d.hidden = false; }, 300); })()",
+  });
+  const rev = (await s.tool("idle", { tab, untilText: "Revealed by attribute", timeoutMs: 3000 })).v;
+  const revMs = Date.now() - tText;
+  check("text revealed by an attribute wakes the wait",
+        rev.woke === "text" && revMs < 1200, { woke: rev.woke, ms: revMs });
+});
+
 s.close();
 console.log(failed ? `\n${failed} failed` : "\nall passed");
 process.exit(failed ? 1 : 0);

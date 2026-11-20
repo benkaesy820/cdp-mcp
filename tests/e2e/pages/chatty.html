@@ -1,0 +1,26 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>cdp-mcp chatty</title>
+<!-- A page that never stops changing, so a wait has to prove it does not pay
+     a layout and a CDP message for every frame. The tick counter lets the test
+     compare how often the page moved with how often the wait was told. -->
+<body>
+<div id="box"></div>
+<script>
+  window.__ticks = 0;
+  const box = document.getElementById('box');
+  for (let i = 0; i < 600; i++) {
+    const d = document.createElement('p');
+    d.textContent = 'line ' + i;
+    box.appendChild(d);
+  }
+  setInterval(() => {
+    window.__ticks++;
+    box.setAttribute('data-tick', String(window.__ticks));
+    if (window.__ticks % 2 === 0) {
+      const s = document.createElement('span');
+      s.textContent = ' tick ';
+      document.body.appendChild(s);
+    }
+  }, 20);
+</script>

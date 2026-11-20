@@ -1269,7 +1269,22 @@ fn watch_js(name: &str, until_text: Option<&str>, until_selector: Option<&str>) 
             const root = document.documentElement;
             if (!root) return {{r:'not-ready'}};
             const SKIP = new Set(['script','style','noscript','template','link','meta','title']);
-            const words = (el) => (el.textContent || '').replace(/\s+/g, ' ').trim();
+            // Bounded on purpose: `textContent` builds the whole subtree first,
+            // and a route swap can add a container with half the page in it.
+            // This stops after 90 characters, which is all `slice(0, 70)` keeps.
+            const words = (el) => {{
+                let out = '', left = 90;
+                const w = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+                while (left > 0 && w.nextNode()) {{
+                    const n = w.currentNode;
+                    const p = n.parentElement;
+                    if (p && p.closest('script,style,noscript,template')) continue;
+                    const t = (n.nodeValue || '').replace(/\s+/g, ' ');
+                    out += t.slice(0, Math.max(0, left));
+                    left -= t.length;
+                }}
+                return out.slice(0, 70).trim();
+            }};
             const dialogs = () => document.querySelectorAll('[role="dialog"],[role="alertdialog"],[aria-modal="true"],dialog[open]').length;
             const describe = (el) => {{
                 if (!el || el.nodeType !== 1) return null;
@@ -1304,6 +1319,7 @@ fn watch_js(name: &str, until_text: Option<&str>, until_selector: Option<&str>) 
                 return !!b && (b.innerText || '').indexOf(WANT) >= 0;
             }};
             let stopped = false, added = [], addedCount = 0, removed = 0, obs = null;
+            let lastSent = 0, lastText = 0;
             const send = (o) => {{ try {{ window[NAME](JSON.stringify(o)); }} catch (e) {{}} }};
             const stop = () => {{ stopped = true; try {{ if (obs) obs.disconnect(); }} catch (e) {{}} window.__cdpWatch = null; }};
             const snapshot = (t, extra) => {{
@@ -1317,12 +1333,38 @@ fn watch_js(name: &str, until_text: Option<&str>, until_selector: Option<&str>) 
             // A hit is a change too: it carries what appeared with it, so a
             // caller that only wanted to know "a dialog opened" is already done.
             const finish = (kind) => {{ stop(); send(snapshot(kind)); }};
-            const flush = () => {{
+            // A hit must be immediate. A plain "the page moved" report is worth
+            // at most one message per 80 ms: a streaming page produces a batch
+            // every frame, and each one used to cost a forced layout plus a CDP
+            // message. The quiet clock is still accurate to 80 ms, and nothing
+            // that matched is delayed by this.
+            const flush = (attrOnly) => {{
                 if (stopped) return;
                 if (hitSel()) return finish('selector');
-                if (hitText()) return finish('text');
+                const now = window.performance ? performance.now() : Date.now();
+                // An attribute-only batch can reveal text (`hidden` removed, a
+                // class that un-hides a panel) without any childList record. It
+                // is checked, but capped, because checking it means reading
+                // `innerText`, which forces a layout.
+                if (!attrOnly) {{ if (hitText()) return finish('text'); }}
+                else if (WANT !== false && now - lastText >= 50) {{
+                    lastText = now;
+                    if (hitText()) return finish('text');
+                }}
+                if (now - lastSent < 80) return;
+                lastSent = now;
                 send(snapshot('change'));
+                // The payload carries this window's additions, and the server
+                // sums them; leaving them in place would count them twice.
+                added = [];
+                addedCount = 0;
+                removed = 0;
             }};
+            // A previous wait that ended badly can leave its observer running.
+            // Stop it before the hit checks below, which return early and would
+            // otherwise never reach the install that replaces it.
+            const prev = window.__cdpWatch;
+            if (prev) {{ try {{ prev.stop(); }} catch (e) {{}} window.__cdpWatch = null; }}
             // Already there: answer now, and name the thing that matched.
             if (hitSel()) {{
                 let el = null;
@@ -1334,10 +1376,7 @@ fn watch_js(name: &str, until_text: Option<&str>, until_selector: Option<&str>) 
             // Without the binding nothing could ever wake this wait, and the only
             // symptom would be a timeout that looks like a quiet page.
             if (typeof window[NAME] !== 'function') return {{ r: 'nobinding' }};
-            const prev = window.__cdpWatch;
-            if (prev) {{ try {{ prev.stop(); }} catch (e) {{}} window.__cdpWatch = null; }}
             obs = new MutationObserver((records) => {{
-                added = []; removed = 0;
                 let moved = false;
                 for (const r of records) {{
                     if (r.type === 'attributes') continue;
@@ -1352,14 +1391,15 @@ fn watch_js(name: &str, until_text: Option<&str>, until_selector: Option<&str>) 
                         if (d) added.push(d);
                     }}
                 }}
-                // An attribute change can be what makes SEL start matching, so it
-                // is only ignored when nothing is being watched for.
-                if (!moved && SEL === false) return;
+                // An attribute change can be what makes SEL or WANT start
+                // matching, so it is only ignored when nothing is being watched
+                // for.
+                if (!moved && SEL === false && WANT === false) return;
                 // Flushed straight from the microtask, not on a timer: a
                 // MutationObserver callback is a microtask, while `setTimeout` in
                 // a tab nobody is looking at is throttled (a 200 ms timer measured
                 // 345 ms in a background tab), which would eat the whole win.
-                flush();
+                flush(!moved);
             }});
             obs.observe(root, {{ subtree: true, childList: true, characterData: true, attributes: true }});
             window.__cdpWatch = {{ text: WANT, sel: SEL, stop: stop }};
@@ -1516,6 +1556,26 @@ fn wait_page_settled(
     deadline: std::time::Instant,
     max_idle_ms: u64,
 ) -> Result<Value, String> {
+    let out = wait_page_settled_inner(conn, until_text, until_selector, started, deadline, max_idle_ms);
+    if out.is_err() {
+        // Every early return used to leave the page's observer running: a
+        // cancellation, a dropped socket, or a page that refused the binding.
+        // It then read `innerText` on every mutation and pushed into a socket
+        // nobody was reading, for the rest of that tab's life. Stopping it is
+        // one eval, and a dead connection answers it immediately.
+        let _ = conn.eval("try{window.__cdpWatch&&window.__cdpWatch.stop()}catch(e){}0");
+    }
+    out
+}
+
+fn wait_page_settled_inner(
+    conn: &mut cdp::Conn,
+    until_text: Option<&str>,
+    until_selector: Option<&str>,
+    started: std::time::Instant,
+    deadline: std::time::Instant,
+    max_idle_ms: u64,
+) -> Result<Value, String> {
     const NAME: &str = "__cdpMCP";
     // A navigation that happened before this wait says nothing about it.
     conn.contexts_cleared = false;
@@ -1608,13 +1668,12 @@ fn wait_page_settled(
         }
 
         let now = std::time::Instant::now();
-        if now >= deadline {
-            stop_watch(conn);
-            let mut o = settled.report("timeout", &started, &last_event);
-            o["note"] = json!("waited the full timeout; the page never matched what was asked for");
-            return Ok(o);
-        }
         let quiet = last_event.elapsed().as_millis() as u64;
+        // The quiet check comes first on purpose: `maxIdleMs` defaults to
+        // `timeoutMs`, so on the last pass both are true, and "the page was
+        // quiet" is the truthful answer. The deadline used to win, which made
+        // every quiet default wait report `woke: "timeout"` and claim the page
+        // never matched anything.
         if quiet >= max_idle_ms {
             // Last look before calling it quiet: a shadow root or an attribute
             // toggle can move the visible text without a light-DOM record, and
@@ -1638,6 +1697,12 @@ fn wait_page_settled(
             stop_watch(conn);
             let mut o = settled.report("idleLimit", &started, &last_event);
             o["note"] = json!("nothing changed for maxIdleMs");
+            return Ok(o);
+        }
+        if now >= deadline {
+            stop_watch(conn);
+            let mut o = settled.report("timeout", &started, &last_event);
+            o["note"] = json!("waited the full timeout; the page never matched what was asked for");
             return Ok(o);
         }
 
