@@ -5,6 +5,7 @@
      is what Gemini's Quill editor does. The tool must notice and fall back. -->
 <body>
 <div id="ed" contenteditable="true">start</div>
+<button id="btn">not editable</button>
 <script>
   document.getElementById('ed').addEventListener('paste', (e) => e.preventDefault());
 </script>

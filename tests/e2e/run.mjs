@@ -434,6 +434,22 @@ await withTab(page("basic.html"), async (tab, ev) => {
   check("a label survives leading whitespace nodes",
         (pretty.appeared || []).some(a => a.text === "Deep label"),
         (pretty.appeared || []).map(a => a.text));
+
+  // Adjacent inline runs have no whitespace in the source, so none may be
+  // invented: <span>$</span><span>42</span> is "$42", not "$ 42".
+  await s.tool("eval", {
+    tab,
+    expression: `(() => {
+      const d = document.createElement('div'); d.id = 'inline';
+      const a = document.createElement('span'); a.textContent = '$';
+      const b = document.createElement('span'); b.textContent = '42';
+      d.appendChild(a); d.appendChild(b); document.body.appendChild(d);
+    })()`,
+  });
+  const inline = (await s.tool("idle", { tab, untilSelector: "#inline", timeoutMs: 3000 })).v;
+  check("inline runs are not split by an invented space",
+        (inline.appeared || []).some(a => a.text === "$42"),
+        (inline.appeared || []).map(a => a.text));
 });
 
 // A rich editor can accept a paste event and insert nothing; the tool used to
@@ -444,6 +460,23 @@ await withTab(page("paste-eater.html"), async (tab, ev) => {
   const got = await ev("document.getElementById('ed').innerText");
   check("a swallowed paste falls back to typed input",
         /inserted as typed text/.test(r.via || "") && got.includes("pasted by the fallback"),
+        { via: r.via, got });
+
+  // A button has a string `value`, which used to count as editable.
+  await ev("document.getElementById('btn').focus()");
+  const bad = await s.tool("paste", { tab, text: "should not land" });
+  check("a paste into a non-editable element is an error, not a fake success",
+        !bad.ok && /not editable/.test(String(bad.v)), { ok: bad.ok, v: String(bad.v).slice(0, 120) });
+});
+
+// A handler can cancel the paste and commit on the next task. A synchronous
+// read that says "unchanged" must not trigger a second insert.
+await withTab(page("paste-async.html"), async (tab, ev) => {
+  await ev("document.getElementById('ed').focus()");
+  const r = (await s.tool("paste", { tab, text: "by the async handler" })).v;
+  const got = await ev("document.getElementById('ed').innerText");
+  check("an async paste handler is not double-pasted",
+        r.via === "paste event (delayed)" && got === "startby the async handler",
         { via: r.via, got });
 });
 

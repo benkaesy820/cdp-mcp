@@ -1260,7 +1260,7 @@ const VISIBLE_JS: &str = r#"(() => {
 /// with the document while the binding itself survives it (both measured). The
 /// binding is checked rather than assumed, so a browser that drops it is caught
 /// here instead of turning every later wait into a silent timeout.
-fn watch_js(name: &str, until_text: Option<&str>, until_selector: Option<&str>) -> String {
+fn watch_js(name: &str, until_text: Option<&str>, until_selector: Option<&str>, install: bool) -> String {
     let want = until_text.map(|t| Value::String(t.to_string())).unwrap_or(Value::Bool(false));
     let sel = until_selector.map(|s| Value::String(s.to_string())).unwrap_or(Value::Bool(false));
     format!(
@@ -1273,19 +1273,22 @@ fn watch_js(name: &str, until_text: Option<&str>, until_selector: Option<&str>) 
             // and a route swap can add a container with half the page in it.
             // This stops after 90 characters, which is all `slice(0, 70)` keeps.
             const words = (el) => {{
-                let out = '', left = 90;
+                let out = '', left = 90, space = false;
                 const w = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
                 while (left > 0 && w.nextNode()) {{
                     const n = w.currentNode;
                     const p = n.parentElement;
                     if (p && p.closest('script,style,noscript,template')) continue;
-                    // Trim first: indentation and the whitespace between tags
-                    // otherwise eats the whole budget before the label starts.
-                    const t = (n.nodeValue || '').replace(/\s+/g, ' ').trim();
-                    if (!t) continue;
-                    if (out && out.charAt(out.length - 1) !== ' ') {{ out += ' '; left -= 1; }}
+                    // Normalise, but keep where the source had a space: inline
+                    // runs like <b>Ben</b>k must not become "Ben k", and blank
+                    // nodes must not eat the budget before the label starts.
+                    const raw = (n.nodeValue || '').replace(/\s+/g, ' ');
+                    const t = raw.trim();
+                    if (!t) {{ space = true; continue; }}
+                    if (out && (space || raw.charAt(0) === ' ')) {{ out += ' '; left -= 1; }}
                     out += t.slice(0, Math.max(0, left));
                     left -= t.length;
+                    space = raw.charAt(raw.length - 1) === ' ';
                 }}
                 return out.slice(0, 70).trim();
             }};
@@ -1427,6 +1430,10 @@ fn watch_js(name: &str, until_text: Option<&str>, until_selector: Option<&str>) 
             // Without the binding nothing could ever wake this wait, and the only
             // symptom would be a timeout that looks like a quiet page.
             if (typeof window[NAME] !== 'function') return {{ r: 'nobinding' }};
+            // Probe mode: answer the hit question and touch nothing. The
+            // boundary look uses it, because stopping or installing there
+            // would discard the watcher's buffered window.
+            if (!{install}) return {{ r: 'miss' }};
             obs = new MutationObserver((records) => {{
                 let moved = false;
                 for (const r of records) {{
@@ -1461,6 +1468,7 @@ fn watch_js(name: &str, until_text: Option<&str>, until_selector: Option<&str>) 
         want = want,
         sel = sel,
         vis = VISIBLE_JS,
+        install = install,
     )
 }
 
@@ -1590,6 +1598,24 @@ impl Settled {
 /// is stopping. The two literals used to be duplicated here and in the wrapper.
 const STOP_WATCH_JS: &str = "try{window.__cdpWatch&&window.__cdpWatch.stop()}catch(e){}0";
 
+/// Did the editor take the paste after all? Compared against the snapshot the
+/// page stored when a handler cancelled the event and nothing had changed yet.
+const PASTE_LANDED_JS: &str = r#"(() => {
+    let el = document.activeElement || document.body;
+    while (el && el.shadowRoot && el.shadowRoot.activeElement) el = el.shadowRoot.activeElement;
+    const read = (n) => (n && n.isContentEditable) ? ((n.innerText) || '')
+        : ((n && typeof n.value === 'string') ? n.value : '');
+    const sel = (n) => {
+        if (n && typeof n.selectionStart === 'number') return n.selectionEnd > n.selectionStart ? 'range' : 'caret';
+        const s = window.getSelection();
+        return s && !s.isCollapsed ? 'range' : 'caret';
+    };
+    const p = window.__cdpPaste;
+    delete window.__cdpPaste;
+    if (!p) return { changed: false };
+    return { changed: read(el) !== p.text || (p.sel === 'range' && sel(el) === 'caret') };
+})()"#;
+
 /// Wait for a page to move, woken by the page itself and never asked.
 ///
 /// The page installs one `MutationObserver` and calls a CDP binding when
@@ -1643,18 +1669,31 @@ fn wait_page_settled_inner(
     // (which the exit below stops). A wake can be missed when a deferred check
     // was the last one, or when a selector matches through a property such as
     // `checked` or `disabled`, which fires no mutation at all.
-    let last_look = |conn: &mut cdp::Conn| -> Option<(String, Value)> {
+    // What a boundary probe saw. `NoBinding` is separate from a miss: the page
+    // cannot wake us at all, so the wait has to reinstall instead of idling.
+    enum Look {
+        Hit(String, Value),
+        Miss,
+        NoBinding,
+    }
+    // Probe only: `watch_js(.., false)` checks without stopping the watcher or
+    // installing a new one, so the buffered window survives the quiet check.
+    let last_look = |conn: &mut cdp::Conn| -> Look {
         if until_text.is_none() && until_selector.is_none() {
-            return None;
+            return Look::Miss;
         }
-        let v = conn
-            .eval_within(&watch_js(NAME, until_text, until_selector), 2_000)
-            .ok()?;
-        let kind = v.get("r").and_then(Value::as_str)?;
-        if !(kind == "hit:text" || kind == "hit:selector") {
-            return None;
+        let v = match conn.eval_within(&watch_js(NAME, until_text, until_selector, false), 2_000) {
+            Ok(v) => v,
+            Err(_) => return Look::Miss,
+        };
+        match v.get("r").and_then(Value::as_str) {
+            Some("nobinding") => Look::NoBinding,
+            Some(kind @ ("hit:text" | "hit:selector")) => Look::Hit(
+                kind[4..].to_string(),
+                v.get("snap").cloned().unwrap_or(Value::Null),
+            ),
+            _ => Look::Miss,
         }
-        Some((kind[4..].to_string(), v.get("snap").cloned().unwrap_or(Value::Null)))
     };
     let mut installed = false;
     let mut failing_since: Option<std::time::Instant> = None;
@@ -1680,7 +1719,7 @@ fn wait_page_settled_inner(
             }
             // Cached, so this is free unless the page lost it.
             conn.add_binding(NAME)?;
-            match conn.eval(&watch_js(NAME, until_text, until_selector)) {
+            match conn.eval(&watch_js(NAME, until_text, until_selector, true)) {
                 Ok(v) => match v.get("r").and_then(Value::as_str) {
                     Some("installed") => {
                         installed = true;
@@ -1752,12 +1791,22 @@ fn wait_page_settled_inner(
             // One direct look before calling it quiet: a deferred check whose
             // page then went silent, or a selector matched through a property
             // change, would otherwise be reported as a still page.
-            if let Some((kind, snap)) = last_look(conn) {
-                if snap.is_object() {
-                    settled.absorb(&snap);
+            match last_look(conn) {
+                Look::Hit(kind, snap) => {
+                    if snap.is_object() {
+                        settled.absorb(&snap);
+                    }
+                    stop_watch(conn);
+                    return Ok(settled.report(&kind, &started, &last_event));
                 }
-                stop_watch(conn);
-                return Ok(settled.report(&kind, &started, &last_event));
+                Look::NoBinding => {
+                    // The page cannot wake us any more. Reinstall rather than
+                    // run the rest of the wait blind.
+                    conn.binding = None;
+                    installed = false;
+                    continue;
+                }
+                Look::Miss => {}
             }
             // Last look before calling it quiet: a shadow root or an attribute
             // toggle can move the visible text without a light-DOM record, and
@@ -1786,7 +1835,7 @@ fn wait_page_settled_inner(
         if now >= deadline {
             // The same look at the deadline: a missed wake must not be
             // reported as "the page never matched".
-            if let Some((kind, snap)) = last_look(conn) {
+            if let Look::Hit(kind, snap) = last_look(conn) {
                 if snap.is_object() {
                     settled.absorb(&snap);
                 }
@@ -2952,13 +3001,35 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                                 for (let k = 0; k < bin.length; k++) u8[k] = bin.charCodeAt(k);
                                 dt.items.add(new File([u8], {name}, {{ type: {mime} }}));
                             }}
-                            const read = (n) => (n && typeof n.value === 'string') ? n.value : ((n && n.innerText) || '');
+                            const textLike = (n) => {{
+                                if (!n) return false;
+                                if (n.isContentEditable) return true;
+                                if (n.tagName === 'TEXTAREA') return !n.disabled && !n.readOnly;
+                                if (n.tagName !== 'INPUT' || n.disabled || n.readOnly) return false;
+                                const t = (n.type || 'text').toLowerCase();
+                                return ['text','search','url','tel','email','password','number'].includes(t);
+                            }};
+                            const read = (n) => (n && n.isContentEditable) ? ((n.innerText) || '')
+                                : ((n && typeof n.value === 'string') ? n.value : '');
+                            const sel = (n) => {{
+                                if (n && typeof n.selectionStart === 'number')
+                                    return n.selectionEnd > n.selectionStart ? 'range' : 'caret';
+                                const s = window.getSelection();
+                                return s && !s.isCollapsed ? 'range' : 'caret';
+                            }};
                             const before = read(el);
-                            const editable = !!(el && (el.isContentEditable || typeof el.value === 'string'));
+                            const selBefore = sel(el);
+                            const editable = textLike(el);
                             const ev = new ClipboardEvent('paste', {{ clipboardData: dt, bubbles: true, cancelable: true, composed: true }});
                             const handled = !el.dispatchEvent(ev);
-                            const out = {{ handled, target: el.tagName.toLowerCase(),
-                                          changed: read(el) !== before, editable }};
+                            // A page can cancel the paste and commit the DOM a tick
+                            // later, so an unchanged read here is not proof it did
+                            // nothing. Remember what to compare after a frame, and
+                            // treat a collapsed range as a replacement even when
+                            // the text came out identical.
+                            const changed = read(el) !== before || (selBefore === 'range' && sel(el) === 'caret');
+                            if (handled && text !== null && !changed) window.__cdpPaste = {{ text: before, sel: selBefore }};
+                            const out = {{ handled, target: el.tagName.toLowerCase(), changed, editable }};
                             // A file nobody took as a paste: offer it as a drop,
                             // which is how most upload areas accept files.
                             if (!handled && text === null) {{
@@ -2991,9 +3062,24 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                                     r.get("target").and_then(Value::as_str).unwrap_or("?")
                                 ));
                             }
-                            // Nobody inserted it, so do what the browser would.
-                            conn.call("Input.insertText", json!({ "text": t }))?;
-                            how = "inserted as typed text";
+                            // Nobody inserted it yet. A handler that cancelled
+                            // the event may commit on a microtask or a frame, so
+                            // give it one before deciding it inserted nothing.
+                            let mut landed = false;
+                            if handled {
+                                nap(50)?;
+                                landed = conn
+                                    .eval_within(PASTE_LANDED_JS, 2_000)
+                                    .ok()
+                                    .and_then(|v| v.get("changed").and_then(Value::as_bool))
+                                    .unwrap_or(false);
+                            }
+                            if landed {
+                                how = "paste event (delayed)";
+                            } else {
+                                conn.call("Input.insertText", json!({ "text": t }))?;
+                                how = "inserted as typed text";
+                            }
                         } else if r.get("dropped").and_then(Value::as_bool) == Some(true) {
                             how = "drop event";
                         } else {

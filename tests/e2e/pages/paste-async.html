@@ -1,0 +1,15 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>paste async</title>
+<!-- A rich editor that cancels the paste and commits on the next task. The
+     tool must not decide "it did nothing" from a synchronous read. -->
+<body>
+<div id="ed" contenteditable="true">start</div>
+<script>
+  const ed = document.getElementById('ed');
+  ed.addEventListener('paste', (e) => {
+    e.preventDefault();
+    const t = e.clipboardData.getData('text/plain');
+    setTimeout(() => ed.appendChild(document.createTextNode(t)), 0);
+  });
+</script>
