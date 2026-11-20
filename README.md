@@ -6,7 +6,7 @@ No extension. No relay. No second browser, no fresh profile — it attaches to t
 browser you are already using, so every login you have is already there when an
 agent starts working.
 
-**534 KB, 44 crates, ~1 ms to initialize, no async runtime.**
+**1.1 MB as a static musl binary, no async runtime.**
 
 ---
 
@@ -50,6 +50,11 @@ To make that permanent from your launcher, add the flag to a **user-level**
 `.desktop` override on Linux (copy `/usr/share/applications/<browser>.desktop`
 into `~/.local/share/applications/` and edit its `Exec=` line). Do not edit the
 system file.
+
+Any Chromium-family browser works. The tool speaks CDP, so it is not tied to
+Helium or to Chrome; Firefox and Safari are not supported. The binary itself is
+Linux x86-64 for v1. Recent Chrome builds refuse `--remote-debugging-port` on the
+default profile, so give it a dedicated `--user-data-dir` if the flag is ignored.
 
 ## Install
 
@@ -259,10 +264,22 @@ browser completely — every cookie, every session, everything open.
 
 ## Limits
 
-- Chromium only. Firefox is not supported (different protocol).
+- Chromium only. Firefox and Safari are not supported (different protocol).
+- **v1 is one Linux x86-64 binary.** Other platforms are next; other Linux
+  distros should work with the static binary.
+- **No network awareness.** A click that starts a fetch and leaves the DOM still
+  can be reported idle before the response renders. This is the next known gap.
+- **Wait reports are coalesced.** `changes` is at most one report per 80 ms, the
+  text check is capped at 50 ms, and `maxIdleMs` below about 100 ms is
+  approximate.
+- `maxIdleMs` defaults to `timeoutMs`, so a bare `idle` can wait the full ten
+  minutes on a still page.
+- **A dead CDP socket can leave the page observer running** until that tab
+  closes; the next wait on that tab clears it.
 - No accessibility tree; `elements` is a flat list of interactive nodes.
 - No network interception or tracing. CDP can do both; this exposes neither.
-- One request at a time per call — deliberately, so there is no async runtime.
+- One request at a time per server — deliberately, so there is no async runtime.
+  A long wait queues the calls behind it.
 - **A cross-origin frame is only separate when it is a different site.** Two
   ports on `127.0.0.1`, or a subdomain of the same registrable domain, stay in
   one renderer, so site isolation never applies and the frame is read as part of
