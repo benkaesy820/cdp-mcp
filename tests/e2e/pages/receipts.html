@@ -1,0 +1,40 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>cdp-mcp receipts</title>
+<!-- One page for the turn-receipt and timeout-diagnostic tests. The save
+     button fails silently: a 500 with no banner, then an uncaught error. The
+     noisy button mixes third-party failures and aborts with one real 422. -->
+<body>
+<button id="save" aria-label="Save">Save</button>
+<button id="noisy" aria-label="Noisy">Noisy</button>
+<button id="later" aria-label="Later">Later</button>
+<button id="console" aria-label="Console">Console</button>
+<div id="price">$50</div>
+<p id="msg">Save changes before leaving</p>
+<div id="modal" aria-modal="true" aria-label="Settings" role="presentation">Settings</div>
+<script>
+  document.getElementById('save').addEventListener('click', () => {
+    fetch('/api/save', { method: 'POST' }).then((r) => {
+      if (r.status >= 400) setTimeout(() => { throw new Error('save failed with 500'); }, 0);
+    });
+  });
+  document.getElementById('noisy').addEventListener('click', () => {
+    for (let i = 0; i < 12; i++) fetch('http://tracker.invalid/tracker-' + i).catch(() => {});
+    for (let i = 0; i < 3; i++) {
+      const c = new AbortController();
+      fetch('/api/slow', { signal: c.signal }).catch(() => {});
+      setTimeout(() => c.abort(), 5);
+    }
+    fetch('/api/422').catch(() => {});
+  });
+  document.getElementById('later').addEventListener('click', () => {
+    setTimeout(() => {
+      const d = document.createElement('div');
+      d.id = 'toast';
+      d.textContent = 'Coupon expired';
+      document.body.appendChild(d);
+      document.getElementById('price').textContent = '$45';
+    }, 200);
+  });
+  document.getElementById('console').addEventListener('click', () => console.error('console boom'));
+</script>

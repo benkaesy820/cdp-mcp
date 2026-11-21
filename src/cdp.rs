@@ -13,6 +13,173 @@ use tungstenite::{client::client_with_config, protocol::WebSocketConfig, Message
 
 pub type Res<T> = Result<T, String>;
 
+/// Causal events seen while an action settles. Bounded and same-origin: a
+/// failing tracker on another host is noise, and an aborted fetch is not a
+/// failure. The point is one block that says what the click actually caused, so
+/// the agent does not spend two more turns in the console and network panels.
+struct Receipts {
+    origin: String,
+    entries: Vec<Value>,
+    requests: std::collections::HashMap<String, String>,
+}
+
+fn origin_of(url: &str) -> String {
+    let url = url.trim();
+    // A blob URL belongs to the origin inside it; about:/data: have none.
+    let url = url.strip_prefix("blob:").unwrap_or(url);
+    let (scheme, rest) = match url.split_once("://") {
+        Some((s, r)) => (s.to_ascii_lowercase(), r),
+        None => return String::new(),
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("").to_ascii_lowercase();
+    if authority.is_empty() {
+        return format!("{scheme}://");
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => {
+            let bracketed = h.starts_with('[') && h.ends_with(']');
+            if bracketed || (!h.contains(':') && p.parse::<u16>().is_ok()) {
+                (h.to_string(), Some(p.to_string()))
+            } else {
+                (authority.clone(), None)
+            }
+        }
+        None => (authority.clone(), None),
+    };
+    let port = match (scheme.as_str(), port.as_deref()) {
+        ("http", Some("80")) | ("https", Some("443")) => None,
+        (_, p) => p.map(str::to_string),
+    };
+    match port {
+        Some(p) => format!("{scheme}://{host}:{p}"),
+        None => format!("{scheme}://{host}"),
+    }
+}
+
+fn clip_event(s: &str) -> String {
+    s.chars().take(160).collect()
+}
+
+impl Receipts {
+    fn new(origin: String) -> Self {
+        Self { origin, entries: Vec::new(), requests: Default::default() }
+    }
+
+    fn push(&mut self, v: Value) {
+        if self.entries.len() >= 5 || self.entries.iter().any(|e| e == &v) {
+            return;
+        }
+        self.entries.push(v);
+    }
+
+    fn same_origin(&self, url: &str) -> bool {
+        if self.origin.is_empty() {
+            return true;
+        }
+        let other = origin_of(url);
+        if other == self.origin {
+            return true;
+        }
+        // Dev stacks put the app and the API on different loopback ports
+        // (Vite on 5173, the API on 3000). Treat loopback as one origin.
+        let loopback = |o: &str| {
+            o.contains("://localhost")
+                || o.contains("://127.0.0.1")
+                || o.contains("://[::1]")
+        };
+        loopback(&self.origin) && loopback(&other)
+    }
+
+    fn note(&mut self, v: &Value) {
+        let method = v.get("method").and_then(Value::as_str).unwrap_or("");
+        let p = v.get("params").unwrap_or(&Value::Null);
+        match method {
+            "Network.requestWillBeSent" => {
+                let Some(id) = p.get("requestId").and_then(Value::as_str) else { return };
+                let url = p.pointer("/request/url").and_then(Value::as_str).unwrap_or("");
+                let ty = p.get("type").and_then(Value::as_str).unwrap_or("");
+                if self.same_origin(url) && matches!(ty, "XHR" | "Fetch" | "Document") {
+                    if self.requests.len() > 2_000 {
+                        self.requests.clear();
+                    }
+                    self.requests.insert(id.to_string(), url.to_string());
+                } else {
+                    // A redirect reuses the id on another origin: the old
+                    // entry must not blame it for this leg's failure.
+                    self.requests.remove(id);
+                }
+            }
+            "Network.responseReceived" => {
+                let status = p.pointer("/response/status").and_then(Value::as_i64).unwrap_or(0);
+                let url = p.pointer("/response/url").and_then(Value::as_str).unwrap_or("");
+                let ty = p.get("type").and_then(Value::as_str).unwrap_or("");
+                if status >= 400 && self.same_origin(url) && matches!(ty, "XHR" | "Fetch" | "Document") {
+                    self.push(json!({ "kind": "http", "status": status, "url": clip_event(url) }));
+                }
+            }
+            "Network.loadingFinished" => {
+                if let Some(id) = p.get("requestId").and_then(Value::as_str) {
+                    self.requests.remove(id);
+                }
+            }
+            "Network.loadingFailed" => {
+                let Some(id) = p.get("requestId").and_then(Value::as_str) else { return };
+                let err = p.get("errorText").and_then(Value::as_str).unwrap_or("");
+                let canceled = p.get("canceled").and_then(Value::as_bool).unwrap_or(false);
+                let url = self.requests.remove(id);
+                if canceled || err.contains("ERR_ABORTED") {
+                    return;
+                }
+                if let Some(url) = url {
+                    self.push(json!({ "kind": "net", "error": clip_event(err), "url": clip_event(&url) }));
+                }
+            }
+            "Runtime.exceptionThrown" => {
+                let d = p.get("exceptionDetails").unwrap_or(&Value::Null);
+                let url = d
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .or_else(|| d.pointer("/stackTrace/callFrames/0/url").and_then(Value::as_str))
+                    .unwrap_or("");
+                if url.starts_with("chrome-extension://") || (!url.is_empty() && !self.same_origin(url)) {
+                    return;
+                }
+                let text = d
+                    .pointer("/exception/description")
+                    .and_then(Value::as_str)
+                    .or_else(|| d.get("text").and_then(Value::as_str))
+                    .unwrap_or("uncaught exception");
+                self.push(json!({ "kind": "js", "text": clip_event(text) }));
+            }
+            "Runtime.consoleAPICalled" => {
+                if p.get("type").and_then(Value::as_str) != Some("error") {
+                    return;
+                }
+                let text = p
+                    .get("args")
+                    .and_then(Value::as_array)
+                    .map(|args| {
+                        args.iter()
+                            .map(|a| {
+                                a.get("value")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                                    .or_else(|| a.get("description").and_then(Value::as_str).map(str::to_string))
+                                    .or_else(|| a.get("value").map(|v| v.to_string()))
+                                    .unwrap_or_default()
+                            })
+                            .filter(|s| !s.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .unwrap_or_default();
+                self.push(json!({ "kind": "console", "text": clip_event(&text) }));
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Split `http://host:port` into (`host:port`, "").
 fn split_endpoint(endpoint: &str) -> Res<(String, String)> {
     let rest = endpoint
@@ -284,6 +451,8 @@ pub struct Conn {
     /// (`Runtime.executionContextsCleared`, which is what a navigation sends).
     /// Everything installed in the document died with it.
     pub contexts_cleared: bool,
+    /// Causal events for an action that asked for a settle window.
+    receipts: Option<Receipts>,
 }
 
 fn timeout_from_env() -> u64 {
@@ -323,7 +492,8 @@ impl Conn {
         let ms = timeout_from_env();
         let mut conn = Conn { ws, next: 0, focus_on: false, timeout_ms: ms, dead: false, replies: 0,
                               oopifs: Vec::new(), auto_attach: false, runtime_on: false,
-                              binding: None, timed_out: false, contexts_cleared: false };
+                              binding: None, timed_out: false, contexts_cleared: false,
+                              receipts: None };
         conn.set_read_timeout(ms);
         // No domain is enabled on connect: each enable costs a round trip, and
         // most commands do not need one. `enable_runtime` turns on the Runtime
@@ -368,6 +538,9 @@ impl Conn {
             };
             if let Ok(v) = v {
                 self.track_frames(&v);
+                if let Some(r) = self.receipts.as_mut() {
+                    r.note(&v);
+                }
                 return Ok(v);
             }
         }
@@ -528,6 +701,55 @@ impl Conn {
         self.call("Runtime.addBinding", json!({ "name": name }))?;
         self.binding = Some(name.to_string());
         Ok(())
+    }
+
+    /// Start collecting causal events for an action that asked for a settle
+    /// window. Off by default: enabling Network on every click would cost
+    /// latency and fill the socket for actions nobody is debugging.
+    pub fn begin_receipts(&mut self, page_url: &str) -> Res<()> {
+        // Enable first: Runtime.enable replays buffered console entries, and a
+        // receipt armed before the call would blame them on this action.
+        self.enable_runtime()?;
+        self.call("Network.enable", json!({}))?;
+        self.receipts = Some(Receipts::new(origin_of(page_url)));
+        Ok(())
+    }
+
+    /// Read until `quiet_ms` passes with no message while no same-origin
+    /// request is in flight, or `max_ms` elapses, then turn Network off.
+    /// This is a socket read, not a poll: an in-flight API call keeps the
+    /// window open, and a still page costs one timeout.
+    pub fn settle_receipts(&mut self, quiet_ms: u64, max_ms: u64) -> Vec<Value> {
+        let deadline = std::time::Instant::now() + Duration::from_millis(max_ms);
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            let slice = left.min(Duration::from_millis(quiet_ms.max(1)));
+            self.set_read_timeout(slice.as_millis().max(1) as u64);
+            match self.next_msg("action settle", slice.as_millis() as u64) {
+                Ok(_) => continue,
+                Err(_) if self.timed_out => {
+                    let quiet = self.receipts.as_ref().map(|r| r.requests.is_empty()).unwrap_or(true);
+                    if quiet {
+                        break;
+                    }
+                    // A same-origin request is still in flight: keep reading
+                    // until it lands or the cap expires.
+                }
+                Err(_) => break,
+            }
+        }
+        // A quiet exit leaves timed_out set; clear it so the next call does not
+        // mistake a healthy page for a stalled one.
+        self.timed_out = false;
+        let restore = self.timeout_ms;
+        self.set_read_timeout(restore);
+        if !self.dead {
+            let _ = self.call("Network.disable", json!({}));
+        }
+        self.receipts.take().map(|r| r.entries).unwrap_or_default()
     }
 
     /// Block until the page calls `name`, with nothing sent to the page.
@@ -706,5 +928,34 @@ impl Conn {
             return Err(text.to_string());
         }
         Ok(r.pointer("/result/value").cloned().unwrap_or(Value::Null))
+    }
+}
+
+#[cfg(test)]
+mod receipt_tests {
+    use super::*;
+
+    #[test]
+    fn origins_normalise_ports_case_and_blob() {
+        assert_eq!(origin_of("https://Example.COM:443/x"), "https://example.com");
+        assert_eq!(origin_of("http://example.com:80/"), "http://example.com");
+        assert_eq!(origin_of("http://example.com:8080/x"), "http://example.com:8080");
+        assert_eq!(origin_of("blob:https://Example.com/uuid"), "https://example.com");
+    }
+
+    #[test]
+    fn loopback_is_one_origin_across_ports() {
+        let dev = Receipts::new(origin_of("http://127.0.0.1:5173/"));
+        assert!(dev.same_origin("http://127.0.0.1:3000/api"));
+        assert!(dev.same_origin("http://localhost:3000/api"));
+        assert!(!dev.same_origin("https://tracker.invalid/x"));
+    }
+
+    #[test]
+    fn non_loopback_origins_are_strict() {
+        let app = Receipts::new(origin_of("https://app.example.com/"));
+        assert!(app.same_origin("https://app.example.com:443/api"));
+        assert!(!app.same_origin("https://api.example.com/x"));
+        assert!(!app.same_origin("http://app.example.com/x"));
     }
 }

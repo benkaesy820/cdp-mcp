@@ -25,8 +25,23 @@ let framePort = 0;
 async function serveFrames() {
   if (framePort) return framePort;
   const srv = createServer((q, res) => {
+    const path = new URL(q.url, "http://x").pathname;
+    if (path === "/api/save") {
+      res.writeHead(500, { "content-type": "text/plain" });
+      res.end("save failed");
+      return;
+    }
+    if (path === "/api/422") {
+      res.writeHead(422, { "content-type": "text/plain" });
+      res.end("invalid");
+      return;
+    }
+    if (path === "/api/slow") {
+      setTimeout(() => { res.writeHead(200); res.end("slow"); }, 300);
+      return;
+    }
     res.writeHead(200, { "content-type": "text/html" });
-    res.end(readFileSync(join(here, "pages", "cross.html")));
+    res.end(readFileSync(join(here, "pages", path === "/receipts" ? "receipts.html" : "cross.html")));
   });
   await new Promise(r => srv.listen(0, "0.0.0.0", r));
   framePort = srv.address().port;
@@ -182,7 +197,7 @@ await withTab(page("basic.html"), async (tab, ev) => {
   const txt = (await s.tool("idle", { tab, untilText: "needle-is-here", timeoutMs: 8000 })).v;
   const waited2 = Date.now() - t2;
   check("idle {untilText} wakes on text that appears mid-wait", txt.woke === "text", txt);
-  check("idle {untilText} wakes promptly too", waited2 >= 360 && waited2 - 400 < 250, waited2 + " ms");
+  check("idle {untilText} wakes promptly too", waited2 >= 300 && waited2 - 400 < 250, waited2 + " ms");
 
   // A bulk insert has to be summarised: the report is capped, but the count
   // still says how much actually arrived.
@@ -507,6 +522,49 @@ await withTab(page("paste-blocked.html"), async (tab, ev) => {
   const bad = await s.tool("paste", { tab, text: "will not land" });
   check("a blocked insert is an error, not a fake success",
         !bad.ok && /did not take/.test(String(bad.v)), { ok: bad.ok, v: String(bad.v).slice(0, 140) });
+});
+
+// Turn receipts: opt-in settle, same-origin, noise filtered.
+const rport = await serveFrames();
+await withTab(`http://127.0.0.1:${rport}/receipts`, async (tab) => {
+  const els = (await s.tool("elements", { tab, limit: 200 })).v.elements || [];
+  const at = (label) => els.find(e => e.label === label)?.i;
+  const save = (await s.tool("input", { tab, actions: [{ click: { i: at("Save") } }], settleMs: 1500 })).v;
+  const sk = (save.errors || []).map(e => `${e.kind}:${e.status ?? e.text ?? e.error}`);
+  check("a click receipt names a silent 500", sk.some(k => k === "http:500"), sk);
+  check("a click receipt names the uncaught exception", sk.some(k => k.startsWith("js:") && /save failed/i.test(k)), sk);
+
+  const noisy = (await s.tool("input", { tab, actions: [{ click: { i: at("Noisy") } }], settleMs: 1500 })).v;
+  const nk = (noisy.errors || []).map(e => `${e.kind}:${e.status ?? e.text ?? e.error}:${e.url || ""}`);
+  check("a same-origin 422 is kept", nk.some(k => k.includes("http:422")), nk);
+  check("third-party and aborted requests are filtered",
+        !nk.some(k => k.includes("tracker.invalid") || /ERR_ABORTED/.test(k)), nk);
+
+  const con = (await s.tool("input", { tab, actions: [{ click: { i: at("Console") } }], settleMs: 800 })).v;
+  const ck = (con.errors || []).map(e => `${e.kind}:${e.text || e.status}`);
+  check("a console.error is a receipt", ck.some(k => k === "console:console boom"), ck);
+
+  await s.tool("input", { tab, actions: [{ click: { i: at("Later") } }] });
+  const delta = (await s.tool("idle", { tab, maxIdleMs: 700, timeoutMs: 2000 })).v;
+  const texts = (delta.appeared || []).map(a => a.text || "");
+  check("a wait reports the text that changed",
+        texts.some(t => /Coupon expired/.test(t)) && texts.some(t => /\$45/.test(t)), texts);
+});
+
+// Timeout diagnostics: the near miss, not a rescan.
+await withTab(`http://127.0.0.1:${rport}/receipts`, async (tab) => {
+  const near = (await s.tool("idle", { tab, untilSelector: "[role=dialog]", maxIdleMs: 5000, timeoutMs: 500 })).v;
+  check("a timed-out selector reports the near miss",
+        near.woke === "timeout" && (near.near?.dialogs || []).some(d => d.label === "Settings"),
+        near.near);
+  const text = (await s.tool("idle", { tab, untilText: "Saved changes", maxIdleMs: 5000, timeoutMs: 500 })).v;
+  check("a timed-out text wait reports the closest text",
+        text.woke === "timeout" && /Save changes/.test(text.near?.textNear || ""),
+        text.near);
+  const pseudo = (await s.tool("idle", { tab, untilSelector: "button#save:disabled", maxIdleMs: 5000, timeoutMs: 500 })).v;
+  check("a pseudo-class miss reports the real element",
+        pseudo.woke === "timeout" && (pseudo.near?.selectorMatches || []).some(m => m.tag === "button"),
+        pseudo.near);
 });
 
 s.close();

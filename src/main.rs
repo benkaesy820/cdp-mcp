@@ -700,7 +700,8 @@ fn tool_defs() -> Value {
                     "actions": { "type": "array", "items": { "type": "object" } },
                     "tab": { "type": "string" },
                     "announce": { "type": "boolean", "description": "also check for a dialog that appeared because of these actions (default false: costs a round trip)" },
-                    "force": { "type": "boolean", "description": "allow repeating a final confirmation (Post/Publish/Delete/…) that was already clicked in this run. Verify with delta first." }
+                    "force": { "type": "boolean", "description": "allow repeating a final confirmation (Post/Publish/Delete/…) that was already clicked in this run. Verify with delta first." },
+                    "settleMs": { "type": "integer", "description": "after the actions, read CDP events for up to this many ms and return same-origin HTTP 4xx/5xx, uncaught exceptions and console errors in `errors` (default 0 = off). Adds the settle time to the call." }
                 },
                 "required": ["actions"]
             }
@@ -1451,12 +1452,23 @@ fn watch_js(name: &str, until_text: Option<&str>, until_selector: Option<&str>, 
                     if (r.type === 'attributes') continue;
                     const t = r.target && r.target.nodeType === 1 ? r.target : (r.target ? r.target.parentElement : null);
                     if (t && t.closest && t.closest('script,style,noscript,template')) continue;
+                    if (r.type === 'characterData') {{
+                        // A price that changes in place has no added node; the
+                        // parent's current text is the delta the caller wants.
+                        moved = true;
+                        const p = r.target.parentElement;
+                        const d = p ? describe(p) : null;
+                        if (d && added.length < 6) added.push(d);
+                        continue;
+                    }}
                     moved = true;
                     addedCount += r.addedNodes.length;
                     removed += r.removedNodes.length;
                     for (const n of r.addedNodes) {{
                         if (added.length >= 6) break;
-                        const d = describe(n);
+                        // Replacing textContent adds a text node; its parent is
+                        // the element whose text changed.
+                        const d = describe(n.nodeType === 1 ? n : n.parentElement);
                         if (d) added.push(d);
                     }}
                 }}
@@ -1608,6 +1620,117 @@ impl Settled {
 /// is wedged, and a default 30 s eval would make "stop" slower than the wait it
 /// is stopping. The two literals used to be duplicated here and in the wrapper.
 const STOP_WATCH_JS: &str = "try{window.__cdpWatch&&window.__cdpWatch.stop()}catch(e){}0";
+
+/// Cold-path diagnostics for a timeout: the near miss, not a new snapshot.
+/// Only runs when a wait actually expires, behind a 400 ms eval cap.
+fn diagnose_js(sel: Option<&str>, text: Option<&str>) -> String {
+    let sel = sel.map(|s| Value::String(s.to_string())).unwrap_or(Value::Bool(false));
+    let want = text.map(|s| Value::String(s.to_string())).unwrap_or(Value::Bool(false));
+    format!(
+        r#"(() => {{
+            const SEL = {sel}, WANT = {want};
+            const out = {{ selector: null, selectorMatches: [], dialogs: [], textNear: "" }};
+            const describe = (el) => {{
+                if (!el || el.nodeType !== 1) return null;
+                const o = {{ tag: el.tagName.toLowerCase() }};
+                const role = el.getAttribute('role');
+                if (role) o.role = role;
+                const label = el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('name');
+                if (label) o.label = label.slice(0, 60);
+                const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+                if (t) o.text = t;
+                o.visible = !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                return o;
+            }};
+            const roots = [document];
+            let nodes = 4000;
+            try {{
+                for (const el of document.querySelectorAll('*')) {{
+                    if (--nodes <= 0 || roots.length >= 40) break;
+                    if (el.shadowRoot) roots.push(el.shadowRoot);
+                }}
+            }} catch (e) {{}}
+            const seen = new Set();
+            const add = (arr, el) => {{
+                const d = describe(el);
+                if (!d) return;
+                const k = d.tag + '|' + (d.label || '') + '|' + (d.text || '');
+                if (seen.has(k)) return;
+                seen.add(k);
+                arr.push(d);
+            }};
+            try {{
+                for (const root of roots) {{
+                    for (const el of root.querySelectorAll('[aria-modal="true"],dialog[open],[role="dialog"],[role="alertdialog"]')) {{
+                        if (out.dialogs.length >= 3) break;
+                        add(out.dialogs, el);
+                    }}
+                    if (out.dialogs.length >= 3) break;
+                }}
+            }} catch (e) {{}}
+            if (SEL !== false) {{
+                for (const root of roots) {{
+                    try {{
+                        const el = root.querySelector(SEL);
+                        if (el) {{ out.selector = describe(el); break; }}
+                    }} catch (e) {{}}
+                }}
+                if (!out.selector) {{
+                    // Strip pseudo-classes and pseudo-elements, but only when
+                    // that actually leaves a selector to try.
+                    let loose = SEL.replace(/::[\w-]+/g, '').replace(/:([\w-]+)(\([^)]*\))?/g, '');
+                    loose = loose.trim();
+                    if (loose && loose !== SEL.trim()) {{
+                        for (const root of roots) {{
+                            try {{
+                                for (const el of root.querySelectorAll(loose)) {{
+                                    if (out.selectorMatches.length >= 3) break;
+                                    add(out.selectorMatches, el);
+                                }}
+                            }} catch (e) {{}}
+                            if (out.selectorMatches.length >= 3) break;
+                        }}
+                    }}
+                }}
+            }}
+            if (WANT !== false && WANT.length >= 3) {{
+                const words = WANT.split(/\s+/).filter(w => w.length >= 4).sort((a, b) => b.length - a.length);
+                const candidates = words.length ? words : [WANT];
+                let text = '', budget = 100000, nodes2 = 8000;
+                const collect = (root) => {{
+                    try {{
+                        const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+                        let n;
+                        while (budget > 0 && (n = w.nextNode())) {{
+                            const s = n.nodeValue || '';
+                            text += s + ' ';
+                            budget -= s.length;
+                        }}
+                        for (const el of root.querySelectorAll('*')) {{
+                            if (budget <= 0 || --nodes2 <= 0) break;
+                            if (el.shadowRoot) collect(el.shadowRoot);
+                        }}
+                    }} catch (e) {{}}
+                }};
+                collect(document);
+                let hit = -1;
+                const lower = text.toLowerCase();
+                for (const w of candidates) {{
+                    const tries = w.length > 4 ? [w.toLowerCase(), w.slice(0, 4).toLowerCase()] : [w.toLowerCase()];
+                    for (const needle of tries) {{
+                        const i = lower.indexOf(needle);
+                        if (i >= 0) {{ hit = i; break; }}
+                    }}
+                    if (hit >= 0) break;
+                }}
+                if (hit >= 0) out.textNear = text.slice(Math.max(0, hit - 50), hit + 100).replace(/\s+/g, ' ').trim();
+            }}
+            return out;
+        }})()"#,
+        sel = sel,
+        want = want,
+    )
+}
 
 /// Did the editor take the paste after all? Compared against the snapshot the
 /// page stored when a handler cancelled the event and nothing had changed yet.
@@ -1887,6 +2010,21 @@ fn wait_page_settled_inner(
             }
             stop_watch(conn);
             let mut o = settled.report("timeout", &started, &last_event);
+            // Cold path only: one bounded look at the near miss, so the next
+            // turn can correct the selector instead of rescanning the page.
+            if until_selector.is_some() || until_text.is_some() {
+                if let Ok(near) = conn.eval_within(&diagnose_js(until_selector, until_text), 400) {
+                    let has = |k: &str| match near.get(k) {
+                        Some(Value::Array(a)) => !a.is_empty(),
+                        Some(Value::String(s)) => !s.is_empty(),
+                        Some(Value::Null) | None => false,
+                        Some(_) => true,
+                    };
+                    if has("selector") || has("selectorMatches") || has("dialogs") || has("textNear") {
+                        o["near"] = near;
+                    }
+                }
+            }
             o["note"] = json!("waited the full timeout; the page never matched what was asked for");
             return Ok(o);
         }
@@ -2635,9 +2773,35 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
             let actions = args.get("actions").and_then(Value::as_array).ok_or("input needs actions[]")?.clone();
             let announce = args.get("announce").and_then(Value::as_bool).unwrap_or(false);
             let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+            let settle_ms = args.get("settleMs").and_then(Value::as_u64).unwrap_or(0).min(5_000);
             with_conn(&cfg.endpoint, tab, |conn, tab_id| {
                 let scope = scope_for(tab_id);
-                let log = run_input(conn, &actions, force, scope.as_deref())?;
+                // A settle window is opt-in: enabling Network and Log on every
+                // click would add latency to the common case, and most actions
+                // are not being debugged.
+                let (log, errors) = if settle_ms > 0 {
+                    let url = conn
+                        .eval("location.href")
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .unwrap_or_default();
+                    let on = !url.is_empty() && conn.begin_receipts(&url).is_ok();
+                    let result = run_input(conn, &actions, force, scope.as_deref());
+                    let errors = if on {
+                        if result.is_err() {
+                            // Nothing was dispatched cleanly; do not make the
+                            // caller wait out the quiet window as well.
+                            conn.settle_receipts(0, 0)
+                        } else {
+                            conn.settle_receipts(250, settle_ms)
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    (result?, errors)
+                } else {
+                    (run_input(conn, &actions, force, scope.as_deref())?, Vec::new())
+                };
                 let (overlays, url) = if announce {
                     // cheap post-action check: only what appeared because we acted
                     let ov = conn.eval(scan::OVERLAYS_QUICK_JS).unwrap_or(json!([]));
@@ -2646,7 +2810,11 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                 } else {
                     (json!([]), Value::Null)
                 };
-                Ok(json!({ "tab": tab_id, "url": url, "log": log, "overlays": overlays }))
+                let mut out = json!({ "tab": tab_id, "url": url, "log": log, "overlays": overlays });
+                if !errors.is_empty() {
+                    out["errors"] = json!(errors);
+                }
+                Ok(out)
             })
         }
         "images" => {
