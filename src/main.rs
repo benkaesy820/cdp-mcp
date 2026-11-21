@@ -1039,7 +1039,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "profile",
-            "description": "Read or change this agent's settings (a small JSON file). Keys: screenshot_dir, shot_format (png|jpeg), shot_quality. Use set once, and shot() will keep writing there.",
+            "description": "Read or change this agent's settings (a small JSON file). Keys: screenshot_dir, shot_format (png|jpeg|webp), shot_quality. Use set once, and shot() will keep writing there.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1289,6 +1289,13 @@ fn is_text_mime(mime: &str) -> bool {
     mime.starts_with("text/") || matches!(mime, "UTF8_STRING" | "STRING")
 }
 
+/// What X11 should advertise for a MIME. `xclip` publishes exactly the atom it
+/// was handed, and standard apps ask for `UTF8_STRING`; publishing only
+/// `text/plain;charset=utf-8` makes the paste work in Chromium and nowhere else.
+fn x11_target(mime: &str) -> &str {
+    if mime.starts_with("text/plain") { "UTF8_STRING" } else { mime }
+}
+
 fn clip_types_cmd(b: ClipBackend) -> Option<ClipCmd> {
     match b {
         ClipBackend::Wayland => Some(ClipCmd { program: "wl-paste", args: args(&["--list-types"]) }),
@@ -1309,7 +1316,7 @@ fn clip_read_cmd(b: ClipBackend, mime: &str) -> Result<ClipCmd, String> {
         }),
         ClipBackend::X11 => Ok(ClipCmd {
             program: "xclip",
-            args: args(&["-selection", "clipboard", "-o", "-t", mime]),
+            args: args(&["-selection", "clipboard", "-o", "-t", x11_target(mime)]),
         }),
         ClipBackend::Mac if is_text_mime(mime) => Ok(ClipCmd { program: "pbpaste", args: Vec::new() }),
         ClipBackend::Mac => Err(format!(
@@ -1323,7 +1330,7 @@ fn clip_write_cmd(b: ClipBackend, mime: &str) -> Result<ClipCmd, String> {
         ClipBackend::Wayland => Ok(ClipCmd { program: "wl-copy", args: args(&["--type", mime]) }),
         ClipBackend::X11 => Ok(ClipCmd {
             program: "xclip",
-            args: args(&["-selection", "clipboard", "-i", "-t", mime]),
+            args: args(&["-selection", "clipboard", "-i", "-t", x11_target(mime)]),
         }),
         ClipBackend::Mac if is_text_mime(mime) => Ok(ClipCmd { program: "pbcopy", args: Vec::new() }),
         ClipBackend::Mac => Err(format!(
@@ -1333,20 +1340,20 @@ fn clip_write_cmd(b: ClipBackend, mime: &str) -> Result<ClipCmd, String> {
     }
 }
 
-/// Run a clipboard command, optionally feeding it a file. `None` on any failure.
-fn run_clip_cmd(cmd: &ClipCmd, stdin: Option<std::fs::File>) -> Option<Vec<u8>> {
-    let mut c = std::process::Command::new(cmd.program);
-    c.args(&cmd.args);
-    match stdin {
-        Some(f) => c.stdin(std::process::Stdio::from(f)),
-        None => c.stdin(std::process::Stdio::null()),
-    };
-    c.output().ok().filter(|o| o.status.success()).map(|o| o.stdout)
+/// Run a clipboard command. `None` on any failure.
+fn run_clip_cmd(cmd: &ClipCmd) -> Option<Vec<u8>> {
+    std::process::Command::new(cmd.program)
+        .args(&cmd.args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| o.stdout)
 }
 
 fn clip_types(b: ClipBackend) -> Vec<String> {
     match clip_types_cmd(b) {
-        Some(cmd) => run_clip_cmd(&cmd, None)
+        Some(cmd) => run_clip_cmd(&cmd)
             .map(|out| String::from_utf8_lossy(&out).lines().map(str::to_string).collect())
             .unwrap_or_default(),
         None => Vec::new(),
@@ -1355,7 +1362,7 @@ fn clip_types(b: ClipBackend) -> Vec<String> {
 
 fn clip_read_from(b: ClipBackend, mime: &str) -> Option<Vec<u8>> {
     let cmd = clip_read_cmd(b, mime).ok()?;
-    run_clip_cmd(&cmd, None)
+    run_clip_cmd(&cmd)
 }
 
 fn clip_read(mime: &str) -> Option<Vec<u8>> {
@@ -1369,8 +1376,8 @@ fn clip_write(mime: &str, bytes: &[u8]) -> Result<(), String> {
     let cmd = clip_write_cmd(backend, mime)?;
     // A file gives the writer a clean EOF. wl-copy forks and serves the
     // selection from its child, so a pipe we own is a lifetime race.
-    let tmp = std::env::temp_dir().join(format!("cdp-mcp-clip-{}", std::process::id()));
-    std::fs::write(&tmp, bytes).map_err(|e| format!("cannot stage the clipboard payload: {e}"))?;
+    let tmp = clip_temp("cdp-mcp-clip");
+    clip_stage(&tmp, bytes).map_err(|e| format!("cannot stage the clipboard payload: {e}"))?;
     let file = std::fs::File::open(&tmp).map_err(|e| format!("cannot open {}: {e}", tmp.display()))?;
     // stdout and stderr null on purpose: wl-copy forks a child that serves the
     // selection, and that child would otherwise inherit this process's stdio and
@@ -1402,8 +1409,10 @@ fn clip_save() -> Option<(String, Vec<u8>)> {
             }
         }
     }
-    // A backend that cannot list what it holds (macOS pbpaste): try text.
-    if types.is_empty() {
+    // A backend that cannot list what it holds (macOS pbpaste): try text. An
+    // empty list from a backend that *can* list means an empty clipboard, and a
+    // second read would just fail slowly.
+    if clip_types_cmd(backend).is_none() {
         let want = "text/plain;charset=utf-8";
         if let Some(bytes) = clip_read_from(backend, want) {
             if !bytes.is_empty() && bytes.len() < 32 * 1024 * 1024 {
@@ -1440,8 +1449,28 @@ fn sh_quote(s: &str) -> String {
     }
 }
 
-/// Say something in the chat window. Silent if it is not running: this is a
-/// courtesy, never a dependency.
+/// A fresh temp path per call: two clipboard writes inside the restore delay
+/// must not share a file, or the first restore deletes the second payload.
+fn clip_temp(prefix: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+}
+
+/// Write clipboard bytes where only this user can read them.
+fn clip_stage(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    use std::io::Write as _;
+    opts.open(path)?.write_all(bytes)
+}
 
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -4059,29 +4088,44 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                                       "bytes": payload.len(), "via": how }));
                 }
 
-                // method "system": the real clipboard and a real Ctrl+V. Only
-                // works while the browser window has keyboard focus.
+                // method "system": the real clipboard and a real Ctrl+V. Only works while
+                // the browser window has keyboard focus.
                 clip_write(mime, &payload)?;
-                // The writer's child claims the selection after the parent
-                // exits, so wait until the clipboard really holds our bytes;
-                // pasting sooner pastes whatever was there before.
+                // From here on the human's clipboard is already overwritten, so every exit has
+                // to schedule the restore — including a failed keystroke. The result is
+                // carried, not returned early.
+                let mut outcome: Result<(), String> = Ok(());
+                // The writer's child claims the selection after the parent exits, so wait
+                // until the clipboard really holds our bytes; pasting sooner pastes whatever
+                // was there before.
                 let started = std::time::Instant::now();
                 while started.elapsed().as_millis() < 1_500 {
                     if clip_read(mime).is_some_and(|b| b.len() == payload.len() && (path.is_some() || b == payload)) {
                         break;
                     }
-                    nap(30)?;
+                    if let Err(e) = nap(30) {
+                        outcome = Err(e);
+                        break;
+                    }
                 }
-                let key = json!({ "modifiers": 2, "key": "v", "code": "KeyV",
-                                  "windowsVirtualKeyCode": 86, "nativeVirtualKeyCode": 86 });
-                let mut down = key.clone();
-                down["type"] = json!("keyDown");
-                // A modifier bitmask alone does not make the browser perform a
-                // paste; the editing command has to be named explicitly.
-                down["commands"] = json!(["paste"]);
-                let mut up = key; up["type"] = json!("keyUp");
-                conn.call_many(&[("Input.dispatchKeyEvent", down), ("Input.dispatchKeyEvent", up)])?;
-                nap(400)?;
+                if outcome.is_ok() {
+                    // macOS pastes with Cmd, everyone else with Control: the modifier has to
+                    // match or the browser ignores the chord.
+                    let mods = if current_os() == Os::Mac { 4 } else { 2 };
+                    let key = json!({ "modifiers": mods, "key": "v", "code": "KeyV",
+                                      "windowsVirtualKeyCode": 86, "nativeVirtualKeyCode": 86 });
+                    let mut down = key.clone();
+                    down["type"] = json!("keyDown");
+                    // A modifier bitmask alone does not make the browser perform a paste; the
+                    // editing command has to be named explicitly.
+                    down["commands"] = json!(["paste"]);
+                    let mut up = key; up["type"] = json!("keyUp");
+                    outcome = conn.call_many(&[("Input.dispatchKeyEvent", down), ("Input.dispatchKeyEvent", up)])
+                        .map(|_| ());
+                    if outcome.is_ok() {
+                        outcome = nap(400);
+                    }
+                }
 
                 // Put the caller's clipboard back — but out of process and a
                 // couple of seconds later. The writer forks, and its child
@@ -4091,8 +4135,8 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                 let backend = clip_backend();
                 let restored = match (&saved, backend) {
                     (Some((m, b)), Some(bk)) => {
-                        let tmp = std::env::temp_dir().join(format!("cdp-mcp-restore-{}", std::process::id()));
-                        if std::fs::write(&tmp, b).is_ok() {
+                        let tmp = clip_temp("cdp-mcp-restore");
+                        if clip_stage(&tmp, b).is_ok() {
                             match clip_restore_script(bk, m, &tmp.to_string_lossy()) {
                                 Ok(cmd) => std::process::Command::new("sh")
                                     .arg("-c")
@@ -4114,6 +4158,7 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                     }
                     _ => false,
                 };
+                outcome?;
                 Ok(json!({ "tab": tab_id, "pasted": pasted, "mime": mime, "bytes": payload.len(),
                            "via": "system clipboard + Ctrl+V",
                            "clipboardRestoreScheduled": restored,
@@ -4635,9 +4680,13 @@ mod tests {
         assert_eq!(w.program, "wl-copy");
         assert_eq!(w.args, ["--type", "image/png"]);
 
+        // xclip publishes only the atom it is given, and standard X11 apps ask
+        // for UTF8_STRING, so text/plain* is advertised under that name.
         let x = clip_write_cmd(ClipBackend::X11, "text/plain").unwrap();
         assert_eq!(x.program, "xclip");
-        assert_eq!(x.args, ["-selection", "clipboard", "-i", "-t", "text/plain"]);
+        assert_eq!(x.args, ["-selection", "clipboard", "-i", "-t", "UTF8_STRING"]);
+        let xi = clip_write_cmd(ClipBackend::X11, "image/png").unwrap();
+        assert_eq!(xi.args, ["-selection", "clipboard", "-i", "-t", "image/png"]);
 
         let m = clip_write_cmd(ClipBackend::Mac, "text/plain;charset=utf-8").unwrap();
         assert_eq!(m.program, "pbcopy");
@@ -4648,7 +4697,7 @@ mod tests {
         assert_eq!(r.program, "wl-paste");
         assert_eq!(r.args, ["--type", "text/plain", "--no-newline"]);
 
-        let rx = clip_read_cmd(ClipBackend::X11, "UTF8_STRING").unwrap();
+        let rx = clip_read_cmd(ClipBackend::X11, "text/plain;charset=utf-8").unwrap();
         assert_eq!(rx.args, ["-selection", "clipboard", "-o", "-t", "UTF8_STRING"]);
 
         assert_eq!(clip_read_cmd(ClipBackend::Mac, "text/plain").unwrap().program, "pbpaste");
@@ -4667,10 +4716,25 @@ mod tests {
         let m = clip_restore_script(ClipBackend::Mac, "text/plain;charset=utf-8", "/tmp/x").unwrap();
         assert!(m.starts_with("sleep 2; pbcopy < /tmp/x; rm -f /tmp/x"), "{m}");
 
-        let x = clip_restore_script(ClipBackend::X11, "UTF8_STRING", "/tmp/y").unwrap();
+        let x = clip_restore_script(ClipBackend::X11, "text/plain;charset=utf-8", "/tmp/y").unwrap();
         assert!(x.contains("xclip -selection clipboard -i -t UTF8_STRING < /tmp/y"), "{x}");
 
         assert!(clip_restore_script(ClipBackend::Mac, "image/png", "/tmp/x").is_err());
+    }
+
+    #[test]
+    fn clipboard_staging_is_unique_and_private() {
+        let a = clip_temp("cdp-mcp-test");
+        let b = clip_temp("cdp-mcp-test");
+        assert_ne!(a, b, "two writes inside the restore delay must not share a file");
+        clip_stage(&a, b"secret").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&a).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "clipboard bytes must not be world-readable");
+        }
+        std::fs::remove_file(&a).ok();
     }
 
 }
