@@ -1,8 +1,9 @@
 <!doctype html><meta charset="utf-8"><title>cross</title>
 <body style="margin:0;font:14px sans-serif">
 <button onclick="parent.postMessage({hit:'cross'},'*')">Reject all</button>
-<!-- A final confirmation inside a frame must hit the same guard as a page one. -->
-<button onclick="parent.postMessage({hit:'framedelete'},'*')">Delete</button>
+<!-- A final confirmation inside a frame must hit the same guard as a page one.
+     Its name is in title, not the text, so the label rule is exercised too. -->
+<button title="Delete" onclick="parent.postMessage({hit:'framedelete'},'*')">×</button>
 <div style="height:400px"></div>
 <button onclick="parent.postMessage({hit:'cross-far'},'*')">Cross far</button>
 <!-- The frame scan must read form state by the same rules as the main one. -->

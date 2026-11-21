@@ -41,7 +41,7 @@ async function serveFrames() {
       return;
     }
     res.writeHead(200, { "content-type": "text/html" });
-    const file = path === "/receipts" ? "receipts.html" : path === "/sprint2" ? "sprint2.html" : "cross.html";
+    const file = path === "/receipts" ? "receipts.html" : path === "/sprint2" ? "sprint2.html" : path === "/imgs" ? "imgs.html" : "cross.html";
     res.end(readFileSync(join(here, "pages", file)));
   });
   await new Promise(r => srv.listen(0, "0.0.0.0", r));
@@ -375,6 +375,36 @@ await withTab(page("frames.html?port=" + fport), async (tabA) => {
           { a: JSON.stringify(ca.v).slice(0, 120), b: JSON.stringify(cb.v).slice(0, 120), ha, hb });
   } finally {
     // A failed assertion must not leave a second tab behind for the next run.
+    await s.tool("tabs", { action: "close", tab: tabB });
+  }
+});
+
+// `images` lists only <img> that have a source, so image {i} must index that
+// same list: a lazy placeholder before the real image shifted every index.
+await withTab(`http://localhost:${fport}/imgs`, async (tab) => {
+  const listed = (await s.tool("images", { tab })).v;
+  check("images lists only images with a source",
+        listed.count === 1 && /real-image\.png$/.test(listed.images?.[0]?.src || ""),
+        listed.images?.map(i => i.src));
+  const opened = (await s.tool("image", { tab, action: "open", i: 0 })).v;
+  check("an image index matches the images list",
+        /real-image\.png$/.test(opened.url || ""), opened);
+  if (opened.tab) await s.tool("tabs", { action: "close", tab: opened.tab });
+});
+
+// A flow's own tab must reach its steps: they used to run on whatever tab the
+// last call happened to touch.
+await withTab(`http://localhost:${fport}/receipts`, async (tabA) => {
+  const tabB = (await s.tool("tabs", { action: "open", url: `http://localhost:${fport}/sprint2` })).v.tab;
+  try {
+    await s.tool("elements", { tab: tabA, limit: 5 }); // make tabA the last tab used
+    const flow = (await s.tool("flow", {
+      tab: tabB,
+      steps: [{ tool: "eval", args: { expression: "document.title" } }],
+    })).v;
+    const got = flow.trail?.[0]?.log?.[0]?.result?.value;
+    check("a flow runs its steps on the tab it names", got === "cdp-mcp sprint 2", { got, tabB });
+  } finally {
     await s.tool("tabs", { action: "close", tab: tabB });
   }
 });

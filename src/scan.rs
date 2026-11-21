@@ -363,19 +363,24 @@ pub const FRAME_ELEMENTS_JS: &str = r#"(() => {
   const sel = 'a[href], button, input, select, textarea, summary, [role="button"], [role="link"], [role="tab"], [role="menuitem"], [role="checkbox"], [role="radio"], [role="switch"], [role="combobox"], [contenteditable]:not([contenteditable="false"]), [onclick], [tabindex]:not([tabindex="-1"])';
   const out = [];
   const seen = new Set();
-  const labelOf = (el) => {
-    const aria = el.getAttribute && el.getAttribute('aria-label');
-    const t = (aria || el.innerText || el.value || el.getAttribute('title')
-      || el.getAttribute('placeholder') || el.getAttribute('alt') || '').trim().replace(/\s+/g, ' ');
-    return t.slice(0, 60);
-  };
+  // Same order and cap as SCAN_JS. The label decides the irreversible-click
+  // guard, so a frame must not name a button differently from the page.
+  const labelOf = (el) => String(
+    el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('title') ||
+    el.innerText || el.value || el.getAttribute('name') || ''
+  ).trim().replace(/\s+/g, ' ').slice(0, 90);
   const walk = (root) => {
     for (const el of root.querySelectorAll(sel)) {
       if (out.length >= 300) return;
       const r = el.getBoundingClientRect();
       if (r.width < 2 || r.height < 2) continue;
-      const st = getComputedStyle(el);
-      if (st.visibility === 'hidden' || st.display === 'none' || st.opacity === '0') continue;
+      // Same rule as SCAN_JS: checkVisibility sees hidden ancestors, which
+      // computed style alone does not (an element under opacity:0 is invisible).
+      if (el.checkVisibility && !el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) continue;
+      if (!el.checkVisibility) {
+        const st = getComputedStyle(el);
+        if (st.visibility === 'hidden' || st.display === 'none' || st.opacity === '0') continue;
+      }
       const key = Math.round(r.x) + ',' + Math.round(r.y) + ',' + Math.round(r.width);
       if (seen.has(key)) continue;
       seen.add(key);

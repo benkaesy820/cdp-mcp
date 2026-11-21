@@ -879,19 +879,47 @@ impl Conn {
     /// `call`, addressed to an attached child session (an iframe) when given.
     pub fn call_in(&mut self, session: Option<&str>, method: &str, params: Value) -> Res<Value> {
         let id = self.send_to(session, method, &params)?;
-        let ms = self.timeout_ms;
-        loop {
-            let v = self.next_msg(method, ms)?;
-            if v.get("id").and_then(Value::as_i64) != Some(id) {
-                continue; // an event, or a late reply to a call that timed out
+        let total = self.timeout_ms;
+        let replies = self.await_replies(&[id], method, total);
+        self.set_read_timeout(total);
+        let v = replies?.into_iter().next().unwrap_or(Value::Null);
+        if let Some(err) = v.get("error") {
+            let m = err.get("message").and_then(Value::as_str).unwrap_or("unknown error");
+            return Err(format!("{method}: {m}"));
+        }
+        Ok(v.get("result").cloned().unwrap_or(Value::Null))
+    }
+
+    /// One reply per id, within `total` milliseconds overall.
+    ///
+    /// The per-read timeout alone cannot bound a call: every protocol event
+    /// resets it, so a page emitting events faster than the timeout can keep a
+    /// stalled reply waiting forever. The deadline is fixed here instead, and
+    /// each read gets only what is left of it.
+    fn await_replies(&mut self, ids: &[i64], waiting: &str, total: u64) -> Res<Vec<Value>> {
+        let deadline = std::time::Instant::now() + Duration::from_millis(total);
+        let mut got: Vec<Option<Value>> = vec![None; ids.len()];
+        let mut left = ids.len();
+        while left > 0 {
+            let remaining = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis() as u64;
+            if remaining == 0 {
+                self.timed_out = true;
+                return Err(format!("{waiting}: no reply within {total} ms (the page is busy or frozen)"));
+            }
+            self.set_read_timeout(remaining);
+            let v = self.next_msg(waiting, remaining)?;
+            let Some(id) = v.get("id").and_then(Value::as_i64) else { continue };
+            let Some(slot) = ids.iter().position(|i| *i == id) else { continue };
+            if got[slot].is_some() {
+                continue;
             }
             self.replies += 1;
-            if let Some(err) = v.get("error") {
-                let m = err.get("message").and_then(Value::as_str).unwrap_or("unknown error");
-                return Err(format!("{method}: {m}"));
-            }
-            return Ok(v.get("result").cloned().unwrap_or(Value::Null));
+            got[slot] = Some(v);
+            left -= 1;
         }
+        Ok(got.into_iter().map(|v| v.unwrap_or(Value::Null)).collect())
     }
 
     /// `call` with its own reply deadline, for a command that legitimately
@@ -915,31 +943,25 @@ impl Conn {
             ids.push(self.send_cmd(method, params)?);
         }
         let label = cmds.first().map(|c| c.0).unwrap_or("batched call");
-        let ms = self.timeout_ms;
-        let mut got: Vec<Option<Value>> = vec![None; ids.len()];
-        let mut left = ids.len();
+        let total = self.timeout_ms;
+        let replies = self.await_replies(&ids, label, total);
+        self.set_read_timeout(total);
+        let replies = replies?;
         let mut first_err: Option<String> = None;
-        while left > 0 {
-            let v = self.next_msg(label, ms)?;
-            let Some(id) = v.get("id").and_then(Value::as_i64) else { continue };
-            let Some(slot) = ids.iter().position(|i| *i == id) else { continue };
-            if got[slot].is_some() {
-                continue;
-            }
-            self.replies += 1;
-            left -= 1;
-            // Drain every reply before failing, so none of them is left on the
-            // socket to be mistaken for the answer to a later call.
+        let mut out = Vec::with_capacity(replies.len());
+        // Every reply is collected before failing, so none is left on the socket
+        // to be mistaken for the answer to a later call.
+        for v in replies {
             if let Some(err) = v.get("error") {
                 let m = err.get("message").and_then(Value::as_str).unwrap_or("unknown error");
                 first_err.get_or_insert_with(|| format!("{label}: {m}"));
             }
-            got[slot] = Some(v.get("result").cloned().unwrap_or(Value::Null));
+            out.push(v.get("result").cloned().unwrap_or(Value::Null));
         }
         if let Some(e) = first_err {
             return Err(e);
         }
-        Ok(got.into_iter().map(Option::unwrap_or_default).collect())
+        Ok(out)
     }
 
     /// Evaluate JS in the page and return the value as JSON.

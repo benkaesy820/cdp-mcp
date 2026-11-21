@@ -22,9 +22,8 @@ use std::io::{self, BufRead, Write};
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Irreversible actions already performed in this process.
-/// Keyed by label + index, so a retry loop is caught while a *different* post is
-/// not: "Post" on post A does not block "Post" on post B. Two tabs are not told
-/// apart; a false refusal needs one `force:true`.
+/// Keyed by tab + label + index: a retry loop is caught, a *different* post is
+/// not, and a same-labelled button on another tab is a different click.
 fn guard() -> &'static Mutex<HashSet<String>> {
     static DONE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     DONE.get_or_init(|| Mutex::new(HashSet::new()))
@@ -43,8 +42,8 @@ fn irreversible(label: &str) -> bool {
 /// Refuse a second click on the same final confirmation in one run, unless the
 /// caller forced it. One place, because the frame path and the page path must
 /// not drift: a frame click that skipped this would be a way around it.
-fn guard_irreversible(label: &str, i: u64, force: bool) -> Result<(), String> {
-    let key = format!("{label}|{i}");
+fn guard_irreversible(tab: &str, label: &str, i: u64, force: bool) -> Result<(), String> {
+    let key = format!("{tab}|{label}|{i}");
     let already = guard().lock().unwrap().contains(&key);
     if already && !force {
         return Err(format!(
@@ -357,6 +356,8 @@ fn scan_with_frames(conn: &mut cdp::Conn, scope: Option<&str>) -> Result<Value, 
         let origin = match conn.eval(&format!(
             "(() => {{ const f = [...document.querySelectorAll('iframe, frame')].find(f => (f.src || '') === {src}); \
                if (!f) return null; const r = f.getBoundingClientRect(); \
+               if (r.width < 2 || r.height < 2) return null; \
+               if (f.checkVisibility && !f.checkVisibility({{ checkOpacity: true, checkVisibilityCSS: true }})) return null; \
                return JSON.stringify({{ x: r.left + f.clientLeft, y: r.top + f.clientTop, w: f.clientWidth, h: f.clientHeight }}); }})()",
             src = serde_json::to_string(&url).unwrap_or_else(|_| "null".into())
         )) {
@@ -386,6 +387,11 @@ fn scan_with_frames(conn: &mut cdp::Conn, scope: Option<&str>) -> Result<Value, 
                 k.get("w").and_then(Value::as_f64).unwrap_or(0.0),
                 k.get("h").and_then(Value::as_f64).unwrap_or(0.0),
             );
+            // The click lands at the child's centre, so the centre is the point
+            // that has to be inside the frame: an edge-flush element whose
+            // rounded edges overshoot by a pixel is still clickable, and one
+            // whose centre is outside is not.
+            let (lx, ly) = ((x + w / 2.0).round(), (y + h / 2.0).round());
             if let Some(o) = k.as_object_mut() {
                 o.insert("i".into(), json!(elements.len()));
                 o.insert("x".into(), json!((x + ox + w / 2.0).round() as i64));
@@ -395,12 +401,12 @@ fn scan_with_frames(conn: &mut cdp::Conn, scope: Option<&str>) -> Result<Value, 
                 // The target id survives a reconnect; the session id does not.
                 o.insert("target".into(), json!(target));
                 // Local centre, which is what a click inside the frame needs.
-                o.insert("lx".into(), json!((x + w / 2.0).round() as i64));
-                o.insert("ly".into(), json!((y + h / 2.0).round() as i64));
+                o.insert("lx".into(), json!(lx as i64));
+                o.insert("ly".into(), json!(ly as i64));
             }
-            let inside = x >= 0.0 && y >= 0.0
-                && x + w <= origin.get("w").and_then(Value::as_f64).unwrap_or(0.0)
-                && y + h <= origin.get("h").and_then(Value::as_f64).unwrap_or(0.0);
+            let fw = origin.get("w").and_then(Value::as_f64).unwrap_or(0.0);
+            let fh = origin.get("h").and_then(Value::as_f64).unwrap_or(0.0);
+            let inside = lx >= 0.0 && ly >= 0.0 && lx <= fw && ly <= fh;
             if !inside {
                 if let Some(o) = k.as_object_mut() {
                     o.insert("off".into(), json!(true));
@@ -469,17 +475,24 @@ fn frame_target(
     // target id survives both, which is why the scan records it.
     let want = el.get("target").and_then(Value::as_str).unwrap_or_default();
     if !want.is_empty() {
-        let live = conn.frames().ok();
-        match live.as_ref().and_then(|fs| fs.iter().find(|f| f.0 == want)) {
-            Some((_, s, _)) => session = s.clone(),
-            // The frame is gone, or it is same-origin now. Falling through to
-            // the main document would act on a different element with this index.
-            None if live.is_some() => {
+        match conn.frames() {
+            Ok(frames) => match frames.iter().find(|f| f.0 == want) {
+                Some((_, s, _)) => session = s.clone(),
+                // The frame is gone, or it is same-origin now. Falling through to
+                // the main document would act on a different element with this index.
+                None => {
+                    return Err(format!(
+                        "element {i} was inside a frame that is no longer there; call elements again"
+                    ));
+                }
+            },
+            // Without the frame list the cached session cannot be trusted: it may
+            // belong to a connection that is gone.
+            Err(e) => {
                 return Err(format!(
-                    "element {i} was inside a frame that is no longer there; call elements again"
+                    "cannot resolve the frame for element {i} ({e}); call elements again"
                 ));
             }
-            None => {}
         }
     }
     // The same refusals the page path makes, from the state the frame scan
@@ -498,7 +511,7 @@ fn frame_target(
     }
     if let Some(text) = label.as_str() {
         if irreversible(text) {
-            guard_irreversible(text, i, force)?;
+            guard_irreversible(tab, text, i, force)?;
         }
     }
     let x = el.get("lx").and_then(Value::as_f64).unwrap_or(0.0);
@@ -516,9 +529,15 @@ fn frame_click(
     count: u64,
     mods: u32,
 ) -> Result<(), String> {
+    // The same three events the page path sends, and the same held-button mask:
+    // a right click with buttons:1 is a left-button state to the page's scripts.
+    let held = match button { "right" => 2, "middle" => 4, _ => 1 };
+    conn.call_in(Some(session), "Input.dispatchMouseEvent", json!({
+        "type": "mouseMoved", "x": x, "y": y, "modifiers": mods,
+    }))?;
     conn.call_in(Some(session), "Input.dispatchMouseEvent", json!({
         "type": "mousePressed", "x": x, "y": y, "button": button,
-        "clickCount": count, "buttons": 1, "modifiers": mods,
+        "clickCount": count, "buttons": held, "modifiers": mods,
     }))?;
     conn.call_in(Some(session), "Input.dispatchMouseEvent", json!({
         "type": "mouseReleased", "x": x, "y": y, "button": button,
@@ -2285,7 +2304,7 @@ fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], force: bool, sc
                 }
                 if let Some(label) = at.get("label").and_then(Value::as_str) {
                     if irreversible(label) {
-                        guard_irreversible(label, i, force)?;
+                        guard_irreversible(tab, label, i, force)?;
                     }
                 }
                 let x = at.get("x").and_then(Value::as_f64).unwrap_or(0.0);
@@ -2443,6 +2462,17 @@ fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], force: bool, sc
     Ok(json!(log))
 }
 
+/// A step inherits the caller's tab unless it names one: `flow {tab}` used to
+/// leave its steps on whatever tab the last call happened to touch.
+fn inherit_tab(mut a: Value, tab: Option<&str>) -> Value {
+    if let (Some(t), Some(o)) = (tab, a.as_object_mut()) {
+        if !o.contains_key("tab") {
+            o.insert("tab".into(), json!(t));
+        }
+    }
+    a
+}
+
 fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
     let tab = args.get("tab").and_then(Value::as_str);
     match name {
@@ -2471,7 +2501,7 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                 let mut iteration_log = Vec::new();
                 for step in &steps {
                     let name = step.get("tool").and_then(Value::as_str).unwrap_or("");
-                    let a = step.get("args").cloned().unwrap_or(json!({}));
+                    let a = inherit_tab(step.get("args").cloned().unwrap_or(json!({})), tab);
                     match call_tool(cfg, name, &a) {
                         Ok(v) => iteration_log.push(json!({ "tool": name, "ok": true, "result": v })),
                         Err(e) => {
@@ -3148,7 +3178,7 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                     (Some(u), _) => u,
                     (None, Some(i)) => conn
                         .eval(&format!(
-                            "(() => {{ const im = document.querySelectorAll('img')[{i}]; return im ? (im.currentSrc || im.src) : null; }})()"
+                            "(() => {{ const im = [...document.querySelectorAll('img')].filter(i => i.currentSrc || i.src)[{i}]; return im ? (im.currentSrc || im.src) : null; }})()"
                         ))?
                         .as_str()
                         .ok_or_else(|| format!("no image at index {i}"))?
@@ -3248,7 +3278,7 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                     (Some(u), _) => u,
                     (None, Some(i)) => {
                         let v = conn.eval(
-                            "(() => { const im = document.querySelectorAll('img')[INDEX]; return im ? (im.currentSrc || im.src) : null; })()"
+                            "(() => { const im = [...document.querySelectorAll('img')].filter(i => i.currentSrc || i.src)[INDEX]; return im ? (im.currentSrc || im.src) : null; })()"
                                 .replace("INDEX", &i.to_string())
                                 .as_str(),
                         )?;
@@ -3680,6 +3710,11 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                 // forces frames while it runs, so the frame arriving (or not)
                 // is also the honest answer to "can this be captured at all".
                 if let Err(why) = conn.start_frames() {
+                    // Hand the tab back before returning: a borrowed tab must not
+                    // keep rendering because a capture failed.
+                    if borrowed {
+                        let _ = conn.set_focus_emulation(false);
+                    }
                     return Err(format!(
                         "no frame: the browser window is not on the workspace you are viewing, \
                          so it is not being rendered. Switch to it and retry, or skip the \
