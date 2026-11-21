@@ -300,6 +300,83 @@ await withTab(page("frames.html?port=" + fport), async (tab, ev) => {
     const h = await H();
     check("cross-origin frame button is clickable", !!(h.cross || h["cross-far"]), h);
   }
+
+  // The frame branch is not a way around the click rules: a final confirmation
+  // is guarded, and a disabled control is refused, exactly as in the page.
+  const del = els.find(e => (e.label || "").trim() === "Delete");
+  const g1 = await s.tool("input", { tab, actions: [{ click: { i: del?.i } }] });
+  const g2 = await s.tool("input", { tab, actions: [{ click: { i: del?.i } }] });
+  check("a frame click on a final confirmation is guarded like a page click",
+        g1.ok && !g2.ok && /already clicked/.test(String(g2.v)),
+        { first: g1.ok, second: String(g2.v).slice(0, 140) });
+  const ffieldEl = els.find(e => (e.label || "").trim() === "Frame Field");
+  const fdis = await s.tool("input", { tab, actions: [{ click: { i: ffieldEl?.i } }] });
+  check("a disabled control in a cross-origin frame is refused",
+        !fdis.ok && /"reason":"disabled"/.test(String(fdis.v)), String(fdis.v).slice(0, 140));
+  // force is the documented bypass on the page path; it must be one on frames too,
+  // or a refusal can never be lifted.
+  const g3 = await s.tool("input", { tab, actions: [{ click: { i: del?.i } }], force: true });
+  const fforce = await s.tool("input", { tab, actions: [{ click: { i: ffieldEl?.i } }], force: true });
+  check("force bypasses the frame refusals", g3.ok && fforce.ok,
+        { guarded: g3.ok, disabled: fforce.ok, v: String(fforce.v).slice(0, 120) });
+
+  // Below the frame's own fold: the page cannot scroll the frame's document, so
+  // clicking would dispatch outside its viewport and burn the guard for nothing.
+  const offEl = els.find(e => (e.label || "").trim() === "Cross far");
+  const offClick = await s.tool("input", { tab, actions: [{ click: { i: offEl?.i } }] });
+  check("a frame element outside the frame's box is refused",
+        !offClick.ok && /"reason":"outside_frame"/.test(String(offClick.v)),
+        String(offClick.v).slice(0, 140));
+
+  // A scoped click indexes the scoped list, which holds no frame elements; it
+  // must not fall back to the tab's unscoped scan and hit the frame anyway.
+  const hitsBefore = (await H()).cross || 0;
+  const scopedClick = await s.tool("input", { tab, actions: [{ click: { i: cross.i, within: "body" } }] });
+  await sleep(250);
+  const hitsAfter = (await H()).cross || 0;
+  check("a scoped click never resolves into a cross-origin frame",
+        hitsAfter === hitsBefore,
+        { ok: scopedClick.ok, v: String(scopedClick.v).slice(0, 120), before: hitsBefore, after: hitsAfter });
+  // A scope is this document only: appending frame elements would hand the
+  // caller indexes outside what it scoped, and cross-origin ones at that.
+  const scopedFrame = (await s.tool("elements", { tab, within: "body", limit: 999 })).v;
+  const sfEls = scopedFrame.elements || [];
+  check("a scoped scan leaves cross-origin frames out",
+        scopedFrame.framesScanned === 0 &&
+        sfEls.some(e => (e.label || "").trim() === "Top button") &&
+        !sfEls.some(e => /Cross far|Reject all/.test(e.label || "")),
+        { framesScanned: scopedFrame.framesScanned, labels: sfEls.map(e => e.label).slice(0, 10) });
+});
+
+// Two tabs are cached at once. A frame click must resolve against the tab it
+// names: reading whichever cache entry came first aimed the event at another
+// page's session, so one of two otherwise identical clicks failed.
+await withTab(page("frames.html?port=" + fport), async (tabA) => {
+  const tabB = (await s.tool("tabs", { action: "open", url: page("frames.html?port=" + fport) })).v.tab;
+  try {
+    const frameEl = async (t) => {
+      for (let i = 0; i < 20; i++) {
+        const els = (await s.tool("elements", { tab: t, limit: 999 })).v.elements || [];
+        const c = els.find(e => (e.label || "").trim() === "Reject all");
+        if (c) return c;
+        await sleep(250);
+      }
+      return null;
+    };
+    const a = await frameEl(tabA);
+    const b = await frameEl(tabB);
+    check("both tabs list their own frame element", !!a && !!b && a.i === b.i, { a: a?.i, b: b?.i });
+    const ca = await s.tool("input", { tab: tabA, actions: [{ click: { i: a?.i } }] });
+    const cb = await s.tool("input", { tab: tabB, actions: [{ click: { i: b?.i } }] });
+    const hits = async (t) => JSON.parse((await s.tool("eval", { tab: t, expression: "JSON.stringify(H)" })).v.value);
+    const ha = await hits(tabA), hb = await hits(tabB);
+    check("a frame click lands in the tab it names, with two tabs cached",
+          ca.ok && cb.ok && ha.cross === 1 && hb.cross === 1,
+          { a: JSON.stringify(ca.v).slice(0, 120), b: JSON.stringify(cb.v).slice(0, 120), ha, hb });
+  } finally {
+    // A failed assertion must not leave a second tab behind for the next run.
+    await s.tool("tabs", { action: "close", tab: tabB });
+  }
 });
 
 // A wait on a page that never stops moving used to pay a forced layout and a
@@ -652,6 +729,53 @@ await withTab(`http://127.0.0.1:${rport}/sprint2`, async (tab, ev) => {
         f("Name")?.value === "Ada" && f("Secret")?.value === "***" &&
         f("Agree")?.checked === true && f("Plan")?.selected === "Pro",
         { name: f("Name"), secret: f("Secret"), agree: f("Agree"), plan: f("Plan") });
+
+  check("a scoped scan echoes its scope",
+        form.scope === "#modal-form" && form.scopeMissing === false,
+        { scope: form.scope, scopeMissing: form.scopeMissing });
+
+  // A scope that matches nothing must not come back as the whole page: that is
+  // how an agent clicks something it never asked about.
+  const miss = (await s.tool("elements", { tab, within: "#not-mounted", limit: 99 })).v;
+  check("a scope that matches nothing returns no elements, not the whole page",
+        (miss.elements || []).length === 0 && miss.total === 0 && miss.scopeMissing === true &&
+        miss.suspect === null,
+        { total: miss.total, scopeMissing: miss.scopeMissing, suspect: miss.suspect,
+          labels: (miss.elements || []).map(e => e.label) });
+
+  // Same rule for text: a missing scope is not the body.
+  const tmiss = (await s.tool("text", { tab, within: "#not-mounted" })).v;
+  check("a text scope that matches nothing returns no text, not the whole page",
+        (tmiss.text || "").length === 0 && tmiss.scopeMissing === true,
+        { chars: tmiss.chars, scopeMissing: tmiss.scopeMissing, head: (tmiss.text || "").slice(0, 60) });
+
+  // Overlays are page-wide by design, so a stale scope must not hide a modal;
+  // and delta is the mode used to verify a click, so it must not read a missing
+  // scope as "nothing changed".
+  check("a missing scope still reports page-wide overlays",
+        JSON.stringify(miss.overlays || []).includes("Cookie Banner"), miss.overlays);
+  const dmiss = (await s.tool("elements", { tab, within: "#not-mounted", mode: "delta" })).v;
+  check("a delta scan reports a missing scope too",
+        dmiss.scopeMissing === true, { scope: dmiss.scope, scopeMissing: dmiss.scopeMissing });
+
+  // A baseline from a different scope cannot be compared: everything would read
+  // as added and everything old as removed.
+  const dscope = (await s.tool("elements", { tab, within: "#off-box", mode: "delta" })).v;
+  check("a delta against another scope reports no baseline",
+        dscope.baseline === false && dscope.scopeChanged === true,
+        { baseline: dscope.baseline, scopeChanged: dscope.scopeChanged, added: dscope.addedCount });
+
+  // An empty selector is no selector, not "everything".
+  const emptyScope = (await s.tool("elements", { tab, within: "", limit: 999 })).v;
+  const emptyText = (await s.tool("text", { tab, within: "" })).v;
+  check("an empty within means the whole page",
+        emptyScope.scope === null && emptyScope.scopeMissing === false && emptyScope.total > 0 &&
+        (emptyText.text || "").length > 0 && emptyText.scopeMissing === false,
+        { scope: emptyScope.scope, scopeMissing: emptyScope.scopeMissing, total: emptyScope.total, chars: emptyText.chars });
+
+  const badWithin = await s.tool("text", { tab, within: 5 });
+  check("text rejects a non-string within instead of ignoring it",
+        !badWithin.ok && /CSS selector/.test(String(badWithin.v)), String(badWithin.v).slice(0, 100));
 
   // The scoped scan above set the click scope to #modal-form. A real caller
   // rescans before using indexes from the page again; so does this test.

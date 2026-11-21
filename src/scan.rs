@@ -32,7 +32,14 @@ pub const SCAN_JS: &str = r#"(() => {
   // element itself. Indexing by element, not by point, is what makes a click
   // on something below the fold land: elementFromPoint is null off-screen.
   const PICK = __PICK__;
-  const root = SCOPE ? (document.querySelector(SCOPE) || document) : document;
+  const scopeEl = SCOPE ? document.querySelector(SCOPE) : null;
+  // A miss is not "the whole page": the element list must not silently become the
+  // document. PICK keeps its own shape so a stale index fails with the usual "no
+  // element" message instead of resolving against a list it never came from.
+  // Overlays and media are page-wide by design, so they are still scanned.
+  const scopeMissed = !!(SCOPE && !scopeEl);
+  if (scopeMissed && PICK) return { missing: true, i: PICK.i, total: 0, scopeMissing: true };
+  const root = scopeEl || document;
   const sel = 'a[href], button, input, select, textarea, summary, [role="button"], [role="link"], [role="tab"], [role="menuitem"], [role="checkbox"], [role="radio"], [role="switch"], [role="combobox"], [contenteditable]:not([contenteditable="false"]), [onclick], [tabindex]:not([tabindex="-1"])';
   const elements = [];
   const refs = [];
@@ -138,6 +145,10 @@ pub const SCAN_JS: &str = r#"(() => {
     }
   };
   collect(root, [], '');
+
+  // A miss was scanned as the document so overlays and media are real; the
+  // element list is what the caller did not ask for, so it is what gets emptied.
+  if (scopeMissed) { elements.length = 0; refs.length = 0; chains.length = 0; }
 
   if (PICK) {
     const el = refs[PICK.i];
@@ -300,6 +311,7 @@ pub const SCAN_JS: &str = r#"(() => {
 
   return {
     url: location.href,
+    scopeMissing: scopeMissed,
     // How much page is there, and where am I in it? Without this a virtualised
     // feed looks like the whole page, and an empty scan looks like an empty site.
     scroll: {

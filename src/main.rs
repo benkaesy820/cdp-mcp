@@ -21,11 +21,10 @@ use std::io::{self, BufRead, Write};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Last scan per tab, so `mode:"delta"` can say what changed instead of
-/// re-sending the whole page after every click.
-/// Irreversible actions already performed in this process, per tab.
-/// Keyed by tab + label so a retry loop is caught but a *different* post is not:
-/// "Post" on post A does not block "Post" on post B.
+/// Irreversible actions already performed in this process.
+/// Keyed by label + index, so a retry loop is caught while a *different* post is
+/// not: "Post" on post A does not block "Post" on post B. Two tabs are not told
+/// apart; a false refusal needs one `force:true`.
 fn guard() -> &'static Mutex<HashSet<String>> {
     static DONE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     DONE.get_or_init(|| Mutex::new(HashSet::new()))
@@ -41,6 +40,48 @@ fn irreversible(label: &str) -> bool {
         .any(|w| l == *w || l.starts_with(&format!("{w} ")) || l.ends_with(&format!(" {w}")))
 }
 
+/// Refuse a second click on the same final confirmation in one run, unless the
+/// caller forced it. One place, because the frame path and the page path must
+/// not drift: a frame click that skipped this would be a way around it.
+fn guard_irreversible(label: &str, i: u64, force: bool) -> Result<(), String> {
+    let key = format!("{label}|{i}");
+    let already = guard().lock().unwrap().contains(&key);
+    if already && !force {
+        return Err(format!(
+            "'{label}' was already clicked in this run. \
+             Verify the result with elements {{ mode: \"delta\" }} first; \
+             pass input {{ force: true }} only if you mean to do it twice."
+        ));
+    }
+    guard().lock().unwrap().insert(key);
+    Ok(())
+}
+
+/// An empty or whitespace-only selector is no selector: it must not read as a
+/// scope that matched everything, and it must not be passed to querySelector.
+fn nonempty_scope(s: &str) -> Option<String> {
+    let t = s.trim();
+    if t.is_empty() { None } else { Some(t.to_string()) }
+}
+
+/// The refusal a blocked indexed click reports. One shape for the page and the
+/// frame path, so a reason and its target cannot drift apart.
+fn blocked_click(
+    reason: &str,
+    i: u64,
+    tag: &Value,
+    label: &Value,
+    obscured_by: Value,
+    in_frame: bool,
+) -> String {
+    let mut target = json!({ "i": i, "tag": tag, "label": label });
+    if in_frame {
+        target["inFrame"] = json!(true);
+    }
+    json!({ "blocked": true, "reason": reason, "target": target, "obscuredBy": obscured_by })
+        .to_string()
+}
+
 fn data_dir() -> std::path::PathBuf {
     std::env::var("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
@@ -48,6 +89,8 @@ fn data_dir() -> std::path::PathBuf {
         .join("cdp-mcp")
 }
 
+/// Last scan per tab, so `mode:"delta"` can say what changed instead of
+/// re-sending the whole page after every click. Keyed by tab id.
 fn scan_cache() -> &'static Mutex<HashMap<String, Value>> {
     static CACHE: OnceLock<Mutex<HashMap<String, Value>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -276,11 +319,18 @@ fn pick(conn: &mut cdp::Conn, scope: Option<&str>, i: u64, scroll: bool, select:
 /// target with its own session, which is what `Conn::frames` collects.
 ///
 /// Every frame's elements are appended after the page's own, so an index still
-/// means one element and every page element keeps the index it already had.
+/// means one element and every page element keeps the index it already had. A
+/// scoped scan is the exception: a CSS selector cannot reach into a frame.
 /// Coordinates are translated into the embedding page's viewport, which is the
 /// space a click is dispatched in.
 fn scan_with_frames(conn: &mut cdp::Conn, scope: Option<&str>) -> Result<Value, String> {
     let mut scan_v = conn.eval(&scan_js(scope))?;
+    // A CSS selector can only match this document. Frame elements appended to a
+    // scoped scan would be indexes the caller never asked for, in a list it
+    // believes is scoped.
+    if scope.is_some() {
+        return Ok(scan_v);
+    }
     let frames = match conn.frames() {
         Ok(f) => f,
         Err(_) => return Ok(scan_v), // older browser: page-only scan is still useful
@@ -290,7 +340,7 @@ fn scan_with_frames(conn: &mut cdp::Conn, scope: Option<&str>) -> Result<Value, 
     }
     let mut elements = scan_v.get("elements").and_then(Value::as_array).cloned().unwrap_or_default();
     let mut added = 0u64;
-    for (_target, session, url) in frames {
+    for (target, session, url) in frames {
         // Read the frame's own document, then find where its box sits in the
         // parent so local coordinates can be made absolute.
         // The frame returns a JSON string: one value in, one value out, and no
@@ -342,6 +392,8 @@ fn scan_with_frames(conn: &mut cdp::Conn, scope: Option<&str>) -> Result<Value, 
                 o.insert("y".into(), json!((y + oy + h / 2.0).round() as i64));
                 o.insert("frame".into(), json!(label));
                 o.insert("session".into(), json!(session));
+                // The target id survives a reconnect; the session id does not.
+                o.insert("target".into(), json!(target));
                 // Local centre, which is what a click inside the frame needs.
                 o.insert("lx".into(), json!((x + w / 2.0).round() as i64));
                 o.insert("ly".into(), json!((y + h / 2.0).round() as i64));
@@ -370,17 +422,35 @@ fn scan_with_frames(conn: &mut cdp::Conn, scope: Option<&str>) -> Result<Value, 
     Ok(scan_v)
 }
 
-/// If element `i` lives inside a cross-origin frame, where to click it.
+/// If element `i` of tab `tab` lives inside a cross-origin frame, where to
+/// click it.
 ///
 /// Returns `(local x, local y, session)`. Cheap in the common case: one cached
-/// scan lookup, no protocol traffic. It only asks the browser anything when the
-/// element carries a `session`, which `scan_with_frames` sets only for frames.
-fn frame_target(conn: &mut cdp::Conn, i: u64) -> Result<Option<(f64, f64, String)>, String> {
+/// scan lookup, no protocol traffic; the browser is only asked when the element
+/// carries a `session`, which `scan_with_frames` sets only for frames.
+///
+/// The target id proves the frame is the same one, not that the document inside
+/// it still shows the same element: a same-site navigation keeps both the target
+/// and the old coordinates, so the click can land on whatever moved there.
+fn frame_target(
+    conn: &mut cdp::Conn,
+    tab: &str,
+    scope: Option<&str>,
+    i: u64,
+    force: bool,
+) -> Result<Option<(f64, f64, String)>, String> {
+    // A scoped click indexes the scoped list, which holds no frame elements: a
+    // CSS selector cannot reach into a child document. Resolving it in the tab's
+    // unscoped cache would click a different element than the one named.
+    if scope.is_some() {
+        return Ok(None);
+    }
+    // The cache holds one entry per tab. Reading whichever entry came first sent
+    // this click into a session that belongs to a different page's connection.
     let cached = {
         let cache = scan_cache().lock().unwrap();
         cache
-            .values()
-            .next()
+            .get(tab)
             .and_then(|v| v.get("elements").and_then(Value::as_array).cloned())
     };
     let el = cached
@@ -390,13 +460,47 @@ fn frame_target(conn: &mut cdp::Conn, i: u64) -> Result<Option<(f64, f64, String
         Some(e) => e,
         None => return Ok(None),
     };
-    let session = el.get("session").and_then(Value::as_str).unwrap_or_default().to_string();
+    let mut session = el.get("session").and_then(Value::as_str).unwrap_or_default().to_string();
     if session.is_empty() {
         return Ok(None);
     }
-    // Ensure the session is attached before using it (a fresh process has never
-    // called frames()).
-    let _ = conn.frames();
+    // Resolve the session on this connection: a cached id goes stale when the
+    // page reconnects, and ids attached elsewhere are not usable here. The
+    // target id survives both, which is why the scan records it.
+    let want = el.get("target").and_then(Value::as_str).unwrap_or_default();
+    if !want.is_empty() {
+        let live = conn.frames().ok();
+        match live.as_ref().and_then(|fs| fs.iter().find(|f| f.0 == want)) {
+            Some((_, s, _)) => session = s.clone(),
+            // The frame is gone, or it is same-origin now. Falling through to
+            // the main document would act on a different element with this index.
+            None if live.is_some() => {
+                return Err(format!(
+                    "element {i} was inside a frame that is no longer there; call elements again"
+                ));
+            }
+            None => {}
+        }
+    }
+    // The same refusals the page path makes, from the state the frame scan
+    // recorded: without them a frame was a way around both. They come after the
+    // resolution, so a frame that is gone does not consume the guard.
+    let tag = el.get("tag").unwrap_or(&Value::Null);
+    let label = el.get("label").unwrap_or(&Value::Null);
+    if !force && el.get("disabled").and_then(Value::as_bool) == Some(true) {
+        return Err(blocked_click("disabled", i, tag, label, Value::Null, true));
+    }
+    // Below the frame's own fold: what scrolls is the frame's document, not the
+    // page, so a dispatch at these coordinates lands outside its viewport. An
+    // unfelt click that still burns the guard is the worst of both.
+    if !force && el.get("off").and_then(Value::as_bool) == Some(true) {
+        return Err(blocked_click("outside_frame", i, tag, label, Value::Null, true));
+    }
+    if let Some(text) = label.as_str() {
+        if irreversible(text) {
+            guard_irreversible(text, i, force)?;
+        }
+    }
     let x = el.get("lx").and_then(Value::as_f64).unwrap_or(0.0);
     let y = el.get("ly").and_then(Value::as_f64).unwrap_or(0.0);
     Ok(Some((x, y, session)))
@@ -657,7 +761,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "elements",
-            "description": "Scan the page: `overlays` lists dialogs/modals/cookie walls with their dismiss buttons, and `elements` lists visible interactive nodes with a clickable index `i` and centre point. Filter with `find` and cap with `limit` to keep the payload small. Indexes are absolute in the unfiltered list and are re-resolved at click time, so they cannot go stale. Form controls include current `value` (passwords masked), `checked`, `selected` and `disabled`; `within` scopes the scan to a selector.",
+            "description": "Scan the page: `overlays` lists dialogs/modals/cookie walls with their dismiss buttons, and `elements` lists visible interactive nodes with a clickable index `i` and centre point. Filter with `find` and cap with `limit` to keep the payload small. Indexes are absolute in the unfiltered list and are re-resolved at click time, so they cannot silently go stale. A cross-origin frame element is clicked at the coordinates this scan recorded (rescan after the frame navigates), and only `click` routes an index into a frame; `hover`, `select`, `link` and `paste` resolve indexes in the main document. Form controls include current `value` (passwords masked), `checked`, `selected` and `disabled`; `within` scopes the scan to a selector in the main document (cross-origin frame elements are left out), the result echoes `scope`, and a selector that matches nothing returns no elements with `scopeMissing: true` instead of the whole page, and `overlays` stay page-wide and are still reported.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -681,7 +785,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "text",
-            "description": "The page as readable text, top to bottom: headings, labels, paragraphs, list items. Use this to find out what a page says or to confirm a sentence is there; use `elements` for what can be clicked. `within` scopes it to a CSS selector (main, article, [role=dialog]); `limit` caps characters (default 4000).",
+            "description": "The page as readable text, top to bottom: headings, labels, paragraphs, list items. Use this to find out what a page says or to confirm a sentence is there; use `elements` for what can be clicked. `within` scopes it to a CSS selector in the main document (main, article, [role=dialog]); a selector that matches nothing returns empty text with `scopeMissing: true`, and an invalid selector is an error. `limit` caps characters (default 4000).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -693,7 +797,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "input",
-            "description": "Send real user input, in order. Actions: {click:{i|x,y[,button:right|middle,count:2,modifiers:[Shift]]}} (an index is scrolled into view and resolved in the same `within` scope as the last elements call), {hover:{i}}, {drag:{from:{i},to:{i},steps:12}}, {tap:{i}} (touch), {swipe:{from,to}} (touch), {select:{i,value}} (<select>), {insert:\"text\"}, {key:\"Enter\"|\"Control+a\"|\"Control+Shift+z\"|\"a\"|\"Escape\"|\"Tab\"|\"ArrowDown\"|\"F5\"}, {scroll:{dy:400}} (scrolls the page, or the scrollable panel in the middle of the screen; reports whether it moved), {dismiss:{prefer:\"reject\"}} (closes cookie walls and modals, refusing cookies when offered), {wait:{idle:true,ms:15000}} (waits for loading to settle), {wait:{text:\"...\",ms:15000}}, {sleep:{ms:300}}. Real events, so React/Draft editors accept them. An indexed click is refused when the element is detached, zero-size, disabled or covered, with `{blocked, reason, obscuredBy}`; `force` bypasses that check, and the log entry then carries `covered` with what was on top. With `settleMs`, the result also reports `navigated`, `url`, `openedTab` and same-origin errors.",
+            "description": "Send real user input, in order. Actions: {click:{i|x,y[,button:right|middle,count:2,modifiers:[Shift]]}} (an index is scrolled into view and resolved in the same `within` scope as the last elements call, or in the action's own `within` when it carries one), {hover:{i}}, {drag:{from:{i},to:{i},steps:12}}, {tap:{i}} (touch), {swipe:{from,to}} (touch), {select:{i,value}} (<select>), {insert:\"text\"}, {key:\"Enter\"|\"Control+a\"|\"Control+Shift+z\"|\"a\"|\"Escape\"|\"Tab\"|\"ArrowDown\"|\"F5\"}, {scroll:{dy:400}} (scrolls the page, or the scrollable panel in the middle of the screen; reports whether it moved), {dismiss:{prefer:\"reject\"}} (closes cookie walls and modals, refusing cookies when offered), {wait:{idle:true,ms:15000}} (waits for loading to settle), {wait:{text:\"...\",ms:15000}}, {sleep:{ms:300}}. Real events, so React/Draft editors accept them. An indexed click is refused when the element is detached, zero-size, disabled or covered, with `{blocked, reason, obscuredBy}`; `force` bypasses that check, and the log entry then carries `covered` with what was on top. With `settleMs`, the result also reports `navigated`, `url`, `openedTab` and same-origin errors.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2119,7 +2223,7 @@ const SCROLL_JS: &str = r#"((dy) => {
            atBottom: Math.ceil(el.scrollTop + el.clientHeight) >= el.scrollHeight - 2, container: true };
 })"#;
 
-fn run_input(conn: &mut cdp::Conn, actions: &[Value], force: bool, scope: Option<&str>) -> Result<Value, String> {
+fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], force: bool, scope: Option<&str>) -> Result<Value, String> {
     let mut log = Vec::new();
     for a in actions {
         check_cancel()?;
@@ -2129,12 +2233,18 @@ fn run_input(conn: &mut cdp::Conn, actions: &[Value], force: bool, scope: Option
             let count = c.get("count").and_then(Value::as_u64).unwrap_or(1);
             let mods = mod_mask(c.get("modifiers"));
             if let Some(i) = c.get("i").and_then(Value::as_u64) {
-                let scope = c.get("within").and_then(Value::as_str).or(scope);
+                // A per-action scope replaces the ambient one; an empty selector
+                // is no scope at all, not a scope that matches everything.
+                let scope = match c.get("within").and_then(Value::as_str) {
+                    Some(w) if w.trim().is_empty() => None,
+                    Some(w) => Some(w.trim()),
+                    None => scope,
+                };
                 // An element inside a cross-origin frame lives in another
                 // renderer: a click at its page coordinates lands in the frame's
                 // box but the frame's own document receives it at LOCAL
                 // coordinates, so the event has to be sent to its session.
-                if let Some(target) = frame_target(conn, i)? {
+                if let Some(target) = frame_target(conn, tab, scope, i, force)? {
                     let (lx, ly) = (target.0, target.1);
                     if button != "left" || count > 1 || mods != 0 {
                         frame_click(conn, &target.2, lx, ly, &button, count, mods as u32)?;
@@ -2161,29 +2271,21 @@ fn run_input(conn: &mut cdp::Conn, actions: &[Value], force: bool, scope: Option
                         None
                     };
                     if let Some(reason) = reason {
-                        let blocked = json!({
-                            "blocked": true,
-                            "reason": reason,
-                            "target": { "i": i, "tag": at.get("tag"), "label": at.get("label") },
-                            "obscuredBy": at.get("blocker").cloned()
+                        return Err(blocked_click(
+                            reason,
+                            i,
+                            at.get("tag").unwrap_or(&Value::Null),
+                            at.get("label").unwrap_or(&Value::Null),
+                            at.get("blocker").cloned()
                                 .or_else(|| at.get("coveredBy").cloned())
                                 .unwrap_or(Value::Null),
-                        });
-                        return Err(blocked.to_string());
+                            false,
+                        ));
                     }
                 }
                 if let Some(label) = at.get("label").and_then(Value::as_str) {
                     if irreversible(label) {
-                        let key = format!("{label}|{i}");
-                        let already = guard().lock().unwrap().contains(&key);
-                        if already && !force {
-                            return Err(format!(
-                                "'{label}' was already clicked in this run. \
-                                 Verify the result with elements {{ mode: \"delta\" }} first; \
-                                 pass input {{ force: true }} only if you mean to do it twice."
-                            ));
-                        }
-                        guard().lock().unwrap().insert(key);
+                        guard_irreversible(label, i, force)?;
                     }
                 }
                 let x = at.get("x").and_then(Value::as_f64).unwrap_or(0.0);
@@ -2655,11 +2757,16 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
 
             let within = match args.get("within") {
                 None | Some(Value::Null) => None,
-                Some(Value::String(s)) => Some(s.clone()),
+                Some(Value::String(s)) => nonempty_scope(s),
                 Some(_) => return Err("within must be a CSS selector; integer within is not implemented yet".into()),
             };
             with_conn(&cfg.endpoint, tab, |conn, tab_id| {
-                let scan_v = scan_with_frames(conn, within.as_deref())?;
+                let mut scan_v = scan_with_frames(conn, within.as_deref())?;
+                // Kept with the cache entry, so a delta knows whether its
+                // baseline came from the same scope as this scan.
+                if let Some(o) = scan_v.as_object_mut() {
+                    o.insert("scope".into(), json!(&within));
+                }
                 scope_cache().lock().unwrap().insert(tab_id.to_string(), within.clone());
 
                 let mut all = scan_v.get("elements").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -2673,6 +2780,11 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                     cache.insert(tab_id.to_string(), scan_v.clone());
                     prev
                 };
+                // A baseline taken under another scope is not a baseline: every
+                // element would read as added and every old one as removed.
+                let scope_changed = !previous.is_null()
+                    && previous.get("scope").and_then(Value::as_str) != within.as_deref();
+                let previous = if scope_changed { Value::Null } else { previous };
 
                 if mode == "delta" {
                     let prev_els = previous.get("elements").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -2685,6 +2797,11 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                     return Ok(json!({
                         "tab": tab_id,
                         "mode": "delta",
+                        // Without these, a scope that never existed reads as
+                        // "nothing changed" in the mode callers use to verify.
+                        "scope": within.clone(),
+                        "scopeChanged": scope_changed,
+                        "scopeMissing": scan_v.get("scopeMissing").and_then(Value::as_bool).unwrap_or(false),
                         "baseline": !previous.is_null(),
                         "added": added,
                         "addedCount": added.len(),
@@ -2732,10 +2849,16 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
 
                 let url = scan_v.get("url").and_then(Value::as_str).unwrap_or("").to_string();
                 let url = if url.len() > 300 { format!("{}…", clip_str(&url, 300)) } else { url };
+                let scope_missing = scan_v.get("scopeMissing").and_then(Value::as_bool).unwrap_or(false);
                 let payload = json!({
                     "tab": tab_id,
                     "url": url,
                     "title": scan_v.get("title").cloned().unwrap_or(Value::Null),
+                    // Which scope produced this list, and whether it matched.
+                    // Without the echo, a caller cannot tell a scoped scan from
+                    // an unscoped one, and a miss from an empty scope.
+                    "scope": within.clone(),
+                    "scopeMissing": scope_missing,
                     "overlays": scan_v.get("overlays").cloned().unwrap_or(json!([])),
                     "media": scan_v.get("media").cloned().unwrap_or(json!([])),
                     "scroll": scan_v.get("scroll").cloned().unwrap_or(Value::Null),
@@ -2749,8 +2872,9 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                     "nodes": scan_v.get("nodes").cloned().unwrap_or(json!(0)),
                     // A near-empty scan on a document with almost nothing in it
                     // is usually a page that has not painted yet, not an empty
-                    // page. Saying so costs one field and saves a retry.
-                    "suspect": if suspect_render(
+                    // page. Saying so costs one field and saves a retry. Never
+                    // for a scope that missed: that answer is already exact.
+                    "suspect": if !scope_missing && suspect_render(
                         total as u64,
                         scan_v.get("nodes").and_then(Value::as_u64).unwrap_or(0),
                     ) {
@@ -2777,26 +2901,36 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
             // this answers "what does it say", which is the other half of reading
             // a page and had no tool until now - every agent call was writing the
             // same innerText extraction by hand.
-            let within = args.get("within").and_then(Value::as_str).unwrap_or("body").to_string();
+            let within = match args.get("within") {
+                None | Some(Value::Null) => "body".to_string(),
+                Some(Value::String(s)) => nonempty_scope(s).unwrap_or_else(|| "body".to_string()),
+                Some(_) => return Err("within must be a CSS selector".into()),
+            };
             let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(4000) as usize;
             with_conn(&cfg.endpoint, tab, |conn, tab_id| {
                 let js = format!(
                     "(() => {{ \
                        let r = null; \
-                       try {{ r = document.querySelector({sel}); }} catch (e) {{ return null; }} \
-                       r = r || document.body; \
-                       if (!r) return null; \
+                       try {{ r = document.querySelector({sel}); }} catch (e) {{ return {{ err: String(e) }}; }} \
+                       if (!r) return {{ missing: true }}; \
                        const t = (r.innerText || '').replace(/\\n{{3,}}/g, '\\n\\n').trim(); \
-                       return t.slice(0, {lim}); \
+                       return {{ text: t.slice(0, {lim}) }}; \
                      }})()",
                     sel = serde_json::to_string(&within).unwrap_or_else(|_| "\"body\"".into()),
                     lim = limit
                 );
                 let v = conn.eval(&js)?;
-                let text = v.as_str().unwrap_or("").to_string();
+                if let Some(e) = v.get("err").and_then(Value::as_str) {
+                    return Err(format!("text: {e}"));
+                }
+                // A selector that matches nothing is not the body: saying so
+                // beats handing back the whole page as if it were the scope.
+                let scope_missing = v.get("missing").and_then(Value::as_bool) == Some(true);
+                let text = v.get("text").and_then(Value::as_str).unwrap_or("").to_string();
                 Ok(json!({
                     "tab": tab_id,
                     "within": within,
+                    "scopeMissing": scope_missing,
                     "chars": text.chars().count(),
                     "truncated": text.chars().count() >= limit,
                     "text": text,
@@ -2824,7 +2958,7 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                         .unwrap_or_default();
                     let on = !url.is_empty() && conn.begin_receipts(&url, tab_id).is_ok();
                     conn.contexts_cleared = false;
-                    let result = run_input(conn, &actions, force, scope.as_deref());
+                    let result = run_input(conn, tab_id, &actions, force, scope.as_deref());
                     let outcome = if on {
                         if result.is_err() {
                             // Nothing was dispatched cleanly; do not make the
@@ -2851,7 +2985,7 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                     };
                     (log, errors)
                 } else {
-                    (run_input(conn, &actions, force, scope.as_deref())?, Vec::new())
+                    (run_input(conn, tab_id, &actions, force, scope.as_deref())?, Vec::new())
                 };
                 let (overlays, mut url) = if announce {
                     // cheap post-action check: only what appeared because we acted
