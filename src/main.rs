@@ -959,7 +959,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "paste",
-            "description": "Paste text or a file (image, video, PDF) into the focused element. Optionally click element `i` first to focus it. Default method \"page\" hands the data to the page as a paste event (a file nobody takes as a paste is offered as a drop; text nobody intercepts is inserted as typed input) and never touches the system clipboard. method \"system\" uses the real clipboard and Ctrl+V, which only works while the browser window has keyboard focus (Wayland, wl-copy).",
+            "description": "Paste text or a file (image, video, PDF) into the focused element. Optionally click element `i` first to focus it. Default method \"page\" hands the data to the page as a paste event (a file nobody takes as a paste is offered as a drop; text nobody intercepts is inserted as typed input) and never touches the system clipboard. method \"system\" uses the real clipboard and Ctrl+V, which only works while the browser window has keyboard focus; the backend is Wayland wl-clipboard, X11 xclip, or macOS pbcopy/pbpaste, and an image on macOS is refused rather than silently dropped.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1217,58 +1217,227 @@ fn click_log(at: &Value) -> Value {
 
 /* ------------------------------ clipboard -------------------------------- */
 
-fn clip_types() -> Vec<String> {
-    std::process::Command::new("wl-paste")
-        .arg("--list-types")
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(str::to_string).collect())
-        .unwrap_or_default()
+/// The system clipboard's backend, chosen from the session and the tools on
+/// PATH. Linux has two, macOS one, Windows none here.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ClipBackend { Wayland, X11, Mac }
+
+/// Is `program` on PATH? A plain scan: no dependency, and it answers the
+/// question a user asks when the system clipboard stops working.
+fn which(program: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
+        .unwrap_or(false)
+}
+
+fn clip_backend_for(
+    os: Os,
+    get: &dyn Fn(&str) -> Option<String>,
+    has: &dyn Fn(&str) -> bool,
+) -> Option<ClipBackend> {
+    match os {
+        Os::Mac => (has("pbcopy") && has("pbpaste")).then_some(ClipBackend::Mac),
+        Os::Windows => None,
+        Os::Linux => {
+            // Wayland first: it is also the case where wl-clipboard is the only
+            // tool that can see the human's selection.
+            if env_nonempty(get, "WAYLAND_DISPLAY").is_some() && has("wl-copy") && has("wl-paste") {
+                return Some(ClipBackend::Wayland);
+            }
+            if env_nonempty(get, "DISPLAY").is_some() && has("xclip") {
+                return Some(ClipBackend::X11);
+            }
+            None
+        }
+    }
+}
+
+fn clip_backend() -> Option<ClipBackend> {
+    clip_backend_for(current_os(), &|k| std::env::var(k).ok(), &which)
+}
+
+/// Why there is no backend, said in terms of the session that was detected
+/// rather than always blaming wl-clipboard.
+fn clip_unavailable_reason() -> String {
+    let get = |k: &str| std::env::var(k).ok();
+    match current_os() {
+        Os::Mac => "no clipboard tools on PATH: this needs pbcopy and pbpaste".into(),
+        Os::Windows => "the system clipboard has no Windows backend here; use method:\"page\"".into(),
+        Os::Linux => {
+            let wayland = env_nonempty(&get, "WAYLAND_DISPLAY").is_some();
+            let x11 = env_nonempty(&get, "DISPLAY").is_some();
+            match (wayland, x11) {
+                (true, true) => "no clipboard tool available: install wl-clipboard (Wayland) or xclip (X11)".into(),
+                (true, false) => "no clipboard tool available: install wl-clipboard for this Wayland session".into(),
+                (false, true) => "no clipboard tool available: install xclip for this X11 session".into(),
+                (false, false) => "no display session found (WAYLAND_DISPLAY and DISPLAY are both empty), so the system clipboard is out of reach".into(),
+            }
+        }
+    }
+}
+
+struct ClipCmd {
+    program: &'static str,
+    args: Vec<String>,
+}
+
+fn args(list: &[&str]) -> Vec<String> {
+    list.iter().map(|s| s.to_string()).collect()
+}
+
+fn is_text_mime(mime: &str) -> bool {
+    mime.starts_with("text/") || matches!(mime, "UTF8_STRING" | "STRING")
+}
+
+fn clip_types_cmd(b: ClipBackend) -> Option<ClipCmd> {
+    match b {
+        ClipBackend::Wayland => Some(ClipCmd { program: "wl-paste", args: args(&["--list-types"]) }),
+        ClipBackend::X11 => Some(ClipCmd {
+            program: "xclip",
+            args: args(&["-selection", "clipboard", "-o", "-t", "TARGETS"]),
+        }),
+        // pbpaste cannot say what the pasteboard holds.
+        ClipBackend::Mac => None,
+    }
+}
+
+fn clip_read_cmd(b: ClipBackend, mime: &str) -> Result<ClipCmd, String> {
+    match b {
+        ClipBackend::Wayland => Ok(ClipCmd {
+            program: "wl-paste",
+            args: args(&["--type", mime, "--no-newline"]),
+        }),
+        ClipBackend::X11 => Ok(ClipCmd {
+            program: "xclip",
+            args: args(&["-selection", "clipboard", "-o", "-t", mime]),
+        }),
+        ClipBackend::Mac if is_text_mime(mime) => Ok(ClipCmd { program: "pbpaste", args: Vec::new() }),
+        ClipBackend::Mac => Err(format!(
+            "the macOS clipboard backend here is text-only; it cannot read {mime}"
+        )),
+    }
+}
+
+fn clip_write_cmd(b: ClipBackend, mime: &str) -> Result<ClipCmd, String> {
+    match b {
+        ClipBackend::Wayland => Ok(ClipCmd { program: "wl-copy", args: args(&["--type", mime]) }),
+        ClipBackend::X11 => Ok(ClipCmd {
+            program: "xclip",
+            args: args(&["-selection", "clipboard", "-i", "-t", mime]),
+        }),
+        ClipBackend::Mac if is_text_mime(mime) => Ok(ClipCmd { program: "pbcopy", args: Vec::new() }),
+        ClipBackend::Mac => Err(format!(
+            "the macOS clipboard backend here is text-only: cannot put {mime} on it. \
+             Use paste method:\"page\" for images"
+        )),
+    }
+}
+
+/// Run a clipboard command, optionally feeding it a file. `None` on any failure.
+fn run_clip_cmd(cmd: &ClipCmd, stdin: Option<std::fs::File>) -> Option<Vec<u8>> {
+    let mut c = std::process::Command::new(cmd.program);
+    c.args(&cmd.args);
+    match stdin {
+        Some(f) => c.stdin(std::process::Stdio::from(f)),
+        None => c.stdin(std::process::Stdio::null()),
+    };
+    c.output().ok().filter(|o| o.status.success()).map(|o| o.stdout)
+}
+
+fn clip_types(b: ClipBackend) -> Vec<String> {
+    match clip_types_cmd(b) {
+        Some(cmd) => run_clip_cmd(&cmd, None)
+            .map(|out| String::from_utf8_lossy(&out).lines().map(str::to_string).collect())
+            .unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
+fn clip_read_from(b: ClipBackend, mime: &str) -> Option<Vec<u8>> {
+    let cmd = clip_read_cmd(b, mime).ok()?;
+    run_clip_cmd(&cmd, None)
 }
 
 fn clip_read(mime: &str) -> Option<Vec<u8>> {
-    std::process::Command::new("wl-paste")
-        .args(["--type", mime, "--no-newline"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| o.stdout)
+    clip_read_from(clip_backend()?, mime)
 }
 
-fn clip_write(mime: &str, bytes: &[u8]) -> bool {
-    // wl-copy forks and serves the selection from its child, so a pipe we own is
-    // a lifetime race. A file gives it a clean EOF.
+/// Put bytes on the system clipboard. The error names what this session is
+/// missing instead of always blaming wl-clipboard.
+fn clip_write(mime: &str, bytes: &[u8]) -> Result<(), String> {
+    let backend = clip_backend().ok_or_else(clip_unavailable_reason)?;
+    let cmd = clip_write_cmd(backend, mime)?;
+    // A file gives the writer a clean EOF. wl-copy forks and serves the
+    // selection from its child, so a pipe we own is a lifetime race.
     let tmp = std::env::temp_dir().join(format!("cdp-mcp-clip-{}", std::process::id()));
-    if std::fs::write(&tmp, bytes).is_err() {
-        return false;
-    }
-    let file = match std::fs::File::open(&tmp) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-    let ok = std::process::Command::new("wl-copy")
-        .args(["--type", mime])
+    std::fs::write(&tmp, bytes).map_err(|e| format!("cannot stage the clipboard payload: {e}"))?;
+    let file = std::fs::File::open(&tmp).map_err(|e| format!("cannot open {}: {e}", tmp.display()))?;
+    // stdout and stderr null on purpose: wl-copy forks a child that serves the
+    // selection, and that child would otherwise inherit this process's stdio and
+    // hold it open after we exit (measured: the MCP client's pipe never closed).
+    let status = std::process::Command::new(cmd.program)
+        .args(&cmd.args)
         .stdin(std::process::Stdio::from(file))
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
     let _ = std::fs::remove_file(&tmp);
-    ok
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(format!("{} exited with {s}", cmd.program)),
+        Err(e) => Err(format!("cannot run {}: {e}", cmd.program)),
+    }
 }
 
 /// Save the clipboard in the most useful representation available.
 fn clip_save() -> Option<(String, Vec<u8>)> {
-    let types = clip_types();
+    let backend = clip_backend()?;
+    let types = clip_types(backend);
     for want in ["text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "image/png"] {
         if types.iter().any(|t| t == want) {
-            if let Some(bytes) = clip_read(want) {
+            if let Some(bytes) = clip_read_from(backend, want) {
                 if !bytes.is_empty() && bytes.len() < 32 * 1024 * 1024 {
                     return Some((want.to_string(), bytes));
                 }
             }
         }
     }
+    // A backend that cannot list what it holds (macOS pbpaste): try text.
+    if types.is_empty() {
+        let want = "text/plain;charset=utf-8";
+        if let Some(bytes) = clip_read_from(backend, want) {
+            if !bytes.is_empty() && bytes.len() < 32 * 1024 * 1024 {
+                return Some((want.to_string(), bytes));
+            }
+        }
+    }
     None
+}
+
+/// The detached restore for method "system": runs after the paste and removes
+/// the staged file whatever happens, whichever backend wrote it.
+fn clip_restore_script(b: ClipBackend, mime: &str, tmp: &str) -> Result<String, String> {
+    let cmd = clip_write_cmd(b, mime)?;
+    let mut line = cmd.program.to_string();
+    for a in &cmd.args {
+        line.push(' ');
+        line.push_str(&sh_quote(a));
+    }
+    Ok(format!("sleep 2; {} < {}; rm -f {}", line, sh_quote(tmp), sh_quote(tmp)))
+}
+
+/// Quote only where the shell needs it: flags and MIME types stay readable,
+/// a path with a space is quoted.
+fn sh_quote(s: &str) -> String {
+    let plain = !s.is_empty()
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '=' | '+' | '@' | '%')
+        });
+    if plain {
+        s.to_string()
+    } else {
+        shell_quote(s)
+    }
 }
 
 /// Say something in the chat window. Silent if it is not running: this is a
@@ -3460,8 +3629,8 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                                 .ok_or("clipboard store is empty")?.to_string()
                         }
                     };
-                    let ok = clip_write("text/plain;charset=utf-8", text.as_bytes());
-                    Ok(json!({ "onSystemClipboard": ok, "chars": text.len() }))
+                    clip_write("text/plain;charset=utf-8", text.as_bytes())?;
+                    Ok(json!({ "onSystemClipboard": true, "chars": text.len() }))
                 }
                 other => Err(format!("unknown clip action: {other}")),
             }
@@ -3590,11 +3759,11 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                                    else if bytes.starts_with(b"RIFF") { "image/webp" }
                                    else if bytes.starts_with(b"GIF8") { "image/gif" }
                                    else { "image/png" };
-                        let ok = clip_write(mime, &bytes);
+                        clip_write(mime, &bytes)?;
                         Ok(json!({
                             "action": "copy",
                             "url": url, "bytes": bytes.len(), "mime": mime,
-                            "onSystemClipboard": ok,
+                            "onSystemClipboard": true,
                             "note": "pixels are on the SYSTEM clipboard so a real Ctrl+V can paste them; the agent clipboard is untouched",
                         }))
                     }
@@ -3892,12 +4061,10 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
 
                 // method "system": the real clipboard and a real Ctrl+V. Only
                 // works while the browser window has keyboard focus.
-                if !clip_write(mime, &payload) {
-                    return Err("wl-copy failed: is wl-clipboard installed, and is this a Wayland session?".into());
-                }
-                // wl-copy's child claims the selection after the parent exits,
-                // so wait until the clipboard really holds our bytes; pasting
-                // sooner pastes whatever was there before.
+                clip_write(mime, &payload)?;
+                // The writer's child claims the selection after the parent
+                // exits, so wait until the clipboard really holds our bytes;
+                // pasting sooner pastes whatever was there before.
                 let started = std::time::Instant::now();
                 while started.elapsed().as_millis() < 1_500 {
                     if clip_read(mime).is_some_and(|b| b.len() == payload.len() && (path.is_some() || b == payload)) {
@@ -3917,37 +4084,35 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                 nap(400)?;
 
                 // Put the caller's clipboard back — but out of process and a
-                // couple of seconds later. wl-copy forks, and its child claims
-                // the selection asynchronously, so restoring inline loses the
-                // race to the paste we just made. A detached shell command wins
+                // couple of seconds later. The writer forks, and its child
+                // claims the selection asynchronously, so restoring inline
+                // loses the race to the paste we just made. A detached shell command wins
                 // it, and keeps the tool's reply fast.
-                let restored = match &saved {
-                    Some((m, b)) => {
+                let backend = clip_backend();
+                let restored = match (&saved, backend) {
+                    (Some((m, b)), Some(bk)) => {
                         let tmp = std::env::temp_dir().join(format!("cdp-mcp-restore-{}", std::process::id()));
                         if std::fs::write(&tmp, b).is_ok() {
-                            let cmd = format!(
-                                "sleep 2; wl-copy --type {} < {}; rm -f {}",
-                                shell_quote(m),
-                                shell_quote(&tmp.to_string_lossy()),
-                                shell_quote(&tmp.to_string_lossy())
-                            );
-                            std::process::Command::new("sh")
-                                .arg("-c")
-                                .arg(cmd)
-                                // Detach its stdio completely: a child that
-                                // inherits our stdout keeps the pipe open after
-                                // this process ends, and anything reading the
-                                // MCP output then waits forever.
-                                .stdin(std::process::Stdio::null())
-                                .stdout(std::process::Stdio::null())
-                                .stderr(std::process::Stdio::null())
-                                .spawn()
-                                .is_ok()
+                            match clip_restore_script(bk, m, &tmp.to_string_lossy()) {
+                                Ok(cmd) => std::process::Command::new("sh")
+                                    .arg("-c")
+                                    .arg(cmd)
+                                    // Detach its stdio completely: a child that
+                                    // inherits our stdout keeps the pipe open after
+                                    // this process ends, and anything reading the
+                                    // MCP output then waits forever.
+                                    .stdin(std::process::Stdio::null())
+                                    .stdout(std::process::Stdio::null())
+                                    .stderr(std::process::Stdio::null())
+                                    .spawn()
+                                    .is_ok(),
+                                Err(_) => false,
+                            }
                         } else {
                             false
                         }
                     }
-                    None => false,
+                    _ => false,
                 };
                 Ok(json!({ "tab": tab_id, "pasted": pasted, "mime": mime, "bytes": payload.len(),
                            "via": "system clipboard + Ctrl+V",
@@ -4437,6 +4602,75 @@ mod tests {
         assert_eq!(mime_for("webp"), "image/webp");
         assert_eq!(mime_for("jpeg"), "image/jpeg");
         assert_eq!(mime_for("jpg"), "image/jpeg");
+    }
+
+    #[test]
+    fn the_clipboard_backend_follows_the_session() {
+        let wayland = |k: &str| match k { "WAYLAND_DISPLAY" => Some("wayland-0".to_string()), _ => None };
+        let both = |k: &str| match k {
+            "WAYLAND_DISPLAY" => Some("wayland-0".to_string()),
+            "DISPLAY" => Some(":0".to_string()),
+            _ => None,
+        };
+        let x11 = |k: &str| match k { "DISPLAY" => Some(":0".to_string()), _ => None };
+        let none = |_k: &str| None;
+        let wl = |p: &str| p.starts_with("wl-");
+        let xclip = |p: &str| p == "xclip";
+        let nothing = |_p: &str| false;
+
+        assert_eq!(clip_backend_for(Os::Linux, &wayland, &wl), Some(ClipBackend::Wayland));
+        // Wayland advertised but wl-clipboard missing: X11 is the fallback.
+        assert_eq!(clip_backend_for(Os::Linux, &both, &xclip), Some(ClipBackend::X11));
+        assert_eq!(clip_backend_for(Os::Linux, &x11, &xclip), Some(ClipBackend::X11));
+        assert_eq!(clip_backend_for(Os::Linux, &x11, &nothing), None);
+        assert_eq!(clip_backend_for(Os::Linux, &none, &wl), None);
+        assert_eq!(clip_backend_for(Os::Mac, &none, &|_p: &str| true), Some(ClipBackend::Mac));
+        assert_eq!(clip_backend_for(Os::Mac, &none, &nothing), None);
+        assert_eq!(clip_backend_for(Os::Windows, &none, &|_p: &str| true), None);
+    }
+
+    #[test]
+    fn clipboard_commands_match_the_backend() {
+        let w = clip_write_cmd(ClipBackend::Wayland, "image/png").unwrap();
+        assert_eq!(w.program, "wl-copy");
+        assert_eq!(w.args, ["--type", "image/png"]);
+
+        let x = clip_write_cmd(ClipBackend::X11, "text/plain").unwrap();
+        assert_eq!(x.program, "xclip");
+        assert_eq!(x.args, ["-selection", "clipboard", "-i", "-t", "text/plain"]);
+
+        let m = clip_write_cmd(ClipBackend::Mac, "text/plain;charset=utf-8").unwrap();
+        assert_eq!(m.program, "pbcopy");
+        assert!(m.args.is_empty());
+        assert!(clip_write_cmd(ClipBackend::Mac, "image/png").is_err());
+
+        let r = clip_read_cmd(ClipBackend::Wayland, "text/plain").unwrap();
+        assert_eq!(r.program, "wl-paste");
+        assert_eq!(r.args, ["--type", "text/plain", "--no-newline"]);
+
+        let rx = clip_read_cmd(ClipBackend::X11, "UTF8_STRING").unwrap();
+        assert_eq!(rx.args, ["-selection", "clipboard", "-o", "-t", "UTF8_STRING"]);
+
+        assert_eq!(clip_read_cmd(ClipBackend::Mac, "text/plain").unwrap().program, "pbpaste");
+        assert!(clip_read_cmd(ClipBackend::Mac, "image/png").is_err());
+
+        // pbpaste cannot list types, so macOS has no list command at all.
+        assert!(clip_types_cmd(ClipBackend::Mac).is_none());
+        assert_eq!(clip_types_cmd(ClipBackend::X11).unwrap().args, ["-selection", "clipboard", "-o", "-t", "TARGETS"]);
+    }
+
+    #[test]
+    fn the_restore_script_quotes_its_arguments_and_cleans_up() {
+        let s = clip_restore_script(ClipBackend::Wayland, "text/plain", "/tmp/a b").unwrap();
+        assert!(s.starts_with("sleep 2; wl-copy --type text/plain < '/tmp/a b'; rm -f '/tmp/a b'"), "{s}");
+
+        let m = clip_restore_script(ClipBackend::Mac, "text/plain;charset=utf-8", "/tmp/x").unwrap();
+        assert!(m.starts_with("sleep 2; pbcopy < /tmp/x; rm -f /tmp/x"), "{m}");
+
+        let x = clip_restore_script(ClipBackend::X11, "UTF8_STRING", "/tmp/y").unwrap();
+        assert!(x.contains("xclip -selection clipboard -i -t UTF8_STRING < /tmp/y"), "{x}");
+
+        assert!(clip_restore_script(ClipBackend::Mac, "image/png", "/tmp/x").is_err());
     }
 
 }
