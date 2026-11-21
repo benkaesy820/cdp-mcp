@@ -207,6 +207,12 @@ subtree; the indexes it returns stay valid for `input`.
 ]
 ```
 
+`input` also takes `settleMs` at the call level: after the actions, it reads
+CDP events for up to that long and returns same-origin HTTP 4xx/5xx,
+non-aborted network failures, uncaught exceptions and console errors in
+`errors`. Default 0, so an ordinary click stays fast; ask for 800 to 1500 ms
+when a silent failure is the bug.
+
 ### Knowing a page is still loading
 
 `elements` reports `nodes` (how many DOM nodes exist) and a `suspect` field. When
