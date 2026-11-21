@@ -41,7 +41,8 @@ async function serveFrames() {
       return;
     }
     res.writeHead(200, { "content-type": "text/html" });
-    res.end(readFileSync(join(here, "pages", path === "/receipts" ? "receipts.html" : "cross.html")));
+    const file = path === "/receipts" ? "receipts.html" : path === "/sprint2" ? "sprint2.html" : "cross.html";
+    res.end(readFileSync(join(here, "pages", file)));
   });
   await new Promise(r => srv.listen(0, "0.0.0.0", r));
   framePort = srv.address().port;
@@ -580,6 +581,57 @@ await withTab(`http://127.0.0.1:${rport}/receipts`, async (tab) => {
   const scriptOnly = (await s.tool("idle", { tab, untilText: "tracker invalid", maxIdleMs: 5000, timeoutMs: 500 })).v;
   check("diagnostics ignore inline script text",
         !(scriptOnly.near?.textNear || "").length, scriptOnly.near);
+});
+
+// ---- sprint 2: honest actions and scoped state -----------------------------
+await withTab(`http://127.0.0.1:${rport}/sprint2`, async (tab, ev) => {
+  const els = (await s.tool("elements", { tab, limit: 999 })).v.elements || [];
+  const at = l => els.find(e => (e.label || "").trim() === l);
+
+  const blocked = await s.tool("input", { tab, actions: [{ click: { i: at("Covered")?.i } }] });
+  const bv = String(blocked.v);
+  check("an obscured click is blocked and names the blocker",
+        !blocked.ok && /"blocked":true/.test(bv) && /Cookie Banner/.test(bv), bv.slice(0, 200));
+
+  const forced = await s.tool("input", { tab, actions: [{ click: { i: at("Covered")?.i } }], force: true });
+  check("a forced click bypasses the obstruction check", forced.ok, String(forced.v).slice(0, 160));
+
+  const dis = await s.tool("input", { tab, actions: [{ click: { i: at("Disabled")?.i } }] });
+  check("a disabled click is blocked",
+        !dis.ok && /"reason":"disabled"/.test(String(dis.v)), String(dis.v).slice(0, 160));
+
+  await s.tool("input", { tab, actions: [{ click: { i: at("Icon Save")?.i } }] });
+  await sleep(150);
+  check("a click on a child of the target is allowed",
+        (await ev("window.__icon || 0")) === 1, await ev("window.__icon || 0"));
+
+  const form = (await s.tool("elements", { tab, within: "#modal-form", limit: 99 })).v;
+  const fels = form.elements || [];
+  const f = l => fels.find(e => (e.label || "").trim() === l);
+  check("a scoped scan returns only the form",
+        fels.length === 4 && !fels.some(e => /Go|Covered|NewTab/.test(e.label || "")),
+        fels.map(e => e.label));
+  check("form state is reported, with the password masked",
+        f("Name")?.value === "Ada" && f("Secret")?.value === "***" &&
+        f("Agree")?.checked === true && f("Plan")?.selected === "Pro",
+        { name: f("Name"), secret: f("Secret"), agree: f("Agree"), plan: f("Plan") });
+
+  // The scoped scan above set the click scope to #modal-form. A real caller
+  // rescans before using indexes from the page again; so does this test.
+  const els2 = (await s.tool("elements", { tab, limit: 999 })).v.elements || [];
+  const at2 = l => els2.find(e => (e.label || "").trim() === l);
+
+  const nt = await s.tool("input", { tab, actions: [{ click: { i: at2("NewTab")?.i } }], settleMs: 1800 });
+  const ntv = nt.v || {};
+  check("a target=_blank click reports the opened tab",
+        !!ntv.openedTab?.tab && /\/receipts$/.test(ntv.openedTab?.url || ""), ntv.openedTab);
+  if (ntv.openedTab?.tab) await s.tool("tabs", { action: "close", tab: ntv.openedTab.tab });
+
+  const nav = await s.tool("input", { tab, actions: [{ click: { i: at2("Go")?.i } }], settleMs: 1800 });
+  const nv = nav.v || {};
+  check("a same-tab navigation is reported with the new URL",
+        nv.navigated === true && /\/receipts$/.test(nv.url || ""),
+        { navigated: nv.navigated, url: nv.url });
 });
 
 s.close();

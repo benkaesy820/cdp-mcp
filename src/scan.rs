@@ -87,6 +87,28 @@ pub const SCAN_JS: &str = r#"(() => {
       const eff = explicit || derived;
       if (eff) rec.role = eff;
       if (el.disabled) rec.disabled = true;
+      if (el.getAttribute('aria-disabled') === 'true') rec.disabled = true;
+      // Current form state, so a scoped scan answers "what is typed here"
+      // without a second eval. Passwords never leave the page in plaintext.
+      const tagName = el.tagName;
+      if (tagName === 'INPUT') {
+          const ty = (el.type || 'text').toLowerCase();
+          if (ty === 'checkbox' || ty === 'radio') rec.checked = !!el.checked;
+          else if (ty === 'password') { if (el.value) rec.value = '***'; }
+          else if (el.value) rec.value = String(el.value).slice(0, 60);
+      } else if (tagName === 'TEXTAREA') {
+          if (el.value) rec.value = String(el.value).slice(0, 60);
+      } else if (tagName === 'SELECT') {
+          const opt = el.options[el.selectedIndex];
+          if (opt) rec.selected = String(opt.text || '').trim().slice(0, 60);
+      } else if (el.isContentEditable || el.getAttribute('role') === 'textbox') {
+          const v = (el.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+          if (v) rec.value = v;
+      }
+      const roleAttr = el.getAttribute('role');
+      if (roleAttr === 'checkbox' || roleAttr === 'switch' || roleAttr === 'radio') {
+          rec.checked = el.getAttribute('aria-checked') === 'true';
+      }
       if (frameLabel) rec.frame = frameLabel;
       Object.assign(rec, b);
       // off-screen (or outside its frame's visible area): needs scrolling
@@ -128,6 +150,10 @@ pub const SCAN_JS: &str = r#"(() => {
     const x = r.x + r.width / 2, y = r.y + r.height / 2;
     const out = { i: PICK.i, tag: elements[PICK.i].tag, label: elements[PICK.i].label,
                   x: Math.round(x), y: Math.round(y), scrolled };
+    out.connected = el.isConnected;
+    out.zero = r.width === 0 || r.height === 0;
+    out.disabled = !!el.disabled || el.getAttribute('aria-disabled') === 'true';
+    try { if (el.closest && el.closest('fieldset[disabled]')) out.disabled = true; } catch (e) {}
     // Would a real click at the centre reach this element, or something on
     // top? Hit-test through shadow roots and same-origin frames, the way the
     // browser will route the click.
@@ -158,6 +184,26 @@ pub const SCAN_JS: &str = r#"(() => {
     const top = deepAt(x, y);
     out.hit = !!top && (holds(el, top) || holds(top, el));
     if (!out.hit && top) out.coveredBy = labelOf(top).slice(0, 60) || top.tagName.toLowerCase();
+    if (!out.hit && top) {
+        // The blocker, in the same compact shape as the wait diagnostics.
+        const desc = (n) => {
+            if (!n || n.nodeType !== 1) return null;
+            const o = { tag: n.tagName.toLowerCase() };
+            const role = n.getAttribute('role');
+            if (role) o.role = role;
+            const label = n.getAttribute('aria-label') || n.getAttribute('placeholder') || n.getAttribute('name');
+            if (label) o.label = label.slice(0, 60);
+            const t = (n.innerText || n.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+            if (t) o.text = t;
+            return o;
+        };
+        const b = desc(top);
+        if (b && !b.label && !b.text) {
+            const d = top.closest && top.closest('[role="dialog"],dialog,[aria-modal="true"]');
+            if (d) Object.assign(b, desc(d));
+        }
+        out.blocker = b;
+    }
     const a = el.closest('a[href]') || el.querySelector('a[href]');
     if (a) out.href = a.href;
     if (PICK.select !== undefined) {
@@ -326,6 +372,28 @@ pub const FRAME_ELEMENTS_JS: &str = r#"(() => {
                     w: Math.round(r.width), h: Math.round(r.height) };
       if (explicit || derived) rec.role = explicit || derived;
       if (el.disabled) rec.disabled = true;
+      if (el.getAttribute('aria-disabled') === 'true') rec.disabled = true;
+      // Current form state, so a scoped scan answers "what is typed here"
+      // without a second eval. Passwords never leave the page in plaintext.
+      const tagName = el.tagName;
+      if (tagName === 'INPUT') {
+          const ty = (el.type || 'text').toLowerCase();
+          if (ty === 'checkbox' || ty === 'radio') rec.checked = !!el.checked;
+          else if (ty === 'password') { if (el.value) rec.value = '***'; }
+          else if (el.value) rec.value = String(el.value).slice(0, 60);
+      } else if (tagName === 'TEXTAREA') {
+          if (el.value) rec.value = String(el.value).slice(0, 60);
+      } else if (tagName === 'SELECT') {
+          const opt = el.options[el.selectedIndex];
+          if (opt) rec.selected = String(opt.text || '').trim().slice(0, 60);
+      } else if (el.isContentEditable || el.getAttribute('role') === 'textbox') {
+          const v = (el.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+          if (v) rec.value = v;
+      }
+      const roleAttr = el.getAttribute('role');
+      if (roleAttr === 'checkbox' || roleAttr === 'switch' || roleAttr === 'radio') {
+          rec.checked = el.getAttribute('aria-checked') === 'true';
+      }
       out.push(rec);
     }
     for (const host of root.querySelectorAll('*')) {

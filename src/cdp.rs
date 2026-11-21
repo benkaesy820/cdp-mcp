@@ -19,8 +19,17 @@ pub type Res<T> = Result<T, String>;
 /// the agent does not spend two more turns in the console and network panels.
 struct Receipts {
     origin: String,
+    opener: String,
     entries: Vec<Value>,
     requests: std::collections::HashMap<String, String>,
+    opened_tab: Option<Value>,
+}
+
+/// What a settle window saw beyond the error list: a tab the action opened.
+#[derive(Default)]
+pub struct ReceiptOutcome {
+    pub entries: Vec<Value>,
+    pub opened_tab: Option<Value>,
 }
 
 fn origin_of(url: &str) -> String {
@@ -61,8 +70,8 @@ fn clip_event(s: &str) -> String {
 }
 
 impl Receipts {
-    fn new(origin: String) -> Self {
-        Self { origin, entries: Vec::new(), requests: Default::default() }
+    fn new(origin: String, opener: String) -> Self {
+        Self { origin, opener, entries: Vec::new(), requests: Default::default(), opened_tab: None }
     }
 
     fn push(&mut self, v: Value) {
@@ -155,6 +164,34 @@ impl Receipts {
                     .or_else(|| d.get("text").and_then(Value::as_str))
                     .unwrap_or("uncaught exception");
                 self.push(json!({ "kind": "js", "text": clip_event(text) }));
+            }
+            "Target.targetCreated" => {
+                let info = p.get("targetInfo").unwrap_or(&Value::Null);
+                if info.get("type").and_then(Value::as_str) != Some("page") {
+                    return;
+                }
+                if info.get("openerId").and_then(Value::as_str) != Some(self.opener.as_str()) {
+                    return;
+                }
+                if self.opened_tab.is_some() {
+                    return;
+                }
+                let id = info.get("targetId").and_then(Value::as_str).unwrap_or("");
+                let url = info.get("url").and_then(Value::as_str).unwrap_or("");
+                self.opened_tab = Some(json!({ "tab": id, "url": url }));
+            }
+            "Target.targetInfoChanged" => {
+                let info = p.get("targetInfo").unwrap_or(&Value::Null);
+                let Some(id) = info.get("targetId").and_then(Value::as_str) else { return };
+                let Some(cur) = self.opened_tab.as_mut() else { return };
+                if cur.get("tab").and_then(Value::as_str) != Some(id) {
+                    return;
+                }
+                if let Some(url) = info.get("url").and_then(Value::as_str) {
+                    if !url.is_empty() && url != "about:blank" {
+                        cur["url"] = json!(url);
+                    }
+                }
             }
             "Runtime.consoleAPICalled" => {
                 if p.get("type").and_then(Value::as_str) != Some("error") {
@@ -718,20 +755,24 @@ impl Conn {
     /// Start collecting causal events for an action that asked for a settle
     /// window. Off by default: enabling Network on every click would cost
     /// latency and fill the socket for actions nobody is debugging.
-    pub fn begin_receipts(&mut self, page_url: &str) -> Res<()> {
+    pub fn begin_receipts(&mut self, page_url: &str, opener: &str) -> Res<()> {
         // Enable first: Runtime.enable replays buffered console entries, and a
         // receipt armed before the call would blame them on this action.
         self.enable_runtime()?;
         self.call("Network.enable", json!({}))?;
-        self.receipts = Some(Receipts::new(origin_of(page_url)));
+        if let Err(e) = self.call("Target.setDiscoverTargets", json!({ "discover": true })) {
+            let _ = self.call("Network.disable", json!({}));
+            return Err(e);
+        }
+        self.receipts = Some(Receipts::new(origin_of(page_url), opener.to_string()));
         Ok(())
     }
 
     /// Read until `quiet_ms` passes with no message while no same-origin
-    /// request is in flight, or `max_ms` elapses, then turn Network off.
+    /// request is in flight, or `max_ms` elapses, then turn the domains off.
     /// This is a socket read, not a poll: an in-flight API call keeps the
     /// window open, and a still page costs one timeout.
-    pub fn settle_receipts(&mut self, quiet_ms: u64, max_ms: u64) -> Vec<Value> {
+    pub fn settle_receipts(&mut self, quiet_ms: u64, max_ms: u64) -> ReceiptOutcome {
         let deadline = std::time::Instant::now() + Duration::from_millis(max_ms);
         loop {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
@@ -760,9 +801,13 @@ impl Conn {
         let restore = self.timeout_ms;
         self.set_read_timeout(restore);
         if !self.dead {
+            let _ = self.call("Target.setDiscoverTargets", json!({ "discover": false }));
             let _ = self.call("Network.disable", json!({}));
         }
-        self.receipts.take().map(|r| r.entries).unwrap_or_default()
+        match self.receipts.take() {
+            Some(r) => ReceiptOutcome { entries: r.entries, opened_tab: r.opened_tab },
+            None => ReceiptOutcome::default(),
+        }
     }
 
     /// Block until the page calls `name`, with nothing sent to the page.
@@ -958,7 +1003,7 @@ mod receipt_tests {
 
     #[test]
     fn loopback_is_one_origin_across_ports() {
-        let dev = Receipts::new(origin_of("http://127.0.0.1:5173/"));
+        let dev = Receipts::new(origin_of("http://127.0.0.1:5173/"), "T".into());
         assert!(dev.same_origin("http://127.0.0.1:3000/api"));
         assert!(dev.same_origin("http://localhost:3000/api"));
         assert!(!dev.same_origin("https://tracker.invalid/x"));
@@ -966,14 +1011,29 @@ mod receipt_tests {
 
     #[test]
     fn lookalike_loopback_hosts_are_not_loopback() {
-        let dev = Receipts::new(origin_of("http://localhost:5173/"));
+        let dev = Receipts::new(origin_of("http://localhost:5173/"), "T".into());
         assert!(!dev.same_origin("https://localhost.evil.com/x"));
         assert!(!dev.same_origin("http://127.0.0.1.nip.io/x"));
     }
 
     #[test]
+    fn an_opened_page_is_attributed_to_its_opener() {
+        let mut r = Receipts::new("https://app.example.com".into(), "T1".into());
+        r.note(&json!({"method":"Target.targetCreated","params":{"targetInfo":{
+            "targetId":"T2","type":"page","openerId":"T1","url":"about:blank"}}}));
+        assert_eq!(r.opened_tab.as_ref().unwrap()["tab"], "T2");
+        r.note(&json!({"method":"Target.targetInfoChanged","params":{"targetInfo":{
+            "targetId":"T2","url":"https://app.example.com/report"}}}));
+        assert_eq!(r.opened_tab.as_ref().unwrap()["url"], "https://app.example.com/report");
+        let before = r.opened_tab.clone();
+        r.note(&json!({"method":"Target.targetCreated","params":{"targetInfo":{
+            "targetId":"T3","type":"page","openerId":"OTHER","url":"https://x.example/"}}}));
+        assert_eq!(r.opened_tab, before);
+    }
+
+    #[test]
     fn non_loopback_origins_are_strict() {
-        let app = Receipts::new(origin_of("https://app.example.com/"));
+        let app = Receipts::new(origin_of("https://app.example.com/"), "T".into());
         assert!(app.same_origin("https://app.example.com:443/api"));
         assert!(!app.same_origin("https://api.example.com/x"));
         assert!(!app.same_origin("http://app.example.com/x"));

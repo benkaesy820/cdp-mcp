@@ -213,6 +213,15 @@ non-aborted network failures, uncaught exceptions and console errors in
 `errors`. Default 0, so an ordinary click stays fast; ask for 800 to 1500 ms
 when a silent failure is the bug.
 
+An indexed click is pre-flighted: a detached, zero-size, disabled or covered
+target is refused with `{blocked, reason, obscuredBy}` unless `force` is true.
+With `settleMs`, `input` also reports `navigated` and the new `url` after a
+same-tab navigation, and `openedTab` when the click opened a tab.
+
+`elements` accepts `within` (a CSS selector) and returns current form state on
+the controls it finds: `value` (passwords masked), `checked`, `selected` and
+`disabled`.
+
 ### Knowing a page is still loading
 
 `elements` reports `nodes` (how many DOM nodes exist) and a `suspect` field. When

@@ -657,7 +657,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "elements",
-            "description": "Scan the page: `overlays` lists dialogs/modals/cookie walls with their dismiss buttons, and `elements` lists visible interactive nodes with a clickable index `i` and centre point. Filter with `find` and cap with `limit` to keep the payload small. Indexes are absolute in the unfiltered list and are re-resolved at click time, so they cannot go stale.",
+            "description": "Scan the page: `overlays` lists dialogs/modals/cookie walls with their dismiss buttons, and `elements` lists visible interactive nodes with a clickable index `i` and centre point. Filter with `find` and cap with `limit` to keep the payload small. Indexes are absolute in the unfiltered list and are re-resolved at click time, so they cannot go stale. Form controls include current `value` (passwords masked), `checked`, `selected` and `disabled`; `within` scopes the scan to a selector.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -693,14 +693,14 @@ fn tool_defs() -> Value {
         },
         {
             "name": "input",
-            "description": "Send real user input, in order. Actions: {click:{i|x,y[,button:right|middle,count:2,modifiers:[Shift]]}} (an index is scrolled into view and resolved in the same `within` scope as the last elements call; the log says `covered` when something else sits on top of it), {hover:{i}}, {drag:{from:{i},to:{i},steps:12}}, {tap:{i}} (touch), {swipe:{from,to}} (touch), {select:{i,value}} (<select>), {insert:\"text\"}, {key:\"Enter\"|\"Control+a\"|\"Control+Shift+z\"|\"a\"|\"Escape\"|\"Tab\"|\"ArrowDown\"|\"F5\"}, {scroll:{dy:400}} (scrolls the page, or the scrollable panel in the middle of the screen; reports whether it moved), {dismiss:{prefer:\"reject\"}} (closes cookie walls and modals, refusing cookies when offered), {wait:{idle:true,ms:15000}} (waits for loading to settle), {wait:{text:\"...\",ms:15000}}, {sleep:{ms:300}}. Real events, so React/Draft editors accept them.",
+            "description": "Send real user input, in order. Actions: {click:{i|x,y[,button:right|middle,count:2,modifiers:[Shift]]}} (an index is scrolled into view and resolved in the same `within` scope as the last elements call; the log says `covered` when something else sits on top of it), {hover:{i}}, {drag:{from:{i},to:{i},steps:12}}, {tap:{i}} (touch), {swipe:{from,to}} (touch), {select:{i,value}} (<select>), {insert:\"text\"}, {key:\"Enter\"|\"Control+a\"|\"Control+Shift+z\"|\"a\"|\"Escape\"|\"Tab\"|\"ArrowDown\"|\"F5\"}, {scroll:{dy:400}} (scrolls the page, or the scrollable panel in the middle of the screen; reports whether it moved), {dismiss:{prefer:\"reject\"}} (closes cookie walls and modals, refusing cookies when offered), {wait:{idle:true,ms:15000}} (waits for loading to settle), {wait:{text:\"...\",ms:15000}}, {sleep:{ms:300}}. Real events, so React/Draft editors accept them. An indexed click is refused when the element is detached, zero-size, disabled or covered, with `{blocked, reason, obscuredBy}`; `force` bypasses that check. With `settleMs`, the result also reports `navigated`, `url`, `openedTab` and same-origin errors.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "actions": { "type": "array", "items": { "type": "object" } },
                     "tab": { "type": "string" },
                     "announce": { "type": "boolean", "description": "also check for a dialog that appeared because of these actions (default false: costs a round trip)" },
-                    "force": { "type": "boolean", "description": "allow repeating a final confirmation (Post/Publish/Delete/…) that was already clicked in this run. Verify with delta first." },
+                    "force": { "type": "boolean", "description": "allow repeating a final confirmation (Post/Publish/Delete/…) that was already clicked in this run, and bypass the click obstruction check. Verify with delta first." },
                     "settleMs": { "type": "integer", "description": "after the actions, read CDP events for up to this many ms and return same-origin HTTP 4xx/5xx, uncaught exceptions and console errors in `errors` (default 0 = off). Adds the settle time to the call." }
                 },
                 "required": ["actions"]
@@ -2148,6 +2148,30 @@ fn run_input(conn: &mut cdp::Conn, actions: &[Value], force: bool, scope: Option
                 // clicking: a repeat of a final confirmation is the failure that
                 // bites an unattended run.
                 let at = pick(conn, scope, i, true, None)?;
+                if !force {
+                    let reason = if at.get("connected").and_then(Value::as_bool) == Some(false) {
+                        Some("detached")
+                    } else if at.get("zero").and_then(Value::as_bool) == Some(true) {
+                        Some("zero_size")
+                    } else if at.get("disabled").and_then(Value::as_bool) == Some(true) {
+                        Some("disabled")
+                    } else if at.get("hit").and_then(Value::as_bool) == Some(false) {
+                        Some("obscured")
+                    } else {
+                        None
+                    };
+                    if let Some(reason) = reason {
+                        let blocked = json!({
+                            "blocked": true,
+                            "reason": reason,
+                            "target": { "i": i, "tag": at.get("tag"), "label": at.get("label") },
+                            "obscuredBy": at.get("blocker").cloned()
+                                .or_else(|| at.get("coveredBy").cloned())
+                                .unwrap_or(Value::Null),
+                        });
+                        return Err(blocked.to_string());
+                    }
+                }
                 if let Some(label) = at.get("label").and_then(Value::as_str) {
                     if irreversible(label) {
                         let key = format!("{label}|{i}");
@@ -2629,7 +2653,11 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
             let max_w = args.get("shotMaxWidth").and_then(Value::as_f64).unwrap_or(1024.0);
             let region = parse_region(args.get("region"));
 
-            let within = args.get("within").and_then(Value::as_str).map(str::to_string);
+            let within = match args.get("within") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(_) => return Err("within must be a CSS selector; integer within is not implemented yet".into()),
+            };
             with_conn(&cfg.endpoint, tab, |conn, tab_id| {
                 let scan_v = scan_with_frames(conn, within.as_deref())?;
                 scope_cache().lock().unwrap().insert(tab_id.to_string(), within.clone());
@@ -2782,18 +2810,22 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
             let settle_ms = args.get("settleMs").and_then(Value::as_u64).unwrap_or(0).min(5_000);
             with_conn(&cfg.endpoint, tab, |conn, tab_id| {
                 let scope = scope_for(tab_id);
-                // A settle window is opt-in: enabling Network on every
-                // click would add latency to the common case, and most actions
-                // are not being debugged.
+                let mut navigated = false;
+                let mut opened_tab: Option<Value> = None;
+                let mut note: Option<String> = None;
+                // A settle window is opt-in: enabling Network on every click
+                // would add latency to the common case, and most actions are
+                // not being debugged.
                 let (log, errors) = if settle_ms > 0 {
                     let url = conn
                         .eval("location.href")
                         .ok()
                         .and_then(|v| v.as_str().map(str::to_string))
                         .unwrap_or_default();
-                    let on = !url.is_empty() && conn.begin_receipts(&url).is_ok();
+                    let on = !url.is_empty() && conn.begin_receipts(&url, tab_id).is_ok();
+                    conn.contexts_cleared = false;
                     let result = run_input(conn, &actions, force, scope.as_deref());
-                    let errors = if on {
+                    let outcome = if on {
                         if result.is_err() {
                             // Nothing was dispatched cleanly; do not make the
                             // caller wait out the quiet window as well.
@@ -2802,13 +2834,26 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                             conn.settle_receipts(250, settle_ms)
                         }
                     } else {
-                        Vec::new()
+                        cdp::ReceiptOutcome::default()
                     };
-                    (result?, errors)
+                    navigated = conn.contexts_cleared;
+                    opened_tab = outcome.opened_tab;
+                    let errors = outcome.entries;
+                    let log = match result {
+                        Ok(v) => v,
+                        // A click that navigated can fail on the trailing
+                        // synthetic event. That is an outcome, not a tool error.
+                        Err(e) if navigated => {
+                            note = Some(e);
+                            json!([])
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    (log, errors)
                 } else {
                     (run_input(conn, &actions, force, scope.as_deref())?, Vec::new())
                 };
-                let (overlays, url) = if announce {
+                let (overlays, mut url) = if announce {
                     // cheap post-action check: only what appeared because we acted
                     let ov = conn.eval(scan::OVERLAYS_QUICK_JS).unwrap_or(json!([]));
                     let u = conn.eval("location.href").unwrap_or(Value::Null);
@@ -2816,7 +2861,23 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                 } else {
                     (json!([]), Value::Null)
                 };
+                if navigated {
+                    if let Ok(u) = conn.eval("location.href") {
+                        if let Some(s) = u.as_str() {
+                            url = json!(s);
+                        }
+                    }
+                }
                 let mut out = json!({ "tab": tab_id, "url": url, "log": log, "overlays": overlays });
+                if navigated {
+                    out["navigated"] = json!(true);
+                }
+                if let Some(t) = opened_tab {
+                    out["openedTab"] = t;
+                }
+                if let Some(n) = note {
+                    out["note"] = json!(n);
+                }
                 if !errors.is_empty() {
                     out["errors"] = json!(errors);
                 }

@@ -1,0 +1,48 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>cdp-mcp sprint 2</title>
+<!-- Honest actions: navigation, a new tab, an obstructed target, a disabled
+     target, a button whose child is the hit point, and a scoped form with
+     current state. -->
+<style>
+  body { font: 16px system-ui, sans-serif; padding: 20px; }
+  a { margin-right: 24px; }
+  #cover-wrap { position: relative; display: inline-block; margin: 20px 0; }
+  #covered { padding: 10px 20px; }
+  #banner {
+    position: absolute; inset: 0; z-index: 10; background: #e8e8e8;
+    border: 1px solid #888; display: flex; align-items: center; justify-content: center;
+  }
+  #modal-form {
+    border: 1px solid #999; padding: 12px; margin-top: 20px;
+    display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+  }
+</style>
+<body>
+<a id="go" href="/receipts">Go</a>
+<a id="newtab" href="/receipts" target="_blank" rel="noopener">NewTab</a>
+
+<div id="cover-wrap">
+  <button id="covered" aria-label="Covered">Covered</button>
+  <div id="banner" role="dialog" aria-label="Cookie Banner">Accept all cookies</div>
+</div>
+
+<button id="dis" aria-label="Disabled" disabled>Submit</button>
+<button id="icon-btn" aria-label="Icon Save">
+  <svg width="16" height="16"><rect width="16" height="16" fill="#555"/></svg>
+  <span>Save</span>
+</button>
+
+<div id="modal-form" role="dialog" aria-label="Modal form">
+  <input type="text" aria-label="Name" value="Ada">
+  <input type="password" aria-label="Secret" value="hunter2">
+  <input type="checkbox" aria-label="Agree" checked>
+  <select aria-label="Plan"><option>Free</option><option selected>Pro</option></select>
+</div>
+
+<script>
+  window.__icon = 0;
+  window.__covered = 0;
+  document.getElementById('icon-btn').addEventListener('click', () => { window.__icon = 1; });
+  document.getElementById('covered').addEventListener('click', () => { window.__covered = 1; });
+</script>
