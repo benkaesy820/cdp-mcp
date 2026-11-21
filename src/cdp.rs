@@ -462,12 +462,21 @@ pub fn new_tab(endpoint: &str, url: &str, foreground: bool) -> Res<String> {
 /// `GET /json/close/<id>` goes through Chrome's tab-strip close, which picks the
 /// next tab and activates the window: measured, focus left the chat window for
 /// Helium on every close. `Target.closeTarget` tears the target down instead.
-pub fn close_tab(endpoint: &str, id: &str) -> Res<()> {
+pub fn close_tab(endpoint: &str, id: &str) -> Res<bool> {
+    // Discovery is what makes the browser emit targetDestroyed.
+    browser_call(endpoint, "Target.setDiscoverTargets", json!({ "discover": true }))?;
     browser_call(endpoint, "Target.closeTarget", json!({ "targetId": id }))?;
-    if let Ok(mut owned) = OWNED.lock() {
-        owned.remove(id);
+    let mut slot = BROWSER.lock().map_err(|_| "browser connection lock poisoned")?;
+    let closed = match slot.as_mut() {
+        Some(conn) => conn.wait_match("Target.targetDestroyed", "targetId", id, 1500),
+        None => false,
+    };
+    if closed {
+        if let Ok(mut owned) = OWNED.lock() {
+            owned.remove(id);
+        }
     }
-    Ok(())
+    Ok(closed)
 }
 
 /// An open DevTools connection to one page.
@@ -502,6 +511,34 @@ pub struct Conn {
     pub contexts_cleared: bool,
     /// Causal events for an action that asked for a settle window.
     receipts: Option<Receipts>,
+    /// `Page.enable` has been sent on this connection. One round trip per tab,
+    /// then free; kept out of `Conn::open` so the browser-level socket never
+    /// sends it.
+    page_on: bool,
+    /// The JavaScript dialog the page is showing, if any: `type`, `message`,
+    /// `defaultPrompt`, `url`. While this is set the renderer is blocked, so
+    /// every other call would wait out its timeout.
+    pub dialog: Option<Value>,
+    /// Bumped for every dialog that opens. A wait records it on entry and
+    /// breaks only when it moves, which lets an already-open dialog be answered
+    /// without breaking the very call that answers it.
+    pub dialog_seq: u64,
+}
+
+/// Events that mean the page is still doing something. `Page.*` is deliberately
+/// absent: frame lifecycle chatter would hold a settle window open to its cap,
+/// and the wait is about network quiet.
+fn settle_activity(v: &Value) -> bool {
+    match v.get("method").and_then(Value::as_str) {
+        Some(m) => {
+            m.starts_with("Network.")
+                || m == "Target.targetCreated"
+                || m == "Target.targetInfoChanged"
+                || m == "Runtime.exceptionThrown"
+                || m == "Runtime.consoleAPICalled"
+        }
+        None => false, // a reply is not page activity
+    }
 }
 
 fn timeout_from_env() -> u64 {
@@ -542,7 +579,7 @@ impl Conn {
         let mut conn = Conn { ws, next: 0, focus_on: false, timeout_ms: ms, dead: false, replies: 0,
                               oopifs: Vec::new(), auto_attach: false, runtime_on: false,
                               binding: None, timed_out: false, contexts_cleared: false,
-                              receipts: None };
+                              receipts: None, page_on: false, dialog: None, dialog_seq: 0 };
         conn.set_read_timeout(ms);
         // No domain is enabled on connect: each enable costs a round trip, and
         // most commands do not need one. `enable_runtime` turns on the Runtime
@@ -595,6 +632,76 @@ impl Conn {
         }
     }
 
+    /// Read whatever has already arrived, without blocking and without counting
+    /// it as a reply.
+    ///
+    /// A dialog can open between two tool calls; the event then sits in the
+    /// socket while nothing reads it, and a command written before it is seen
+    /// would run the moment the dialog is dismissed. A dialog the human
+    /// dismissed while the server was idle has to be seen for the same reason.
+    ///
+    /// `replies` is deliberately not touched, so `with_conn_retry`'s
+    /// "nothing reached the page" test keeps meaning what it meant.
+    pub fn drain_arrived(&mut self) -> Res<usize> {
+        if self.dead {
+            return Ok(0);
+        }
+        if let Err(e) = self.ws.get_mut().set_nonblocking(true) {
+            return Err(format!("cannot poll the page socket: {e}"));
+        }
+        let mut seen: Vec<Value> = Vec::new();
+        let mut pings = Vec::new();
+        let mut out: Res<()> = Ok(());
+        loop {
+            if seen.len() >= 256 {
+                break; // bounded; the rest waits for the next call
+            }
+            match self.ws.read() {
+                Ok(Message::Text(t)) => {
+                    if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                        seen.push(v);
+                    }
+                }
+                Ok(Message::Binary(b)) => {
+                    if let Ok(v) = serde_json::from_slice::<Value>(&b) {
+                        seen.push(v);
+                    }
+                }
+                Ok(Message::Ping(p)) => pings.push(p),
+                Ok(Message::Close(_)) => {
+                    self.dead = true;
+                    out = Err("the page closed the connection".into());
+                    break;
+                }
+                Ok(_) => {}
+                Err(tungstenite::Error::Io(e))
+                    if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) =>
+                {
+                    break;
+                }
+                Err(e) => {
+                    self.dead = true;
+                    out = Err(format!("connection to the page lost: {e}"));
+                    break;
+                }
+            }
+        }
+        // Back to blocking before anything is sent: a partial write on a
+        // non-blocking socket is a bug waiting to happen.
+        let _ = self.ws.get_mut().set_nonblocking(false);
+        self.timed_out = false;
+        for v in &seen {
+            self.track_frames(v);
+            if let Some(r) = self.receipts.as_mut() {
+                r.note(v);
+            }
+        }
+        for p in pings {
+            let _ = self.ws.send(Message::Pong(p));
+        }
+        out.map(|_| seen.len())
+    }
+
     /// Keep the out-of-process iframe list current. Every message passes
     /// through here, so an event is never missed because a call skipped it.
     fn track_frames(&mut self, v: &Value) {
@@ -623,6 +730,19 @@ impl Conn {
                     }
                 }
             }
+            // A dialog blocks the renderer until it is answered: input and
+            // evaluations stop replying, so every wait has to know about it.
+            Some("Page.javascriptDialogOpening") => {
+                let p = &v["params"];
+                self.dialog_seq += 1;
+                self.dialog = Some(json!({
+                    "type": p.get("type").cloned().unwrap_or(Value::Null),
+                    "message": p.get("message").cloned().unwrap_or(Value::Null),
+                    "defaultPrompt": p.get("defaultPrompt").cloned().unwrap_or(Value::Null),
+                    "url": p.get("url").cloned().unwrap_or(Value::Null),
+                }));
+            }
+            Some("Page.javascriptDialogClosed") => self.dialog = None,
             // A navigation, or a document swap. Everything the page was holding
             // for us is gone, including any observer. The binding itself
             // survives (measured), so only the installer has to run again.
@@ -738,6 +858,63 @@ impl Conn {
         Ok(())
     }
 
+    /// Enable the Page domain once per connection. It is the only way to hear
+    /// about a JavaScript dialog before the 30 s timeout, and about frame
+    /// navigations and downloads the caller may want reported.
+    ///
+    /// Deliberately not in `Conn::open`: the browser-level socket is a `Conn`
+    /// too, and `Page.enable` there is a protocol error.
+    pub fn enable_page(&mut self) -> Res<()> {
+        if !self.page_on {
+            self.call("Page.enable", json!({}))?;
+            self.page_on = true;
+        }
+        Ok(())
+    }
+
+    /// Answer the dialog the page is showing, and report the one that replaced
+    /// it, if any: `confirm()` followed by `alert()` opens a second dialog as
+    /// the first closes. One answer per call keeps that deterministic.
+    pub fn handle_dialog(&mut self, accept: bool, text: Option<&str>) -> Res<Option<Value>> {
+        let seq = self.dialog_seq;
+        let mut params = json!({ "accept": accept });
+        if let Some(t) = text {
+            params["promptText"] = json!(t);
+        }
+        match self.call("Page.handleJavaScriptDialog", params) {
+            Ok(_) => {
+                // The Closed event normally clears it; this covers the ordering
+                // where the reply arrives first. A newer dialog is left alone.
+                if self.dialog_seq == seq {
+                    self.dialog = None;
+                }
+                // A chained dialog opens as the renderer resumes, which can land
+                // just after this reply: wait briefly for it so the caller is told
+                // now instead of discovering it on the next call.
+                if self.dialog.is_none() {
+                    let _ = self.wait_event("Page.javascriptDialogOpening", 150);
+                    self.timed_out = false;
+                }
+                Ok(self.dialog.clone())
+            }
+            Err(e) => {
+                if self.dialog_seq != seq && self.dialog.is_some() {
+                    Ok(self.dialog.clone())
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    /// The page's current URL from the browser process, which keeps answering
+    /// while a dialog blocks the renderer. Used where `location.href` cannot.
+    pub fn target_url(&mut self) -> Option<String> {
+        self.call("Target.getTargetInfo", json!({}))
+            .ok()
+            .and_then(|v| v.pointer("/targetInfo/url").and_then(Value::as_str).map(str::to_string))
+    }
+
     /// Install a page-side binding the page can call to wake this server.
     ///
     /// Added once and never removed: the probe showed it survives navigation
@@ -768,29 +945,77 @@ impl Conn {
         Ok(())
     }
 
+    /// Wait until `method` arrives carrying `/params/<key> == want`.
+    ///
+    /// False on a timeout or a dead socket: the caller treats "not seen" as "not
+    /// gone", which is the safe answer for a close.
+    pub fn wait_match(&mut self, method: &str, key: &str, want: &str, ms: u64) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_millis(ms);
+        let pointer = format!("/params/{key}");
+        let out = loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break false;
+            }
+            self.set_read_timeout(left.as_millis().max(1) as u64);
+            match self.next_msg(method, ms) {
+                Ok(v) => {
+                    if v.get("method").and_then(Value::as_str) == Some(method)
+                        && v.pointer(&pointer).and_then(Value::as_str) == Some(want)
+                    {
+                        break true;
+                    }
+                }
+                Err(_) => break false,
+            }
+        };
+        let restore = self.timeout_ms;
+        self.set_read_timeout(restore);
+        out
+    }
+
     /// Read until `quiet_ms` passes with no message while no same-origin
     /// request is in flight, or `max_ms` elapses, then turn the domains off.
     /// This is a socket read, not a poll: an in-flight API call keeps the
     /// window open, and a still page costs one timeout.
     pub fn settle_receipts(&mut self, quiet_ms: u64, max_ms: u64) -> ReceiptOutcome {
         let deadline = std::time::Instant::now() + Duration::from_millis(max_ms);
+        // Quiet is measured from the last event that means the page is working.
+        // Page.* events are seen (a dialog must end the wait) but do not count:
+        // frame lifecycle chatter would hold every settle window to its cap.
+        let mut last_activity = std::time::Instant::now();
         loop {
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
-            if left.is_zero() {
+            let cap_left = deadline.saturating_duration_since(std::time::Instant::now());
+            if cap_left.is_zero() {
                 break;
             }
-            let slice = left.min(Duration::from_millis(quiet_ms.max(1)));
-            self.set_read_timeout(slice.as_millis().max(1) as u64);
-            match self.next_msg("action settle", slice.as_millis() as u64) {
-                Ok(_) => continue,
-                Err(_) if self.timed_out => {
-                    self.timed_out = false;
-                    let quiet = self.receipts.as_ref().map(|r| r.requests.is_empty()).unwrap_or(true);
-                    if quiet {
+            let quiet_left = quiet_ms.saturating_sub(last_activity.elapsed().as_millis() as u64);
+            let wait = if quiet_left == 0 {
+                // Quiet long enough. Leave unless a same-origin request is still
+                // open; a short slice keeps that landing responsive instead of
+                // spinning on 1 ms reads.
+                let idle = self.receipts.as_ref().map(|r| r.requests.is_empty()).unwrap_or(true);
+                if idle {
+                    break;
+                }
+                Duration::from_millis(quiet_ms.clamp(50, 250))
+            } else {
+                Duration::from_millis(quiet_left)
+            };
+            let slice = wait.min(cap_left).as_millis().max(1) as u64;
+            self.set_read_timeout(slice);
+            match self.next_msg("action settle", slice) {
+                Ok(v) => {
+                    // The renderer is blocked; nothing more will settle.
+                    if self.dialog.is_some() {
                         break;
                     }
-                    // A same-origin request is still in flight: keep reading
-                    // until it lands or the cap expires.
+                    if settle_activity(&v) {
+                        last_activity = std::time::Instant::now();
+                    }
+                }
+                Err(_) if self.timed_out => {
+                    self.timed_out = false;
                 }
                 Err(_) => break,
             }
@@ -801,8 +1026,10 @@ impl Conn {
         let restore = self.timeout_ms;
         self.set_read_timeout(restore);
         if !self.dead {
-            let _ = self.call("Target.setDiscoverTargets", json!({ "discover": false }));
-            let _ = self.call("Network.disable", json!({}));
+            // Bounded: if a dialog is up the renderer is blocked, and a teardown
+            // command must not turn a settled action into a 30 s wait.
+            let _ = self.call_within("Target.setDiscoverTargets", json!({ "discover": false }), 400);
+            let _ = self.call_within("Network.disable", json!({}), 400);
         }
         match self.receipts.take() {
             Some(r) => ReceiptOutcome { entries: r.entries, opened_tab: r.opened_tab },
@@ -898,6 +1125,7 @@ impl Conn {
     /// each read gets only what is left of it.
     fn await_replies(&mut self, ids: &[i64], waiting: &str, total: u64) -> Res<Vec<Value>> {
         let deadline = std::time::Instant::now() + Duration::from_millis(total);
+        let start_seq = self.dialog_seq;
         let mut got: Vec<Option<Value>> = vec![None; ids.len()];
         let mut left = ids.len();
         while left > 0 {
@@ -909,7 +1137,18 @@ impl Conn {
                 return Err(format!("{waiting}: no reply within {total} ms (the page is busy or frozen)"));
             }
             self.set_read_timeout(remaining);
-            let v = self.next_msg(waiting, remaining)?;
+            // `total` is for the message: a timeout after events, or after a
+            // dialog, reports the call's deadline rather than the last slice.
+            let v = self.next_msg(waiting, total)?;
+            // A dialog that opened during this wait blocks the renderer; one
+            // that was already open must not, or answering it would break the
+            // very call that answers it.
+            if self.dialog_seq != start_seq {
+                if let Some(d) = self.dialog.as_ref() {
+                    let ty = d.get("type").and_then(Value::as_str).unwrap_or("dialog");
+                    return Err(format!("dialog open: {ty}"));
+                }
+            }
             let Some(id) = v.get("id").and_then(Value::as_i64) else { continue };
             let Some(slot) = ids.iter().position(|i| *i == id) else { continue };
             if got[slot].is_some() {

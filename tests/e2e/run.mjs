@@ -41,7 +41,7 @@ async function serveFrames() {
       return;
     }
     res.writeHead(200, { "content-type": "text/html" });
-    const file = path === "/receipts" ? "receipts.html" : path === "/sprint2" ? "sprint2.html" : path === "/imgs" ? "imgs.html" : "cross.html";
+    const file = path === "/receipts" ? "receipts.html" : path === "/sprint2" ? "sprint2.html" : path === "/imgs" ? "imgs.html" : path === "/dialogs" ? "dialogs.html" : path === "/unload" ? "unload.html" : "cross.html";
     res.end(readFileSync(join(here, "pages", file)));
   });
   await new Promise(r => srv.listen(0, "0.0.0.0", r));
@@ -409,9 +409,80 @@ await withTab(`http://localhost:${fport}/receipts`, async (tabA) => {
   }
 });
 
-// A wait on a page that never stops moving used to pay a forced layout and a
-// CDP message for every mutation batch. The report must stay useful, but the
-// message rate is capped; a hit is still immediate.
+// ---- dialogs: a blocked renderer must never become a 30 s wait ------------
+await withTab(`http://localhost:${fport}/dialogs`, async (tab, ev) => {
+  const els = (await s.tool("elements", { tab, limit: 99 })).v.elements || [];
+  const at = l => els.find(e => (e.label || "").trim() === l);
+  const out = () => ev("document.getElementById('out').textContent");
+
+  const ask = await s.tool("input", { tab, actions: [{ click: { i: at("Confirm")?.i } }] });
+  check("a click that opens a confirm returns the dialog instead of hanging",
+        ask.ok && ask.v?.dialog?.type === "confirm" && /Delete this item/.test(ask.v?.dialog?.message || "") && ask.ms < 4000,
+        { ok: ask.ok, ms: ask.ms, dialog: ask.v?.dialog });
+
+  const during = await s.tool("elements", { tab });
+  check("another tool fails fast while a dialog is open",
+        !during.ok && /dialog/.test(JSON.stringify(during.v)) && during.ms < 4000,
+        { ok: during.ok, ms: during.ms, v: JSON.stringify(during.v).slice(0, 160) });
+
+  // A batch that starts with a click cannot be the one that answers a dialog: it
+  // must fail fast like any other page tool, not send the click and hang.
+  const mixed = await s.tool("input", { tab, actions: [{ click: { i: at("Confirm")?.i } }, { dialog: { accept: true } }] });
+  check("a batch that does not start with the dialog fails fast while one is open",
+        !mixed.ok && /dialog/.test(JSON.stringify(mixed.v)) && mixed.ms < 4000,
+        { ok: mixed.ok, ms: mixed.ms, v: JSON.stringify(mixed.v).slice(0, 140) });
+
+  const no = await s.tool("input", { tab, actions: [{ dialog: { accept: false } }] });
+  check("answering the dialog unblocks the page and settles the click",
+        no.ok && no.v?.dialog === undefined && (await out()) === "ask:false",
+        { ok: no.ok, dialog: no.v?.dialog, out: await out() });
+
+  const pr = await s.tool("input", { tab, actions: [{ click: { i: at("Prompt")?.i } }] });
+  check("a prompt is reported with its default text",
+        pr.v?.dialog?.type === "prompt" && pr.v?.dialog?.defaultPrompt === "Ada", pr.v?.dialog);
+  const answered = await s.tool("input", { tab, actions: [{ dialog: { accept: true, text: "Ben" } }] });
+  check("a prompt answer carries the text",
+        answered.ok && (await out()) === "prompt:Ben", { ok: answered.ok, out: await out() });
+
+  const chain = await s.tool("input", { tab, actions: [{ click: { i: at("Chain")?.i } }] });
+  check("the first dialog of a chain is reported", chain.v?.dialog?.type === "confirm", chain.v?.dialog);
+  const chained = await s.tool("input", { tab, actions: [{ dialog: { accept: true } }] });
+  check("answering a confirm reports the chained alert instead of swallowing it",
+        chained.ok && chained.v?.dialog?.type === "alert" && /Second/.test(chained.v?.dialog?.message || ""),
+        { ok: chained.ok, dialog: chained.v?.dialog });
+  await s.tool("input", { tab, actions: [{ dialog: { accept: true } }] });
+  check("the chain finishes and the handler completes", (await out()) === "chained", await out());
+
+  // A dialog that opens while no call is in flight sits in the socket buffer.
+  // The next tool must drain it before it sends anything.
+  await s.tool("input", { tab, actions: [{ click: { i: at("Later")?.i } }] });
+  await sleep(500);
+  const late = await s.tool("elements", { tab });
+  check("a dialog opened between calls is seen before the next command",
+        !late.ok && /dialog/.test(JSON.stringify(late.v)) && late.ms < 4000,
+        { ok: late.ok, ms: late.ms, v: JSON.stringify(late.v).slice(0, 140) });
+  await s.tool("input", { tab, actions: [{ dialog: { accept: false } }] });
+});
+
+// A beforeunload guard asks before a navigation leaves; the dialog arrives
+// through the click, and accepting it lets the navigation finish.
+await withTab(`http://localhost:${fport}/unload`, async (tab) => {
+  const els = (await s.tool("elements", { tab, limit: 20 })).v.elements || [];
+  const at = l => els.find(e => (e.label || "").trim() === l);
+  const armed = await s.tool("input", { tab, actions: [{ click: { i: at("Add beforeunload guard")?.i } }] });
+  const guardType = (await s.tool("eval", { tab, expression: "typeof window.onbeforeunload" })).v?.value;
+  check("the beforeunload guard is installed",
+        armed.ok && guardType === "function", { ok: armed.ok, guardType, v: JSON.stringify(armed.v).slice(0, 120) });
+  const nav = await s.tool("input", { tab, actions: [{ click: { i: at("Leave")?.i } }], settleMs: 800 });
+  check("a navigation guarded by beforeunload reports the dialog",
+        nav.ok && nav.v?.dialog?.type === "beforeunload", { ok: nav.ok, dialog: nav.v?.dialog });
+  const leave = await s.tool("input", { tab, actions: [{ dialog: { accept: true } }], settleMs: 1200 });
+  const href = (await s.tool("eval", { tab, expression: "location.href" })).v?.value || "";
+  check("accepting beforeunload lets the navigation finish",
+        leave.ok && /\/imgs$/.test(href), { ok: leave.ok, href, v: JSON.stringify(leave.v).slice(0, 120) });
+  const close = await s.tool("tabs", { action: "close", tab });
+  check("a plain close is confirmed by the browser", close.ok && close.v?.closed === true, close.v);
+});
 await withTab(page("chatty.html"), async (tab, ev) => {
   const before = Number(await ev("window.__ticks")) || 0;
   const r = (await s.tool("idle", { tab, maxIdleMs: 1500, timeoutMs: 4000 })).v;

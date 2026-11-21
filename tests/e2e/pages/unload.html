@@ -1,0 +1,15 @@
+<!doctype html><meta charset="utf-8"><title>unload</title>
+<body style="font:14px system-ui;padding:20px">
+<!-- The guard is installed by a click, because a beforeunload dialog needs
+     sticky activation to appear at all. Leaving the page is a link, so the
+     dialog arrives through a click (Target.closeTarget does not ask). -->
+<button id="guard">Add beforeunload guard</button>
+<a id="go" href="/imgs">Leave</a>
+<div id="out">no guard</div>
+<script>
+  document.getElementById('guard').onclick = () => {
+    window.onbeforeunload = (e) => { e.preventDefault(); e.returnValue = 'Leave?'; return 'Leave?'; };
+    document.getElementById('out').textContent = 'guarded';
+  };
+</script>
+</body>

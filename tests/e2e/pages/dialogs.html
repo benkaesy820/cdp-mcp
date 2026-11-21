@@ -1,0 +1,19 @@
+<!doctype html><meta charset="utf-8"><title>dialogs</title>
+<body style="font:14px system-ui;padding:20px">
+<!-- Each button blocks the renderer in its handler: the click's reply must not
+     be waited for, and the dialog must be answerable. -->
+<button id="ask">Confirm</button>
+<button id="prompt">Prompt</button>
+<button id="chain">Chain</button>
+<button id="later">Later</button>
+<div id="out">ready</div>
+<script>
+  const out = document.getElementById('out');
+  document.getElementById('ask').onclick = () => { out.textContent = 'ask:' + confirm('Delete this item?'); };
+  document.getElementById('prompt').onclick = () => { out.textContent = 'prompt:' + prompt('Your name?', 'Ada'); };
+  document.getElementById('chain').onclick = () => { if (confirm('First?')) { alert('Second'); } out.textContent = 'chained'; };
+  document.getElementById('later').onclick = () => {
+    setTimeout(() => { out.textContent = 'later:' + confirm('Later?'); }, 150);
+  };
+</script>
+</body>

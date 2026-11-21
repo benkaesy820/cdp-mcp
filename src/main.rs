@@ -134,7 +134,28 @@ fn with_conn<R>(
     tab: Option<&str>,
     f: impl FnMut(&mut cdp::Conn, &str) -> Result<R, String>,
 ) -> Result<R, String> {
-    with_conn_retry(endpoint, tab, Retry::IfUntouched, f)
+    with_conn_retry(endpoint, tab, Retry::IfUntouched, false, f)
+}
+
+/// `with_conn` for the one action that may run while a dialog is open: answering
+/// it. Everything else fails fast, so a blocked page is reported, not waited on.
+fn with_conn_dialog<R>(
+    endpoint: &str,
+    tab: Option<&str>,
+    f: impl FnMut(&mut cdp::Conn, &str) -> Result<R, String>,
+) -> Result<R, String> {
+    with_conn_retry(endpoint, tab, Retry::IfUntouched, true, f)
+}
+
+/// The refusal a tool gets while a dialog is open: the dialog itself, plus the
+/// action that answers it, instead of a 30 s timeout.
+fn dialog_block(d: &Value) -> String {
+    json!({
+        "dialog": d,
+        "hint": "the page is blocked by this dialog: answer it with \
+                 input { actions: [{ dialog: { accept: true } }] } (add text for a prompt)",
+    })
+    .to_string()
 }
 
 /// `with_conn` for a call with no side effects.
@@ -143,13 +164,14 @@ fn with_conn_readonly<R>(
     tab: Option<&str>,
     f: impl FnMut(&mut cdp::Conn, &str) -> Result<R, String>,
 ) -> Result<R, String> {
-    with_conn_retry(endpoint, tab, Retry::Always, f)
+    with_conn_retry(endpoint, tab, Retry::Always, false, f)
 }
 
 fn with_conn_retry<R>(
     endpoint: &str,
     tab: Option<&str>,
     retry: Retry,
+    allow_dialog: bool,
     mut f: impl FnMut(&mut cdp::Conn, &str) -> Result<R, String>,
 ) -> Result<R, String> {
     // A retry must land on the page the first attempt was talking to. With no
@@ -181,7 +203,20 @@ fn with_conn_retry<R>(
                 let _ = conn.set_focus_emulation(true);
             }
             let before = conn.replies;
-            match f(conn, &k) {
+            // Whatever already arrived is read first: a dialog opened between
+            // calls must be seen before this call decides anything, and an
+            // idle-dead socket fails here, where the retry below handles it.
+            let mut attempt = |conn: &mut cdp::Conn| -> Result<R, String> {
+                conn.drain_arrived()?;
+                conn.enable_page()?;
+                if !allow_dialog {
+                    if let Some(d) = conn.dialog.clone() {
+                        return Err(dialog_block(&d));
+                    }
+                }
+                f(conn, &k)
+            };
+            match attempt(conn) {
                 Ok(v) => {
                     *last_tab().lock().unwrap() = Some(k);
                     return Ok(v);
@@ -216,7 +251,17 @@ fn with_conn_retry<R>(
     if cdp::is_owned(&id) {
         let _ = conn.set_focus_emulation(true);
     }
-    let out = f(&mut conn, &id);
+    let mut attempt = |conn: &mut cdp::Conn| -> Result<R, String> {
+        conn.drain_arrived()?;
+        conn.enable_page()?;
+        if !allow_dialog {
+            if let Some(d) = conn.dialog.clone() {
+                return Err(dialog_block(&d));
+            }
+        }
+        f(conn, &id)
+    };
+    let out = attempt(&mut conn);
     *last_tab().lock().unwrap() = Some(id.clone());
     if !conn.dead {
         conn_cache().lock().unwrap().insert(id, conn);
@@ -816,7 +861,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "input",
-            "description": "Send real user input, in order. Actions: {click:{i|x,y[,button:right|middle,count:2,modifiers:[Shift]]}} (an index is scrolled into view and resolved in the same `within` scope as the last elements call, or in the action's own `within` when it carries one), {hover:{i}}, {drag:{from:{i},to:{i},steps:12}}, {tap:{i}} (touch), {swipe:{from,to}} (touch), {select:{i,value}} (<select>), {insert:\"text\"}, {key:\"Enter\"|\"Control+a\"|\"Control+Shift+z\"|\"a\"|\"Escape\"|\"Tab\"|\"ArrowDown\"|\"F5\"}, {scroll:{dy:400}} (scrolls the page, or the scrollable panel in the middle of the screen; reports whether it moved), {dismiss:{prefer:\"reject\"}} (closes cookie walls and modals, refusing cookies when offered), {wait:{idle:true,ms:15000}} (waits for loading to settle), {wait:{text:\"...\",ms:15000}}, {sleep:{ms:300}}. Real events, so React/Draft editors accept them. An indexed click is refused when the element is detached, zero-size, disabled or covered, with `{blocked, reason, obscuredBy}`; `force` bypasses that check, and the log entry then carries `covered` with what was on top. With `settleMs`, the result also reports `navigated`, `url`, `openedTab` and same-origin errors.",
+            "description": "Send real user input, in order. Actions: {click:{i|x,y[,button:right|middle,count:2,modifiers:[Shift]]}} (an index is scrolled into view and resolved in the same `within` scope as the last elements call, or in the action's own `within` when it carries one), {hover:{i}}, {drag:{from:{i},to:{i},steps:12}}, {tap:{i}} (touch), {swipe:{from,to}} (touch), {select:{i,value}} (<select>), {insert:\"text\"}, {key:\"Enter\"|\"Control+a\"|\"Control+Shift+z\"|\"a\"|\"Escape\"|\"Tab\"|\"ArrowDown\"|\"F5\"}, {scroll:{dy:400}} (scrolls the page, or the scrollable panel in the middle of the screen; reports whether it moved), {dismiss:{prefer:\"reject\"}} (closes cookie walls and modals, refusing cookies when offered), {wait:{idle:true,ms:15000}} (waits for loading to settle), {wait:{text:\"...\",ms:15000}}, {sleep:{ms:300}}. Real events, so React/Draft editors accept them. An indexed click is refused when the element is detached, zero-size, disabled or covered, with `{blocked, reason, obscuredBy}`; `force` bypasses that check, and the log entry then carries `covered` with what was on top. With `settleMs`, the result also reports `navigated`, `url`, `openedTab` and same-origin errors. A JavaScript dialog blocks the page: the call that hit it returns `dialog:{type,message}`, every other tool then fails fast with that dialog, and `{dialog:{accept:true,text:\"...\"}}` answers it — one per call, so a chained alert after a confirm is reported for a second answer.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2247,7 +2292,21 @@ fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], force: bool, sc
     for a in actions {
         check_cancel()?;
         let obj = a.as_object().ok_or("each action must be an object")?;
-        if let Some(c) = obj.get("click") {
+        if let Some(d) = obj.get("dialog") {
+            // The one action allowed while the renderer is blocked. One answer
+            // per call: a chained alert is reported, not auto-dismissed.
+            let accept = d.get("accept").and_then(Value::as_bool).unwrap_or(true);
+            let text = d.get("text").and_then(Value::as_str);
+            let next = conn.handle_dialog(accept, text)?;
+            log.push(json!({ "dialogAnswered": { "accept": accept } }));
+            // A chained dialog can open as the first one closes: its event may
+            // land just after the reply, so read what has arrived before
+            // reporting. Answering it is the caller's decision, not ours.
+            let _ = conn.drain_arrived();
+            if next.is_some() || conn.dialog.is_some() {
+                return Ok(json!(log));
+            }
+        } else if let Some(c) = obj.get("click") {
             let button = c.get("button").and_then(Value::as_str).unwrap_or("left").to_string();
             let count = c.get("count").and_then(Value::as_u64).unwrap_or(1);
             let mods = mod_mask(c.get("modifiers"));
@@ -2265,10 +2324,20 @@ fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], force: bool, sc
                 // coordinates, so the event has to be sent to its session.
                 if let Some(target) = frame_target(conn, tab, scope, i, force)? {
                     let (lx, ly) = (target.0, target.1);
-                    if button != "left" || count > 1 || mods != 0 {
-                        frame_click(conn, &target.2, lx, ly, &button, count, mods as u32)?;
+                    let clicked = if button != "left" || count > 1 || mods != 0 {
+                        frame_click(conn, &target.2, lx, ly, &button, count, mods as u32)
                     } else {
-                        frame_click(conn, &target.2, lx, ly, "left", 1, 0)?;
+                        frame_click(conn, &target.2, lx, ly, "left", 1, 0)
+                    };
+                    // A handler that opened a dialog blocks the renderer, so the
+                    // click's outcome is not known yet: report the dialog instead
+                    // of an error, and mark the entry as unsettled.
+                    if let Err(e) = clicked {
+                        if conn.dialog.is_some() {
+                            log.push(json!({ "clicked": { "i": i, "inFrame": true, "x": lx, "y": ly, "dialog": true } }));
+                            return Ok(json!(log));
+                        }
+                        return Err(e);
                     }
                     log.push(json!({ "clicked": { "i": i, "inFrame": true, "x": lx, "y": ly } }));
                     continue;
@@ -2309,18 +2378,32 @@ fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], force: bool, sc
                 }
                 let x = at.get("x").and_then(Value::as_f64).unwrap_or(0.0);
                 let y = at.get("y").and_then(Value::as_f64).unwrap_or(0.0);
-                if button != "left" || count > 1 || mods != 0 {
-                    click_precise(conn, x, y, &button, count, mods)?;
+                let clicked = if button != "left" || count > 1 || mods != 0 {
+                    click_precise(conn, x, y, &button, count, mods)
                 } else {
-                    click_at(conn, x, y)?;
+                    click_at(conn, x, y)
+                };
+                if let Err(e) = clicked {
+                    if conn.dialog.is_some() {
+                        log.push(json!({ "clicked": { "i": i, "dialog": true } }));
+                        return Ok(json!(log));
+                    }
+                    return Err(e);
                 }
                 log.push(json!({ "clicked": click_log(&at) }));
             } else {
                 let (x, y) = point_of(conn, scope, c)?;
-                if button != "left" || count > 1 || mods != 0 {
-                    click_precise(conn, x, y, &button, count, mods)?;
+                let clicked = if button != "left" || count > 1 || mods != 0 {
+                    click_precise(conn, x, y, &button, count, mods)
                 } else {
-                    click_at(conn, x, y)?;
+                    click_at(conn, x, y)
+                };
+                if let Err(e) = clicked {
+                    if conn.dialog.is_some() {
+                        log.push(json!({ "clicked": { "x": x, "y": y, "dialog": true } }));
+                        return Ok(json!(log));
+                    }
+                    return Err(e);
                 }
                 log.push(json!({ "clicked": { "x": x, "y": y, "button": button, "count": count, "modifiers": mods } }));
             }
@@ -2328,7 +2411,17 @@ fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], force: bool, sc
             conn.call("Input.insertText", json!({ "text": t }))?;
             log.push(json!({ "inserted": t.chars().count() }));
         } else if let Some(k) = obj.get("key").and_then(Value::as_str) {
-            let mask = press(conn, k)?;
+            // Enter can submit a form, and a submit handler can open a dialog.
+            let mask = match press(conn, k) {
+                Ok(m) => m,
+                Err(e) => {
+                    if conn.dialog.is_some() {
+                        log.push(json!({ "key": k, "dialog": true }));
+                        return Ok(json!(log));
+                    }
+                    return Err(e);
+                }
+            };
             if mask != 0 {
                 log.push(json!({ "key": k, "modifiers": mask }));
             } else {
@@ -2462,6 +2555,128 @@ fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], force: bool, sc
     Ok(json!(log))
 }
 
+/// One `input` call: the actions, the optional settle window, and the fields
+/// that say what the page did. Split out so the dialog-aware connection guard
+/// can be chosen without duplicating the body.
+fn run_batch(
+    conn: &mut cdp::Conn,
+    tab_id: &str,
+    actions: &[Value],
+    announce: bool,
+    force: bool,
+    settle_ms: u64,
+) -> Result<Value, String> {
+    let scope = scope_for(tab_id);
+    let mut navigated = false;
+    let mut opened_tab: Option<Value> = None;
+    let mut note: Option<String> = None;
+    // A batch that answers a dialog must not read the page first, and neither
+    // must any batch while one is open: the renderer is blocked. The browser
+    // process still answers Target.getTargetInfo.
+    // Only a page that is already blocked reaches here with a dialog action
+    // first (with_conn_dialog is only used for that shape), so the live state is
+    // the whole answer.
+    let blocked_before = conn.dialog.is_some();
+    // A settle window is opt-in: enabling Network on every click would add
+    // latency to the common case, and most actions are not being debugged.
+    let (log, errors) = if settle_ms > 0 {
+        // A blocked renderer cannot answer `Runtime.enable`/`Network.enable`
+        // either: measured, arming receipts there dismissed the dialog before
+        // the answer was sent. Leave them off; the post-action URL comes from
+        // the browser process instead.
+        let url = if blocked_before {
+            String::new()
+        } else {
+            conn.eval("location.href")
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default()
+        };
+        let on = !url.is_empty() && conn.begin_receipts(&url, tab_id).is_ok();
+        conn.contexts_cleared = false;
+        let result = run_input(conn, tab_id, actions, force, scope.as_deref());
+        let outcome = if on {
+            if result.is_err() {
+                // Nothing was dispatched cleanly; do not make the caller wait
+                // out the quiet window as well.
+                conn.settle_receipts(0, 0)
+            } else {
+                conn.settle_receipts(250, settle_ms)
+            }
+        } else {
+            cdp::ReceiptOutcome::default()
+        };
+        navigated = conn.contexts_cleared;
+        opened_tab = outcome.opened_tab;
+        let errors = outcome.entries;
+        let log = match result {
+            Ok(v) => v,
+            // An action this wrapper does not itemise can still be interrupted
+            // by a dialog; that is an outcome, not a tool error.
+            Err(e) if conn.dialog.is_some() => {
+                note = Some(format!("{e} — a dialog is open"));
+                json!([])
+            }
+            // A click that navigated can fail on the trailing synthetic event.
+            Err(e) if navigated => {
+                note = Some(e);
+                json!([])
+            }
+            Err(e) => return Err(e),
+        };
+        (log, errors)
+    } else {
+        let log = match run_input(conn, tab_id, actions, force, scope.as_deref()) {
+            Ok(v) => v,
+            Err(e) if conn.dialog.is_some() => {
+                note = Some(format!("{e} — a dialog is open"));
+                json!([])
+            }
+            Err(e) => return Err(e),
+        };
+        (log, Vec::new())
+    };
+    // Post-action evals would sit behind a dialog; the browser-process URL works.
+    let blocked_after = conn.dialog.is_some();
+    let (overlays, mut url) = if announce && !blocked_after {
+        // cheap post-action check: only what appeared because we acted
+        let ov = conn.eval(scan::OVERLAYS_QUICK_JS).unwrap_or(json!([]));
+        let u = conn.eval("location.href").unwrap_or(Value::Null);
+        (ov, u)
+    } else {
+        (json!([]), Value::Null)
+    };
+    if navigated && !blocked_after {
+        if let Ok(u) = conn.eval("location.href") {
+            if let Some(s) = u.as_str() {
+                url = json!(s);
+            }
+        }
+    }
+    if url.is_null() && blocked_after {
+        if let Some(s) = conn.target_url() {
+            url = json!(s);
+        }
+    }
+    let mut out = json!({ "tab": tab_id, "url": url, "log": log, "overlays": overlays });
+    if navigated {
+        out["navigated"] = json!(true);
+    }
+    if let Some(t) = opened_tab {
+        out["openedTab"] = t;
+    }
+    if let Some(n) = note {
+        out["note"] = json!(n);
+    }
+    if !errors.is_empty() {
+        out["errors"] = json!(errors);
+    }
+    if let Some(d) = conn.dialog.clone() {
+        out["dialog"] = d;
+    }
+    Ok(out)
+}
+
 /// A step inherits the caller's tab unless it names one: `flow {tab}` used to
 /// leave its steps on whatever tab the last call happened to touch.
 fn inherit_tab(mut a: Value, tab: Option<&str>) -> Value {
@@ -2503,7 +2718,23 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                     let name = step.get("tool").and_then(Value::as_str).unwrap_or("");
                     let a = inherit_tab(step.get("args").cloned().unwrap_or(json!({})), tab);
                     match call_tool(cfg, name, &a) {
-                        Ok(v) => iteration_log.push(json!({ "tool": name, "ok": true, "result": v })),
+                        Ok(v) => {
+                            let dialog = v.get("dialog").cloned();
+                            iteration_log.push(json!({ "tool": name, "ok": true, "result": v }));
+                            // A dialog stops the flow: everything after it would
+                            // run against a blocked page, and the caller has to
+                            // decide whether to accept it.
+                            if let Some(d) = dialog {
+                                all.push(json!({ "iteration": iteration, "log": iteration_log }));
+                                return Ok(json!({
+                                    "iterations": iteration,
+                                    "elapsedMs": started.elapsed().as_millis() as u64,
+                                    "stoppedOnDialog": true,
+                                    "dialog": d,
+                                    "trail": all,
+                                }));
+                            }
+                        }
                         Err(e) => {
                             iteration_log.push(json!({ "tool": name, "ok": false, "error": e }));
                             if stop_on_error {
@@ -2759,11 +2990,22 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
             }
             "close" => {
                 let id = args.get("tab").and_then(Value::as_str).ok_or("close needs tab")?.to_string();
-                cdp::close_tab(&cfg.endpoint, &id)?;
-                conn_cache().lock().unwrap().remove(&id);
-                scope_cache().lock().unwrap().remove(&id);
-                scan_cache().lock().unwrap().remove(&id);
-                Ok(json!({ "closed": id }))
+                // The browser confirms the target is gone. A beforeunload guard
+                // can refuse, and the tab then keeps its connection and caches.
+                let closed = cdp::close_tab(&cfg.endpoint, &id)?;
+                if closed {
+                    conn_cache().lock().unwrap().remove(&id);
+                    scope_cache().lock().unwrap().remove(&id);
+                    scan_cache().lock().unwrap().remove(&id);
+                }
+                Ok(json!({
+                    "closed": closed,
+                    "tab": id,
+                    "note": if closed { Value::Null } else {
+                        json!("the browser did not close it: a beforeunload handler is probably asking \
+                               whether to leave. The tab is still open and its connection is kept.")
+                    },
+                }))
             }
             other => Err(format!("unknown tabs action: {other}")),
         },
@@ -2972,81 +3214,20 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
             let announce = args.get("announce").and_then(Value::as_bool).unwrap_or(false);
             let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
             let settle_ms = args.get("settleMs").and_then(Value::as_u64).unwrap_or(0).min(5_000);
-            with_conn(&cfg.endpoint, tab, |conn, tab_id| {
-                let scope = scope_for(tab_id);
-                let mut navigated = false;
-                let mut opened_tab: Option<Value> = None;
-                let mut note: Option<String> = None;
-                // A settle window is opt-in: enabling Network on every click
-                // would add latency to the common case, and most actions are
-                // not being debugged.
-                let (log, errors) = if settle_ms > 0 {
-                    let url = conn
-                        .eval("location.href")
-                        .ok()
-                        .and_then(|v| v.as_str().map(str::to_string))
-                        .unwrap_or_default();
-                    let on = !url.is_empty() && conn.begin_receipts(&url, tab_id).is_ok();
-                    conn.contexts_cleared = false;
-                    let result = run_input(conn, tab_id, &actions, force, scope.as_deref());
-                    let outcome = if on {
-                        if result.is_err() {
-                            // Nothing was dispatched cleanly; do not make the
-                            // caller wait out the quiet window as well.
-                            conn.settle_receipts(0, 0)
-                        } else {
-                            conn.settle_receipts(250, settle_ms)
-                        }
-                    } else {
-                        cdp::ReceiptOutcome::default()
-                    };
-                    navigated = conn.contexts_cleared;
-                    opened_tab = outcome.opened_tab;
-                    let errors = outcome.entries;
-                    let log = match result {
-                        Ok(v) => v,
-                        // A click that navigated can fail on the trailing
-                        // synthetic event. That is an outcome, not a tool error.
-                        Err(e) if navigated => {
-                            note = Some(e);
-                            json!([])
-                        }
-                        Err(e) => return Err(e),
-                    };
-                    (log, errors)
-                } else {
-                    (run_input(conn, tab_id, &actions, force, scope.as_deref())?, Vec::new())
-                };
-                let (overlays, mut url) = if announce {
-                    // cheap post-action check: only what appeared because we acted
-                    let ov = conn.eval(scan::OVERLAYS_QUICK_JS).unwrap_or(json!([]));
-                    let u = conn.eval("location.href").unwrap_or(Value::Null);
-                    (ov, u)
-                } else {
-                    (json!([]), Value::Null)
-                };
-                if navigated {
-                    if let Ok(u) = conn.eval("location.href") {
-                        if let Some(s) = u.as_str() {
-                            url = json!(s);
-                        }
-                    }
-                }
-                let mut out = json!({ "tab": tab_id, "url": url, "log": log, "overlays": overlays });
-                if navigated {
-                    out["navigated"] = json!(true);
-                }
-                if let Some(t) = opened_tab {
-                    out["openedTab"] = t;
-                }
-                if let Some(n) = note {
-                    out["note"] = json!(n);
-                }
-                if !errors.is_empty() {
-                    out["errors"] = json!(errors);
-                }
-                Ok(out)
-            })
+            // Only a batch that *starts* by answering a dialog may run against a
+            // blocked page: anything else would send a click an eval that has to
+            // wait out its timeout. A click that opens one is handled inside
+            // run_input, where the page was not blocked on entry.
+            let answers_dialog = actions.first().and_then(|a| a.get("dialog")).is_some();
+            if answers_dialog {
+                with_conn_dialog(&cfg.endpoint, tab, |conn, tab_id| {
+                    run_batch(conn, tab_id, &actions, announce, force, settle_ms)
+                })
+            } else {
+                with_conn(&cfg.endpoint, tab, |conn, tab_id| {
+                    run_batch(conn, tab_id, &actions, announce, force, settle_ms)
+                })
+            }
         }
         "images" => {
             with_conn(&cfg.endpoint, tab, |conn, tab_id| {
