@@ -81,11 +81,16 @@ impl Receipts {
             return true;
         }
         // Dev stacks put the app and the API on different loopback ports
-        // (Vite on 5173, the API on 3000). Treat loopback as one origin.
+        // (Vite on 5173, the API on 3000). Treat loopback as one origin, but
+        // match the host exactly: localhost.evil.com is not loopback.
         let loopback = |o: &str| {
-            o.contains("://localhost")
-                || o.contains("://127.0.0.1")
-                || o.contains("://[::1]")
+            let authority = o.split_once("://").map(|(_, h)| h).unwrap_or("");
+            let host = if let Some(rest) = authority.strip_prefix('[') {
+                rest.split(']').next().map(|h| format!("[{h}]")).unwrap_or_default()
+            } else {
+                authority.split(':').next().unwrap_or("").to_string()
+            };
+            matches!(host.as_str(), "localhost" | "127.0.0.1" | "[::1]")
         };
         loopback(&self.origin) && loopback(&other)
     }
@@ -153,6 +158,13 @@ impl Receipts {
             }
             "Runtime.consoleAPICalled" => {
                 if p.get("type").and_then(Value::as_str) != Some("error") {
+                    return;
+                }
+                let url = p
+                    .pointer("/stackTrace/callFrames/0/url")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if url.starts_with("chrome-extension://") || (!url.is_empty() && !self.same_origin(url)) {
                     return;
                 }
                 let text = p
@@ -731,6 +743,7 @@ impl Conn {
             match self.next_msg("action settle", slice.as_millis() as u64) {
                 Ok(_) => continue,
                 Err(_) if self.timed_out => {
+                    self.timed_out = false;
                     let quiet = self.receipts.as_ref().map(|r| r.requests.is_empty()).unwrap_or(true);
                     if quiet {
                         break;
@@ -949,6 +962,13 @@ mod receipt_tests {
         assert!(dev.same_origin("http://127.0.0.1:3000/api"));
         assert!(dev.same_origin("http://localhost:3000/api"));
         assert!(!dev.same_origin("https://tracker.invalid/x"));
+    }
+
+    #[test]
+    fn lookalike_loopback_hosts_are_not_loopback() {
+        let dev = Receipts::new(origin_of("http://localhost:5173/"));
+        assert!(!dev.same_origin("https://localhost.evil.com/x"));
+        assert!(!dev.same_origin("http://127.0.0.1.nip.io/x"));
     }
 
     #[test]

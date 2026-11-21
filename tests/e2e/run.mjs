@@ -256,7 +256,14 @@ await withTab(page("frames.html?port=" + fport), async (tab, ev) => {
     frameReady = await ev("(() => { const f = document.getElementById('cross'); return !!(f && f.src && f.src.includes('localhost')); })()");
   }
   check("cross-origin frame is embedded from another site", frameReady, await ev("document.getElementById('cross')?.src"));
-  const els = (await s.tool("elements", { tab, limit: 999 })).v.elements;
+  // The frame's own target attaches after the src is set; poll the scan rather
+  // than blaming the scanner for a frame that has not loaded yet.
+  let els = [];
+  for (let i = 0; i < 12; i++) {
+    els = (await s.tool("elements", { tab, limit: 999 })).v.elements;
+    if (els.some(e => /Cross far|Reject all/.test(e.label || ""))) break;
+    await sleep(300);
+  }
   const at = l => els.find(e => (e.label || "").trim() === l);
   const H = async () => JSON.parse(await ev("JSON.stringify(H)"));
 
@@ -549,6 +556,11 @@ await withTab(`http://127.0.0.1:${rport}/receipts`, async (tab) => {
   const texts = (delta.appeared || []).map(a => a.text || "");
   check("a wait reports the text that changed",
         texts.some(t => /Coupon expired/.test(t)) && texts.some(t => /\$45/.test(t)), texts);
+
+  await s.tool("input", { tab, actions: [{ click: { i: at("NoiseDom") } }] });
+  const nd = (await s.tool("idle", { tab, maxIdleMs: 600, timeoutMs: 2000 })).v;
+  check("comment and whitespace nodes are not reported as a change",
+        !(nd.appeared || []).some(a => a.tag === "body"), nd.appeared);
 });
 
 // Timeout diagnostics: the near miss, not a rescan.
@@ -565,6 +577,9 @@ await withTab(`http://127.0.0.1:${rport}/receipts`, async (tab) => {
   check("a pseudo-class miss reports the real element",
         pseudo.woke === "timeout" && (pseudo.near?.selectorMatches || []).some(m => m.tag === "button"),
         pseudo.near);
+  const scriptOnly = (await s.tool("idle", { tab, untilText: "tracker invalid", maxIdleMs: 5000, timeoutMs: 500 })).v;
+  check("diagnostics ignore inline script text",
+        !(scriptOnly.near?.textNear || "").length, scriptOnly.near);
 });
 
 s.close();

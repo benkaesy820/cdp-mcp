@@ -1467,8 +1467,12 @@ fn watch_js(name: &str, until_text: Option<&str>, until_selector: Option<&str>, 
                     for (const n of r.addedNodes) {{
                         if (added.length >= 6) break;
                         // Replacing textContent adds a text node; its parent is
-                        // the element whose text changed.
-                        const d = describe(n.nodeType === 1 ? n : n.parentElement);
+                        // the element whose text changed. Comments and
+                        // whitespace are anchors, not changes.
+                        const d = describe(
+                            n.nodeType === 1 ? n
+                            : (n.nodeType === 3 && (n.nodeValue || '').trim() ? n.parentElement : null)
+                        );
                         if (d) added.push(d);
                     }}
                 }}
@@ -1702,6 +1706,8 @@ fn diagnose_js(sel: Option<&str>, text: Option<&str>) -> String {
                         const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
                         let n;
                         while (budget > 0 && (n = w.nextNode())) {{
+                            const parent = n.parentElement;
+                            if (parent && /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(parent.tagName)) continue;
                             const s = n.nodeValue || '';
                             text += s + ' ';
                             budget -= s.length;
@@ -2776,7 +2782,7 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
             let settle_ms = args.get("settleMs").and_then(Value::as_u64).unwrap_or(0).min(5_000);
             with_conn(&cfg.endpoint, tab, |conn, tab_id| {
                 let scope = scope_for(tab_id);
-                // A settle window is opt-in: enabling Network and Log on every
+                // A settle window is opt-in: enabling Network on every
                 // click would add latency to the common case, and most actions
                 // are not being debugged.
                 let (log, errors) = if settle_ms > 0 {

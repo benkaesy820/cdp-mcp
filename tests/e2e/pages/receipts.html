@@ -9,6 +9,7 @@
 <button id="noisy" aria-label="Noisy">Noisy</button>
 <button id="later" aria-label="Later">Later</button>
 <button id="console" aria-label="Console">Console</button>
+<button id="noisedom" aria-label="NoiseDom">NoiseDom</button>
 <div id="price">$50</div>
 <p id="msg">Save changes before leaving</p>
 <div id="modal" aria-modal="true" aria-label="Settings" role="presentation">Settings</div>
@@ -37,4 +38,10 @@
     }, 200);
   });
   document.getElementById('console').addEventListener('click', () => console.error('console boom'));
+  document.getElementById('noisedom').addEventListener('click', () => {
+    setTimeout(() => {
+      document.body.appendChild(document.createComment('anchor'));
+      document.body.appendChild(document.createTextNode('   '));
+    }, 150);
+  });
 </script>
