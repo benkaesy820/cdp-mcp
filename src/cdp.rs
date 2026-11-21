@@ -23,6 +23,7 @@ struct Receipts {
     entries: Vec<Value>,
     requests: std::collections::HashMap<String, String>,
     opened_tab: Option<Value>,
+    downloads: Vec<Value>,
 }
 
 /// What a settle window saw beyond the error list: a tab the action opened.
@@ -30,6 +31,9 @@ struct Receipts {
 pub struct ReceiptOutcome {
     pub entries: Vec<Value>,
     pub opened_tab: Option<Value>,
+    /// Downloads the action started. Reported as started, never as saved: the
+    /// browser says the download began, not where it landed.
+    pub downloads: Vec<Value>,
 }
 
 fn origin_of(url: &str) -> String {
@@ -71,7 +75,8 @@ fn clip_event(s: &str) -> String {
 
 impl Receipts {
     fn new(origin: String, opener: String) -> Self {
-        Self { origin, opener, entries: Vec::new(), requests: Default::default(), opened_tab: None }
+        Self { origin, opener, entries: Vec::new(), requests: Default::default(), opened_tab: None,
+               downloads: Vec::new() }
     }
 
     fn push(&mut self, v: Value) {
@@ -112,7 +117,12 @@ impl Receipts {
                 let Some(id) = p.get("requestId").and_then(Value::as_str) else { return };
                 let url = p.pointer("/request/url").and_then(Value::as_str).unwrap_or("");
                 let ty = p.get("type").and_then(Value::as_str).unwrap_or("");
-                if self.same_origin(url) && matches!(ty, "XHR" | "Fetch" | "Document") {
+                // A Document is tracked whatever its origin: a cross-origin
+                // navigation is the action's outcome, and a slow one must not let
+                // the quiet window close before it lands. XHR and fetch stay
+                // filtered to the page's own origin.
+                let wanted = ty == "Document" || self.same_origin(url);
+                if wanted && matches!(ty, "XHR" | "Fetch" | "Document") {
                     if self.requests.len() > 2_000 {
                         self.requests.clear();
                     }
@@ -127,7 +137,10 @@ impl Receipts {
                 let status = p.pointer("/response/status").and_then(Value::as_i64).unwrap_or(0);
                 let url = p.pointer("/response/url").and_then(Value::as_str).unwrap_or("");
                 let ty = p.get("type").and_then(Value::as_str).unwrap_or("");
-                if status >= 400 && self.same_origin(url) && matches!(ty, "XHR" | "Fetch" | "Document") {
+                // A failed destination document is the navigation's outcome,
+                // whatever the origin was when the action started.
+                let wanted = ty == "Document" || self.same_origin(url);
+                if status >= 400 && wanted && matches!(ty, "XHR" | "Fetch" | "Document") {
                     self.push(json!({ "kind": "http", "status": status, "url": clip_event(url) }));
                 }
             }
@@ -164,6 +177,41 @@ impl Receipts {
                     .or_else(|| d.get("text").and_then(Value::as_str))
                     .unwrap_or("uncaught exception");
                 self.push(json!({ "kind": "js", "text": clip_event(text) }));
+            }
+            "Page.frameNavigated" => {
+                let frame = p.get("frame").unwrap_or(&Value::Null);
+                // Top frame only: a subframe is not where the action landed.
+                if frame.get("parentId").map(|v| !v.is_null()).unwrap_or(false) {
+                    return;
+                }
+                let url = frame.get("url").and_then(Value::as_str).unwrap_or("");
+                // A failed or blank commit says nothing about where we are;
+                // keeping the old origin is what lets the error be reported.
+                if url.is_empty()
+                    || url.starts_with("chrome-error://")
+                    || url.starts_with("about:")
+                    || url.starts_with("data:")
+                {
+                    return;
+                }
+                let moved = origin_of(url);
+                if !moved.is_empty() {
+                    self.origin = moved;
+                }
+            }
+            "Page.downloadWillBegin" => {
+                // Never origin-filtered: a download routinely redirects to a
+                // CDN or a presigned URL on another origin.
+                let url = p.get("url").and_then(Value::as_str).unwrap_or("");
+                if url.is_empty() || self.downloads.len() >= 5 {
+                    return;
+                }
+                self.downloads.push(json!({
+                    "status": "started",
+                    "url": clip_event(url),
+                    "filename": p.get("suggestedFilename").and_then(Value::as_str).unwrap_or(""),
+                    "guid": p.get("guid").and_then(Value::as_str).unwrap_or(""),
+                }));
             }
             "Target.targetCreated" => {
                 let info = p.get("targetInfo").unwrap_or(&Value::Null);
@@ -555,6 +603,10 @@ fn settle_activity(v: &Value) -> bool {
                 || m == "Target.targetInfoChanged"
                 || m == "Runtime.exceptionThrown"
                 || m == "Runtime.consoleAPICalled"
+                // A commit and a started download both mean the action is still
+                // unfolding; without them the quiet window can close first.
+                || m == "Page.frameNavigated"
+                || m == "Page.downloadWillBegin"
         }
         None => false, // a reply is not page activity
     }
@@ -1005,31 +1057,26 @@ impl Conn {
     /// or `ms` elapses. Recorded in `track_frames`, so one that arrived before
     /// the close reply is still counted.
     pub fn await_destroyed(&mut self, id: &str, ms: u64) -> bool {
-        let seen = |c: &Self| c.destroyed.iter().any(|d| d == id);
-        if seen(self) {
-            self.destroyed.retain(|d| d != id);
-            return true;
-        }
         let deadline = std::time::Instant::now() + Duration::from_millis(ms);
-        loop {
+        let seen = |c: &Self| c.destroyed.iter().any(|d| d == id);
+        let out = loop {
+            if seen(self) {
+                self.destroyed.retain(|d| d != id);
+                break true;
+            }
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
-                let restore = self.timeout_ms;
-                self.set_read_timeout(restore);
-                return seen(self);
+                break false;
             }
             self.set_read_timeout(left.as_millis().max(1) as u64);
             if self.next_msg("target close", ms).is_err() {
-                let restore = self.timeout_ms;
-                self.set_read_timeout(restore);
-                return seen(self);
+                break seen(self);
             }
-            if seen(self) {
-                self.destroyed.retain(|d| d != id);
-                return true;
-            }
-        }
+        };
+        self.set_read_timeout(self.timeout_ms);
+        out
     }
+
 
     /// Read until `quiet_ms` passes with no message while no same-origin
     /// request is in flight, or `max_ms` elapses, then turn the domains off.
@@ -1099,7 +1146,8 @@ impl Conn {
             }
         }
         match self.receipts.take() {
-            Some(r) => ReceiptOutcome { entries: r.entries, opened_tab: r.opened_tab },
+            Some(r) => ReceiptOutcome { entries: r.entries, opened_tab: r.opened_tab,
+                                        downloads: r.downloads },
             None => ReceiptOutcome::default(),
         }
     }
@@ -1363,6 +1411,55 @@ mod receipt_tests {
         r.note(&json!({"method":"Target.targetCreated","params":{"targetInfo":{
             "targetId":"T3","type":"page","openerId":"OTHER","url":"https://x.example/"}}}));
         assert_eq!(r.opened_tab, before);
+    }
+
+    #[test]
+    fn a_cross_origin_document_is_tracked_and_its_failure_reported() {
+        let mut r = Receipts::new(origin_of("http://app.test/"), "T".into());
+        r.note(&json!({"method":"Network.requestWillBeSent","params":{
+            "requestId":"d1","type":"Document","request":{"url":"http://other.test/page"}}}));
+        r.note(&json!({"method":"Network.responseReceived","params":{
+            "requestId":"d1","type":"Document","response":{"status":500,"url":"http://other.test/page"}}}));
+        assert!(r.entries.iter().any(|e| e["kind"] == "http" && e["status"] == 500),
+                "{:?}", r.entries);
+    }
+
+    #[test]
+    fn a_top_frame_commit_moves_the_origin_but_an_error_page_does_not() {
+        let mut r = Receipts::new(origin_of("http://app.test/"), "T".into());
+        r.note(&json!({"method":"Page.frameNavigated","params":{"frame":{"url":"http://other.test/x"}}}));
+        r.note(&json!({"method":"Network.responseReceived","params":{
+            "type":"Fetch","response":{"status":503,"url":"http://other.test/api"}}}));
+        assert!(r.entries.iter().any(|e| e["status"] == 503),
+                "the new origin must count: {:?}", r.entries);
+
+        let mut r2 = Receipts::new(origin_of("http://app.test/"), "T".into());
+        r2.note(&json!({"method":"Page.frameNavigated","params":{"frame":{"url":"chrome-error://chromewebdata/"}}}));
+        r2.note(&json!({"method":"Network.responseReceived","params":{
+            "type":"Fetch","response":{"status":503,"url":"http://other.test/api"}}}));
+        assert!(!r2.entries.iter().any(|e| e["status"] == 503),
+                "a failed commit must not move the origin: {:?}", r2.entries);
+        assert_eq!(r2.origin, "http://app.test");
+    }
+
+    #[test]
+    fn a_subframe_commit_does_not_move_the_origin() {
+        let mut r = Receipts::new(origin_of("http://app.test/"), "T".into());
+        r.note(&json!({"method":"Page.frameNavigated","params":{"frame":{
+            "parentId":"p","url":"http://other.test/frame"}}}));
+        assert_eq!(r.origin, "http://app.test");
+    }
+
+    #[test]
+    fn a_download_is_reported_as_started_whatever_its_origin() {
+        let mut r = Receipts::new(origin_of("http://app.test/"), "T".into());
+        r.note(&json!({"method":"Page.downloadWillBegin","params":{
+            "url":"https://cdn.test/file.zip?token=x","suggestedFilename":"file.zip","guid":"g1"}}));
+        assert_eq!(r.downloads.len(), 1);
+        assert_eq!(r.downloads[0]["status"], "started");
+        assert_eq!(r.downloads[0]["filename"], "file.zip");
+        assert_eq!(r.downloads[0]["guid"], "g1");
+        assert!(r.entries.is_empty());
     }
 
     #[test]

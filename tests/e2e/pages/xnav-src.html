@@ -1,0 +1,14 @@
+<!doctype html><meta charset="utf-8"><title>xnav src</title>
+<body style="font:14px system-ui;padding:20px">
+<!-- The trailing dot makes "localhost." a different ORIGIN from "localhost",
+     while still resolving to this machine: same_origin() treats plain loopback
+     as one origin on purpose, so the untested case is a non-loopback host.
+     The port comes from this page so the fixture needs no template. -->
+<a id="ok" href="#">Good</a>
+<a id="bad" href="#">Bad</a>
+<script>
+  const p = location.port;
+  document.getElementById('ok').href = 'http://localhost.:' + p + '/xnav-dst';
+  document.getElementById('bad').href = 'http://localhost.:' + p + '/xnav-404';
+</script>
+</body>

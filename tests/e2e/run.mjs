@@ -20,7 +20,7 @@ await s.rpc("initialize", { protocolVersion: "2024-11-05" });
 // two ports on 127.0.0.1 are the same site, so Chromium keeps them in one
 // process and site isolation never comes into play.
 import { createServer } from "node:http";
-import { readFileSync } from "node:fs";
+import { readFileSync, unlinkSync } from "node:fs";
 let framePort = 0;
 async function serveFrames() {
   if (framePort) return framePort;
@@ -40,8 +40,32 @@ async function serveFrames() {
       setTimeout(() => { res.writeHead(200); res.end("slow"); }, 300);
       return;
     }
+    if (path === "/api/500") {
+      res.writeHead(500, { "content-type": "text/plain" });
+      res.end("server error");
+      return;
+    }
+    if (path === "/file.bin") {
+      // A download that changes no DOM state: only the receipt can show it.
+      res.writeHead(200, {
+        "content-type": "application/octet-stream",
+        "content-disposition": 'attachment; filename="cdp-mcp-e2e-download.bin"',
+      });
+      res.end("cdp-mcp download fixture");
+      return;
+    }
+    if (path === "/xnav-404") {
+      res.writeHead(404, { "content-type": "text/html" });
+      res.end(readFileSync(join(here, "pages", "xnav-dst.html")));
+      return;
+    }
     res.writeHead(200, { "content-type": "text/html" });
-    const file = path === "/receipts" ? "receipts.html" : path === "/sprint2" ? "sprint2.html" : path === "/imgs" ? "imgs.html" : path === "/dialogs" ? "dialogs.html" : path === "/unload" ? "unload.html" : "cross.html";
+    const files = {
+      "/receipts": "receipts.html", "/sprint2": "sprint2.html", "/imgs": "imgs.html",
+      "/dialogs": "dialogs.html", "/unload": "unload.html", "/download": "download.html",
+      "/xnav-src": "xnav-src.html", "/xnav-dst": "xnav-dst.html",
+    };
+    const file = files[path] || "cross.html";
     res.end(readFileSync(join(here, "pages", file)));
   });
   await new Promise(r => srv.listen(0, "0.0.0.0", r));
@@ -480,6 +504,49 @@ await withTab(`http://localhost:${fport}/dialogs`, async (tab, ev) => {
         { ok: settled.ok, ms: settled.ms, dialog: settled.v?.dialog });
   const after = await s.tool("input", { tab, actions: [{ dialog: { accept: false } }], settleMs: 800 });
   check("the dialog can be answered after a settle click", after.ok, JSON.stringify(after.v).slice(0, 140));
+});
+
+// A download changes no DOM state: the receipt is the only evidence, and it
+// says started, not saved.
+await withTab(`http://localhost:${fport}/download`, async (tab) => {
+  const els = (await s.tool("elements", { tab, limit: 20 })).v.elements || [];
+  const dl = els.find(e => (e.label || "").trim() === "Download");
+  const r = await s.tool("input", { tab, actions: [{ click: { i: dl?.i } }], settleMs: 3000 });
+  const got = r.v?.downloads?.[0];
+  check("a click-triggered download is reported as started",
+        !!got && got.status === "started" && /cdp-mcp-e2e-download/.test(got.filename || ""),
+        { got, v: JSON.stringify(r.v).slice(0, 220) });
+  // The browser saved it somewhere on this machine; this test must not leave it.
+  for (const name of ["cdp-mcp-e2e-download.bin", ...Array.from({ length: 6 }, (_, i) => `cdp-mcp-e2e-download (${i + 1}).bin`)]) {
+    try { unlinkSync(`${process.env.HOME}/Downloads/${name}`); } catch {}
+  }
+});
+
+// A cross-origin navigation is the action's outcome: the settle window must stay
+// open for the destination, and its failures belong to the new origin.
+await withTab(`http://localhost:${fport}/xnav-src`, async (tab) => {
+  const els = (await s.tool("elements", { tab, limit: 20 })).v.elements || [];
+  const at = l => els.find(e => (e.label || "").trim() === l);
+  const nav = await s.tool("input", { tab, actions: [{ click: { i: at("Good")?.i } }], settleMs: 2500 });
+  const v = nav.v || {};
+  const http = (v.errors || []).find(e => e.kind === "http" && e.status >= 500);
+  check("a cross-origin navigation keeps the window open and reports the destination",
+        v.navigated === true && /localhost\.:/.test(v.url || "") && !!http,
+        { navigated: v.navigated, url: v.url, errors: v.errors, ms: nav.ms });
+  check("a post-commit console error on the destination is reported",
+        (v.errors || []).some(e => e.kind === "console" && /post-commit/.test(e.text || "")),
+        v.errors);
+});
+
+// A cross-origin destination that answers 4xx is the navigation failing, not a
+// stranger's request: it is reported even though the origin has just moved.
+await withTab(`http://localhost:${fport}/xnav-src`, async (tab) => {
+  const els = (await s.tool("elements", { tab, limit: 20 })).v.elements || [];
+  const bad = els.find(e => (e.label || "").trim() === "Bad");
+  const nav = await s.tool("input", { tab, actions: [{ click: { i: bad?.i } }], settleMs: 2500 });
+  const http = (nav.v?.errors || []).find(e => e.kind === "http" && e.status === 404);
+  check("a cross-origin document 404 is reported", !!http,
+        { url: nav.v?.url, errors: nav.v?.errors });
 });
 
 // A beforeunload guard asks before a navigation leaves; the dialog arrives

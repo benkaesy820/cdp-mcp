@@ -1,0 +1,8 @@
+<!doctype html><meta charset="utf-8"><title>xnav dest</title>
+<div id="out">loading</div>
+<script>
+  // A post-commit failure on the destination: the receipt belongs to the new
+  // origin, not the one the action started from.
+  fetch('/api/500').then(r => { document.getElementById('out').textContent = 'status:' + r.status; });
+  setTimeout(() => console.error('post-commit error'), 50);
+</script>

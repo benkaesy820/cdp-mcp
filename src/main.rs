@@ -863,7 +863,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "input",
-            "description": "Send real user input, in order. Actions: {click:{i|x,y[,button:right|middle,count:2,modifiers:[Shift]]}} (an index is scrolled into view and resolved in the same `within` scope as the last elements call, or in the action's own `within` when it carries one), {hover:{i}}, {drag:{from:{i},to:{i},steps:12}}, {tap:{i}} (touch), {swipe:{from,to}} (touch), {select:{i,value}} (<select>), {insert:\"text\"}, {key:\"Enter\"|\"Control+a\"|\"Control+Shift+z\"|\"a\"|\"Escape\"|\"Tab\"|\"ArrowDown\"|\"F5\"}, {scroll:{dy:400}} (scrolls the page, or the scrollable panel in the middle of the screen; reports whether it moved), {dismiss:{prefer:\"reject\"}} (closes cookie walls and modals, refusing cookies when offered), {wait:{idle:true,ms:15000}} (waits for loading to settle), {wait:{text:\"...\",ms:15000}}, {sleep:{ms:300}}. Real events, so React/Draft editors accept them. An indexed click is refused when the element is detached, zero-size, disabled or covered, with `{blocked, reason, obscuredBy}`; `force` bypasses that check, and the log entry then carries `covered` with what was on top. With `settleMs`, the result also reports `navigated`, `url`, `openedTab` and same-origin errors. A JavaScript dialog blocks the page: the call that hit it returns `dialog:{type,message}`, every other tool then fails fast with that dialog, and `{dialog:{accept:true,text:\"...\"}}` answers it — one per call, so a chained alert after a confirm is reported for a second answer.",
+            "description": "Send real user input, in order. Actions: {click:{i|x,y[,button:right|middle,count:2,modifiers:[Shift]]}} (an index is scrolled into view and resolved in the same `within` scope as the last elements call, or in the action's own `within` when it carries one), {hover:{i}}, {drag:{from:{i},to:{i},steps:12}}, {tap:{i}} (touch), {swipe:{from,to}} (touch), {select:{i,value}} (<select>), {insert:\"text\"}, {key:\"Enter\"|\"Control+a\"|\"Control+Shift+z\"|\"a\"|\"Escape\"|\"Tab\"|\"ArrowDown\"|\"F5\"}, {scroll:{dy:400}} (scrolls the page, or the scrollable panel in the middle of the screen; reports whether it moved), {dismiss:{prefer:\"reject\"}} (closes cookie walls and modals, refusing cookies when offered), {wait:{idle:true,ms:15000}} (waits for loading to settle), {wait:{text:\"...\",ms:15000}}, {sleep:{ms:300}}. Real events, so React/Draft editors accept them. An indexed click is refused when the element is detached, zero-size, disabled or covered, with `{blocked, reason, obscuredBy}`; `force` bypasses that check, and the log entry then carries `covered` with what was on top. With `settleMs`, the result also reports `navigated`, `url`, `openedTab`, `downloads` (started, with filename and guid) and same-origin errors plus a failed destination document. A JavaScript dialog blocks the page: the call that hit it returns `dialog:{type,message}`, every other tool then fails fast with that dialog, and `{dialog:{accept:true,text:\"...\"}}` answers it — one per call, so a chained alert after a confirm is reported for a second answer.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1977,7 +1977,7 @@ fn wait_page_settled(
     max_idle_ms: u64,
 ) -> Result<Value, String> {
     let out = wait_page_settled_inner(conn, until_text, until_selector, started, deadline, max_idle_ms);
-    if out.is_err() {
+    if out.is_err() && conn.dialog.is_none() {
         // Every early return used to leave the page's observer running: a
         // cancellation, or a page that refused the binding. It then read
         // `innerText` on every mutation and pushed into a socket nobody was
@@ -2179,8 +2179,11 @@ fn wait_page_settled_inner(
                 }
                 Look::Miss => {}
             }
-              // The look is where a dialog can appear; do not read the page
-              // again with a blocked renderer.
+            // The look is where a dialog can appear: do not walk shadow roots
+            // or call the page idle with a blocked renderer.
+            if let Some(d) = conn.dialog.clone() {
+                return Ok(settled.dialog_report(d, &started, &last_event));
+            }
             // Last look before calling it quiet: a shadow root or an attribute
             // toggle can move the visible text without a light-DOM record, and
             // reporting idle mid-render is worse than one extra read.
@@ -2287,14 +2290,16 @@ fn wait_idle(conn: &mut cdp::Conn, ms: u64, step: u64) -> Result<i64, String> {
     let mut last = -1i64;
     let mut stable_ms = 0u64;
     loop {
-        if conn.dialog.is_some() {
-            return Err("dialog open: the page is blocked".into());
-        }
         let n = conn
             .eval("performance.getEntriesByType('resource').length")
             .ok()
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
+        // The eval is where a dialog shows up: `.ok()` would read it as zero
+        // resources and call the page idle.
+        if conn.dialog.is_some() {
+            return Err("dialog open: the page is blocked".into());
+        }
         if n == last {
             stable_ms += step;
         } else {
@@ -2627,7 +2632,7 @@ fn run_batch(
     let blocked_before = conn.dialog.is_some();
     // A settle window is opt-in: enabling Network on every click would add
     // latency to the common case, and most actions are not being debugged.
-    let (log, errors) = if settle_ms > 0 {
+    let (log, errors, downloads) = if settle_ms > 0 {
         // A blocked renderer cannot answer `Runtime.enable`/`Network.enable`
         // either: measured, arming receipts there dismissed the dialog before
         // the answer was sent. Leave them off; the post-action URL comes from
@@ -2656,6 +2661,7 @@ fn run_batch(
         };
         navigated = conn.contexts_cleared;
         opened_tab = outcome.opened_tab;
+        let downloads = outcome.downloads;
         let errors = outcome.entries;
         let log = match result {
             Ok(v) => v,
@@ -2672,7 +2678,7 @@ fn run_batch(
             }
             Err(e) => return Err(e),
         };
-        (log, errors)
+        (log, errors, downloads)
     } else {
         let log = match run_input(conn, tab_id, actions, force, scope.as_deref()) {
             Ok(v) => v,
@@ -2682,7 +2688,7 @@ fn run_batch(
             }
             Err(e) => return Err(e),
         };
-        (log, Vec::new())
+        (log, Vec::new(), Vec::new())
     };
     // Post-action evals would sit behind a dialog; the browser-process URL works.
     let blocked_after = conn.dialog.is_some();
@@ -2718,6 +2724,11 @@ fn run_batch(
     }
     if !errors.is_empty() {
         out["errors"] = json!(errors);
+    }
+    if !downloads.is_empty() {
+        // Started, not saved: the browser reports the beginning of a download,
+        // not where it landed or whether it finished.
+        out["downloads"] = json!(downloads);
     }
     if let Some(d) = conn.dialog.clone() {
         out["dialog"] = d;
