@@ -81,11 +81,84 @@ fn blocked_click(
         .to_string()
 }
 
+/// Which platform's conventions to follow. A value, not a `cfg`, so the
+/// resolution below can be tested for every platform on any machine.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Os { Linux, Mac, Windows }
+
+fn current_os() -> Os {
+    if cfg!(target_os = "macos") {
+        Os::Mac
+    } else if cfg!(windows) {
+        Os::Windows
+    } else {
+        Os::Linux
+    }
+}
+
+fn env_nonempty(get: &dyn Fn(&str) -> Option<String>, key: &str) -> Option<String> {
+    get(key).filter(|s| !s.is_empty())
+}
+
+fn home(get: &dyn Fn(&str) -> Option<String>) -> std::path::PathBuf {
+    std::path::PathBuf::from(get("HOME").unwrap_or_default())
+}
+
+/// Where settings live: XDG first on Linux and macOS, `%APPDATA%` on Windows.
+fn config_root_for(os: Os, get: &dyn Fn(&str) -> Option<String>) -> std::path::PathBuf {
+    match os {
+        Os::Linux => env_nonempty(get, "XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| home(get).join(".config")),
+        Os::Mac => env_nonempty(get, "XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| home(get).join("Library").join("Application Support")),
+        Os::Windows => env_nonempty(get, "APPDATA")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(get("USERPROFILE").unwrap_or_default())
+                .join("AppData").join("Roaming")),
+    }
+}
+
+/// Where reports, clipboard history and screenshots live.
+fn data_root_for(os: Os, get: &dyn Fn(&str) -> Option<String>) -> std::path::PathBuf {
+    match os {
+        Os::Linux => env_nonempty(get, "XDG_DATA_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| home(get).join(".local").join("share")),
+        Os::Mac => env_nonempty(get, "XDG_DATA_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| home(get).join("Library").join("Application Support")),
+        Os::Windows => env_nonempty(get, "LOCALAPPDATA")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(get("USERPROFILE").unwrap_or_default())
+                .join("AppData").join("Local")),
+    }
+}
+
+fn config_dir_for(os: Os, get: &dyn Fn(&str) -> Option<String>) -> std::path::PathBuf {
+    config_root_for(os, get).join("cdp-mcp")
+}
+
+fn data_dir_for(os: Os, get: &dyn Fn(&str) -> Option<String>) -> std::path::PathBuf {
+    data_root_for(os, get).join("cdp-mcp")
+}
+
+fn config_dir() -> std::path::PathBuf {
+    config_dir_for(current_os(), &|k| std::env::var(k).ok())
+}
+
 fn data_dir() -> std::path::PathBuf {
-    std::env::var("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share"))
-        .join("cdp-mcp")
+    data_dir_for(current_os(), &|k| std::env::var(k).ok())
+}
+
+/// The MIME the bytes really are. `shot` used to report a WebP capture as JPEG.
+fn mime_for(format: &str) -> &'static str {
+    match format {
+        "png" => "image/png",
+        "webp" => "image/webp",
+        _ => "image/jpeg",
+    }
 }
 
 /// Last scan per tab, so `mode:"delta"` can say what changed instead of
@@ -649,11 +722,7 @@ impl Cfg {
 
 impl Profile {
     fn load(name: &str) -> Self {
-        let dir = std::env::var("XDG_CONFIG_HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config"))
-            .join("cdp-mcp");
-        let path = dir.join(format!("{name}.json"));
+        let path = config_dir().join(format!("{name}.json"));
         let data = std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| serde_json::from_str::<Value>(&s).ok())
@@ -680,10 +749,8 @@ impl Profile {
     }
     /// Where a screenshot goes when the caller gave no path.
     fn shot_dir(&self) -> std::path::PathBuf {
-        self.get_str("screenshot_dir").map(std::path::PathBuf::from).unwrap_or_else(|| {
-            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-                .join(".local/share/cdp-mcp/shots")
-        })
+        self.get_str("screenshot_dir").map(std::path::PathBuf::from)
+            .unwrap_or_else(|| data_dir().join("shots"))
     }
 }
 
@@ -1285,7 +1352,7 @@ fn capture_png(
 
     let r = conn.call("Page.captureScreenshot", params)?;
     let b64 = r.get("data").and_then(Value::as_str).ok_or("screenshot returned no data")?;
-    let mime = if format == "png" { "image/png" } else { "image/jpeg" }.to_string();
+    let mime = mime_for(format).to_string();
     Ok((b64decode(b64)?, clipped, mime))
 }
 
@@ -2896,11 +2963,7 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
         }
         "report" => {
             let action = args.get("action").and_then(Value::as_str).unwrap_or("add");
-            let dir = std::env::var("XDG_DATA_HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|_| std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share"))
-                .join("cdp-mcp");
-            let file = dir.join("reports.jsonl");
+            let file = data_dir().join("reports.jsonl");
             match action {
                 "add" => {
                     let summary = args.get("summary").and_then(Value::as_str).ok_or("report needs summary")?;
@@ -2932,7 +2995,10 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                         "version": VERSION,
                         "where": where_,
                     });
-                    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+                    if let Some(dir) = file.parent() {
+                        std::fs::create_dir_all(dir)
+                            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+                    }
                     use std::io::Write as _;
                     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&file)
                         .map_err(|e| format!("cannot open {}: {e}", file.display()))?;
@@ -4307,4 +4373,70 @@ mod tests {
             assert_eq!(t["inputSchema"]["type"], "object", "{}", t["name"]);
         }
     }
+
+    #[test]
+    fn paths_follow_each_platforms_conventions() {
+        use std::path::PathBuf;
+
+        let linux = |k: &str| match k { "HOME" => Some("/home/ben".to_string()), _ => None };
+        assert_eq!(config_dir_for(Os::Linux, &linux), PathBuf::from("/home/ben/.config/cdp-mcp"));
+        assert_eq!(data_dir_for(Os::Linux, &linux), PathBuf::from("/home/ben/.local/share/cdp-mcp"));
+
+        let linux_xdg = |k: &str| match k {
+            "HOME" => Some("/home/ben".to_string()),
+            "XDG_CONFIG_HOME" => Some("/x/cfg".to_string()),
+            "XDG_DATA_HOME" => Some("/x/data".to_string()),
+            _ => None,
+        };
+        assert_eq!(config_dir_for(Os::Linux, &linux_xdg), PathBuf::from("/x/cfg/cdp-mcp"));
+        assert_eq!(data_dir_for(Os::Linux, &linux_xdg), PathBuf::from("/x/data/cdp-mcp"));
+
+        let mac = |k: &str| match k { "HOME" => Some("/Users/ben".to_string()), _ => None };
+        assert_eq!(config_dir_for(Os::Mac, &mac),
+                   PathBuf::from("/Users/ben/Library/Application Support/cdp-mcp"));
+        assert_eq!(data_dir_for(Os::Mac, &mac),
+                   PathBuf::from("/Users/ben/Library/Application Support/cdp-mcp"));
+
+        let mac_xdg = |k: &str| match k {
+            "HOME" => Some("/Users/ben".to_string()),
+            "XDG_CONFIG_HOME" => Some("/x/cfg".to_string()),
+            _ => None,
+        };
+        assert_eq!(config_dir_for(Os::Mac, &mac_xdg), PathBuf::from("/x/cfg/cdp-mcp"));
+
+        let win = |k: &str| match k {
+            "USERPROFILE" => Some("C:/Users/ben".to_string()),
+            "APPDATA" => Some("C:/Users/ben/AppData/Roaming".to_string()),
+            "LOCALAPPDATA" => Some("C:/Users/ben/AppData/Local".to_string()),
+            _ => None,
+        };
+        assert_eq!(config_dir_for(Os::Windows, &win), PathBuf::from("C:/Users/ben/AppData/Roaming/cdp-mcp"));
+        assert_eq!(data_dir_for(Os::Windows, &win), PathBuf::from("C:/Users/ben/AppData/Local/cdp-mcp"));
+
+        // Without APPDATA/LOCALAPPDATA the profile directory is the convention.
+        let win_fallback = |k: &str| match k { "USERPROFILE" => Some("C:/Users/ben".to_string()), _ => None };
+        assert_eq!(config_dir_for(Os::Windows, &win_fallback),
+                   PathBuf::from("C:/Users/ben/AppData/Roaming/cdp-mcp"));
+        assert_eq!(data_dir_for(Os::Windows, &win_fallback),
+                   PathBuf::from("C:/Users/ben/AppData/Local/cdp-mcp"));
+    }
+
+    #[test]
+    fn an_empty_xdg_value_is_ignored() {
+        let get = |k: &str| match k {
+            "HOME" => Some("/home/ben".to_string()),
+            "XDG_CONFIG_HOME" => Some(String::new()),
+            _ => None,
+        };
+        assert_eq!(config_dir_for(Os::Linux, &get), std::path::PathBuf::from("/home/ben/.config/cdp-mcp"));
+    }
+
+    #[test]
+    fn a_screenshot_reports_the_mime_it_really_is() {
+        assert_eq!(mime_for("png"), "image/png");
+        assert_eq!(mime_for("webp"), "image/webp");
+        assert_eq!(mime_for("jpeg"), "image/jpeg");
+        assert_eq!(mime_for("jpg"), "image/jpeg");
+    }
+
 }
