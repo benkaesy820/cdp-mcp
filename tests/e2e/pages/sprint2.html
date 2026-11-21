@@ -40,9 +40,23 @@
   <select aria-label="Plan"><option>Free</option><option selected>Pro</option></select>
 </div>
 
+<!-- Native semantics: role=switch on a checked checkbox has no aria-checked,
+     and a disabled fieldset does not disable a link or its first legend. -->
+<input type="checkbox" id="native-switch" role="switch" aria-label="Native Switch" checked>
+
+<fieldset id="off-box" disabled>
+  <legend><button id="legend-btn" aria-label="Legend Button">Legend</button></legend>
+  <a id="inside-link" href="#inside" aria-label="Inside Link">Inside</a>
+  <input type="text" aria-label="Field Input" value="x">
+</fieldset>
+
 <script>
   window.__icon = 0;
   window.__covered = 0;
+  window.__inside = 0;
+  window.__legend = 0;
   document.getElementById('icon-btn').addEventListener('click', () => { window.__icon = 1; });
   document.getElementById('covered').addEventListener('click', () => { window.__covered = 1; });
+  document.getElementById('inside-link').addEventListener('click', (e) => { e.preventDefault(); window.__inside = 1; });
+  document.getElementById('legend-btn').addEventListener('click', () => { window.__legend = 1; });
 </script>

@@ -86,8 +86,12 @@ pub const SCAN_JS: &str = r#"(() => {
         : '';
       const eff = explicit || derived;
       if (eff) rec.role = eff;
-      if (el.disabled) rec.disabled = true;
-      if (el.getAttribute('aria-disabled') === 'true') rec.disabled = true;
+      // :disabled is the browser's own answer: the disabled attribute and an
+      // ancestor fieldset[disabled], minus the first-legend exception, and it
+      // leaves a link or a [role=button] inside the fieldset clickable.
+      let dis = !!el.disabled || el.getAttribute('aria-disabled') === 'true';
+      try { if (!dis && el.matches && el.matches(':disabled')) dis = true; } catch (e) {}
+      if (dis) rec.disabled = true;
       // Current form state, so a scoped scan answers "what is typed here"
       // without a second eval. Passwords never leave the page in plaintext.
       const tagName = el.tagName;
@@ -106,7 +110,9 @@ pub const SCAN_JS: &str = r#"(() => {
           if (v) rec.value = v;
       }
       const roleAttr = el.getAttribute('role');
-      if (roleAttr === 'checkbox' || roleAttr === 'switch' || roleAttr === 'radio') {
+      // A native control already answered: role=switch on a checked checkbox
+      // usually has no aria-checked, and must not read as false.
+      if (rec.checked === undefined && (roleAttr === 'checkbox' || roleAttr === 'switch' || roleAttr === 'radio')) {
           rec.checked = el.getAttribute('aria-checked') === 'true';
       }
       if (frameLabel) rec.frame = frameLabel;
@@ -153,7 +159,7 @@ pub const SCAN_JS: &str = r#"(() => {
     out.connected = el.isConnected;
     out.zero = r.width === 0 || r.height === 0;
     out.disabled = !!el.disabled || el.getAttribute('aria-disabled') === 'true';
-    try { if (el.closest && el.closest('fieldset[disabled]')) out.disabled = true; } catch (e) {}
+    try { if (!out.disabled && el.matches && el.matches(':disabled')) out.disabled = true; } catch (e) {}
     // Would a real click at the centre reach this element, or something on
     // top? Hit-test through shadow roots and same-origin frames, the way the
     // browser will route the click.
@@ -371,8 +377,12 @@ pub const FRAME_ELEMENTS_JS: &str = r#"(() => {
       const rec = { tag, label: labelOf(el), x: Math.round(r.x), y: Math.round(r.y),
                     w: Math.round(r.width), h: Math.round(r.height) };
       if (explicit || derived) rec.role = explicit || derived;
-      if (el.disabled) rec.disabled = true;
-      if (el.getAttribute('aria-disabled') === 'true') rec.disabled = true;
+      // :disabled is the browser's own answer: the disabled attribute and an
+      // ancestor fieldset[disabled], minus the first-legend exception, and it
+      // leaves a link or a [role=button] inside the fieldset clickable.
+      let dis = !!el.disabled || el.getAttribute('aria-disabled') === 'true';
+      try { if (!dis && el.matches && el.matches(':disabled')) dis = true; } catch (e) {}
+      if (dis) rec.disabled = true;
       // Current form state, so a scoped scan answers "what is typed here"
       // without a second eval. Passwords never leave the page in plaintext.
       const tagName = el.tagName;
@@ -391,7 +401,9 @@ pub const FRAME_ELEMENTS_JS: &str = r#"(() => {
           if (v) rec.value = v;
       }
       const roleAttr = el.getAttribute('role');
-      if (roleAttr === 'checkbox' || roleAttr === 'switch' || roleAttr === 'radio') {
+      // A native control already answered: role=switch on a checked checkbox
+      // usually has no aria-checked, and must not read as false.
+      if (rec.checked === undefined && (roleAttr === 'checkbox' || roleAttr === 'switch' || roleAttr === 'radio')) {
           rec.checked = el.getAttribute('aria-checked') === 'true';
       }
       out.push(rec);

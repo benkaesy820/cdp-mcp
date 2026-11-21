@@ -289,6 +289,11 @@ await withTab(page("frames.html?port=" + fport), async (tab, ev) => {
   // Cross-origin frame: its own renderer, its own target, its own session.
   const cross = els.find(e => /Cross far|Reject all/.test(e.label || ""));
   check("cross-origin frame button is listed", !!cross, els.map(e => e.label));
+  const fswitch = els.find(e => (e.label || "").trim() === "Frame Switch");
+  const ffield = els.find(e => (e.label || "").trim() === "Frame Field");
+  check("a cross-origin frame scan reads form state the same way",
+        fswitch?.checked === true && ffield?.disabled === true && ffield?.value === "y",
+        { switch: fswitch, field: ffield });
   if (cross) {
     await s.tool("input", { tab, actions: [{ click: { i: cross.i } }] });
     await sleep(400);
@@ -599,6 +604,38 @@ await withTab(`http://127.0.0.1:${rport}/sprint2`, async (tab, ev) => {
   const dis = await s.tool("input", { tab, actions: [{ click: { i: at("Disabled")?.i } }] });
   check("a disabled click is blocked",
         !dis.ok && /"reason":"disabled"/.test(String(dis.v)), String(dis.v).slice(0, 160));
+
+  // A native checkbox with role=switch keeps its own checked state: the ARIA
+  // fallback is for custom controls, not a replacement for the real one.
+  check("role=switch does not overwrite a native checked state",
+        at("Native Switch")?.checked === true, at("Native Switch"));
+
+  // The browser's own :disabled rules: a fieldset disables its controls, but
+  // not a link inside it, nor a button inside its first legend.
+  const fieldEl = at("Field Input"), linkEl = at("Inside Link"), legendEl = at("Legend Button");
+  check("a disabled fieldset disables controls, not links or its legend",
+        !!fieldEl && fieldEl.disabled === true &&
+        !!linkEl && linkEl.disabled !== true &&
+        !!legendEl && legendEl.disabled !== true,
+        { field: fieldEl, link: linkEl, legend: legendEl });
+
+  const inField = await s.tool("input", { tab, actions: [{ click: { i: at("Field Input")?.i } }] });
+  check("a control in a disabled fieldset is refused, matching the scan",
+        !inField.ok && /"reason":"disabled"/.test(String(inField.v)), String(inField.v).slice(0, 160));
+
+  const inLink = await s.tool("input", { tab, actions: [{ click: { i: at("Inside Link")?.i } }] });
+  await sleep(120);
+  check("a link inside a disabled fieldset still clicks",
+        inLink.ok && (await ev("window.__inside || 0")) === 1,
+        { ok: inLink.ok, hit: await ev("window.__inside || 0"), v: String(inLink.v).slice(0, 120) });
+
+  // The first legend of a fieldset is outside its disabled scope, so its
+  // controls stay usable; the closest('fieldset[disabled]') walk got this wrong.
+  const inLegend = await s.tool("input", { tab, actions: [{ click: { i: at("Legend Button")?.i } }] });
+  await sleep(120);
+  check("a button in a disabled fieldset's legend still clicks",
+        inLegend.ok && (await ev("window.__legend || 0")) === 1,
+        { ok: inLegend.ok, hit: await ev("window.__legend || 0"), v: String(inLegend.v).slice(0, 120) });
 
   await s.tool("input", { tab, actions: [{ click: { i: at("Icon Save")?.i } }] });
   await sleep(150);

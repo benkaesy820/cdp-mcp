@@ -3,4 +3,9 @@
 <button onclick="parent.postMessage({hit:'cross'},'*')">Reject all</button>
 <div style="height:400px"></div>
 <button onclick="parent.postMessage({hit:'cross-far'},'*')">Cross far</button>
+<!-- The frame scan must read form state by the same rules as the main one. -->
+<fieldset disabled style="margin-top:12px">
+  <input type="checkbox" role="switch" aria-label="Frame Switch" checked>
+  <input type="text" aria-label="Frame Field" value="y">
+</fieldset>
 </body>
