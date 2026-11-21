@@ -463,14 +463,25 @@ pub fn new_tab(endpoint: &str, url: &str, foreground: bool) -> Res<String> {
 /// next tab and activates the window: measured, focus left the chat window for
 /// Helium on every close. `Target.closeTarget` tears the target down instead.
 pub fn close_tab(endpoint: &str, id: &str) -> Res<bool> {
-    // Discovery is what makes the browser emit targetDestroyed.
+    // `Target.closeTarget` means "asked", not "gone"; the target list lags the
+    // close (measured: a plain close was still listed), so the destroy event is
+    // the confirmation. Discovery is on for the check and off after it: the
+    // answer is exact and no event stream is left behind.
     browser_call(endpoint, "Target.setDiscoverTargets", json!({ "discover": true }))?;
-    browser_call(endpoint, "Target.closeTarget", json!({ "targetId": id }))?;
-    let mut slot = BROWSER.lock().map_err(|_| "browser connection lock poisoned")?;
-    let closed = match slot.as_mut() {
-        Some(conn) => conn.wait_match("Target.targetDestroyed", "targetId", id, 1500),
-        None => false,
+    let closed = match browser_call(endpoint, "Target.closeTarget", json!({ "targetId": id })) {
+        Ok(_) => {
+            let mut slot = BROWSER.lock().map_err(|_| "browser connection lock poisoned")?;
+            match slot.as_mut() {
+                Some(conn) => conn.await_destroyed(id, 1500),
+                None => false,
+            }
+        }
+        Err(e) => {
+            let _ = browser_call(endpoint, "Target.setDiscoverTargets", json!({ "discover": false }));
+            return Err(e);
+        }
     };
+    let _ = browser_call(endpoint, "Target.setDiscoverTargets", json!({ "discover": false }));
     if closed {
         if let Ok(mut owned) = OWNED.lock() {
             owned.remove(id);
@@ -523,6 +534,14 @@ pub struct Conn {
     /// breaks only when it moves, which lets an already-open dialog be answered
     /// without breaking the very call that answers it.
     pub dialog_seq: u64,
+    /// `Network.enable` is on. A settle window that had to skip its teardown
+    /// because a dialog blocked the page leaves this set, so the next call can
+    /// turn it off once the dialog is gone.
+    network_on: bool,
+    /// Targets this connection has seen destroyed. A close asks for one of
+    /// these, and the event is recorded in the funnel every message passes, so
+    /// it still counts when it arrives before the close's own reply.
+    destroyed: Vec<String>,
 }
 
 /// Events that mean the page is still doing something. `Page.*` is deliberately
@@ -579,7 +598,8 @@ impl Conn {
         let mut conn = Conn { ws, next: 0, focus_on: false, timeout_ms: ms, dead: false, replies: 0,
                               oopifs: Vec::new(), auto_attach: false, runtime_on: false,
                               binding: None, timed_out: false, contexts_cleared: false,
-                              receipts: None, page_on: false, dialog: None, dialog_seq: 0 };
+                              receipts: None, page_on: false, dialog: None, dialog_seq: 0, network_on: false,
+                              destroyed: Vec::new() };
         conn.set_read_timeout(ms);
         // No domain is enabled on connect: each enable costs a round trip, and
         // most commands do not need one. `enable_runtime` turns on the Runtime
@@ -743,6 +763,16 @@ impl Conn {
                 }));
             }
             Some("Page.javascriptDialogClosed") => self.dialog = None,
+            Some("Target.targetDestroyed") => {
+                if let Some(id) = v.pointer("/params/targetId").and_then(Value::as_str) {
+                    if !self.destroyed.iter().any(|d| d == id) {
+                        self.destroyed.push(id.to_string());
+                    }
+                    if self.destroyed.len() > 32 {
+                        self.destroyed.remove(0);
+                    }
+                }
+            }
             // A navigation, or a document swap. Everything the page was holding
             // for us is gone, including any observer. The binding itself
             // survives (measured), so only the installer has to run again.
@@ -858,6 +888,17 @@ impl Conn {
         Ok(())
     }
 
+    /// Turn Network off when a settle window had to leave it on because the page
+    /// was blocked. Called before the next use of the connection, so a dialog
+    /// that has since been answered does not leave an event stream on.
+    pub fn cleanup_domains(&mut self) -> Res<()> {
+        if self.network_on && self.dialog.is_none() {
+            self.call_within("Network.disable", json!({}), 400)?;
+            self.network_on = false;
+        }
+        Ok(())
+    }
+
     /// Enable the Page domain once per connection. It is the only way to hear
     /// about a JavaScript dialog before the 30 s timeout, and about frame
     /// navigations and downloads the caller may want reported.
@@ -877,6 +918,8 @@ impl Conn {
     /// the first closes. One answer per call keeps that deterministic.
     pub fn handle_dialog(&mut self, accept: bool, text: Option<&str>) -> Res<Option<Value>> {
         let seq = self.dialog_seq;
+        let beforeunload = self.dialog.as_ref()
+            .and_then(|d| d.get("type")).and_then(Value::as_str) == Some("beforeunload");
         let mut params = json!({ "accept": accept });
         if let Some(t) = text {
             params["promptText"] = json!(t);
@@ -895,9 +938,19 @@ impl Conn {
                     let _ = self.wait_event("Page.javascriptDialogOpening", 150);
                     self.timed_out = false;
                 }
-                Ok(self.dialog.clone())
+                let out = self.dialog.clone();
+                // A settle window that ran into this dialog left Network on; with
+                // the page unblocked it can be turned off now rather than later.
+                let _ = self.cleanup_domains();
+                Ok(out)
             }
             Err(e) => {
+                // Accepting "leave" tears the tab down: the socket can close
+                // before the reply arrives, and that is the expected end.
+                if beforeunload && accept && self.dead {
+                    self.dialog = None;
+                    return Ok(None);
+                }
                 if self.dialog_seq != seq && self.dialog.is_some() {
                     Ok(self.dialog.clone())
                 } else {
@@ -937,41 +990,45 @@ impl Conn {
         // receipt armed before the call would blame them on this action.
         self.enable_runtime()?;
         self.call("Network.enable", json!({}))?;
+        self.network_on = true;
         if let Err(e) = self.call("Target.setDiscoverTargets", json!({ "discover": true })) {
-            let _ = self.call("Network.disable", json!({}));
+            if self.call("Network.disable", json!({})).is_ok() {
+                self.network_on = false;
+            }
             return Err(e);
         }
         self.receipts = Some(Receipts::new(origin_of(page_url), opener.to_string()));
         Ok(())
     }
 
-    /// Wait until `method` arrives carrying `/params/<key> == want`.
-    ///
-    /// False on a timeout or a dead socket: the caller treats "not seen" as "not
-    /// gone", which is the safe answer for a close.
-    pub fn wait_match(&mut self, method: &str, key: &str, want: &str, ms: u64) -> bool {
+    /// Has `Target.targetDestroyed` arrived for this target? Reads until it has
+    /// or `ms` elapses. Recorded in `track_frames`, so one that arrived before
+    /// the close reply is still counted.
+    pub fn await_destroyed(&mut self, id: &str, ms: u64) -> bool {
+        let seen = |c: &Self| c.destroyed.iter().any(|d| d == id);
+        if seen(self) {
+            self.destroyed.retain(|d| d != id);
+            return true;
+        }
         let deadline = std::time::Instant::now() + Duration::from_millis(ms);
-        let pointer = format!("/params/{key}");
-        let out = loop {
+        loop {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
-                break false;
+                let restore = self.timeout_ms;
+                self.set_read_timeout(restore);
+                return seen(self);
             }
             self.set_read_timeout(left.as_millis().max(1) as u64);
-            match self.next_msg(method, ms) {
-                Ok(v) => {
-                    if v.get("method").and_then(Value::as_str) == Some(method)
-                        && v.pointer(&pointer).and_then(Value::as_str) == Some(want)
-                    {
-                        break true;
-                    }
-                }
-                Err(_) => break false,
+            if self.next_msg("target close", ms).is_err() {
+                let restore = self.timeout_ms;
+                self.set_read_timeout(restore);
+                return seen(self);
             }
-        };
-        let restore = self.timeout_ms;
-        self.set_read_timeout(restore);
-        out
+            if seen(self) {
+                self.destroyed.retain(|d| d != id);
+                return true;
+            }
+        }
     }
 
     /// Read until `quiet_ms` passes with no message while no same-origin
@@ -985,6 +1042,12 @@ impl Conn {
         // frame lifecycle chatter would hold every settle window to its cap.
         let mut last_activity = std::time::Instant::now();
         loop {
+            // Blocked before we even read: no event can arrive and no teardown
+            // command would be answered, so leave now instead of waiting out
+            // slices against a renderer that cannot run.
+            if self.dialog.is_some() {
+                break;
+            }
             let cap_left = deadline.saturating_duration_since(std::time::Instant::now());
             if cap_left.is_zero() {
                 break;
@@ -1029,7 +1092,11 @@ impl Conn {
             // Bounded: if a dialog is up the renderer is blocked, and a teardown
             // command must not turn a settled action into a 30 s wait.
             let _ = self.call_within("Target.setDiscoverTargets", json!({ "discover": false }), 400);
-            let _ = self.call_within("Network.disable", json!({}), 400);
+            // A blocked renderer would sit on this command; the next call turns
+            // Network off once the dialog is answered.
+            if self.dialog.is_none() && self.call_within("Network.disable", json!({}), 400).is_ok() {
+                self.network_on = false;
+            }
         }
         match self.receipts.take() {
             Some(r) => ReceiptOutcome { entries: r.entries, opened_tab: r.opened_tab },
@@ -1066,6 +1133,12 @@ impl Conn {
                         break Ok(None);
                     }
                     // Any other event: keep waiting for ours.
+                    // A dialog blocks the renderer, so the wake this waits for cannot
+                    // arrive. Return at once, or the caller waits out its timeout
+                    // and every retry after that.
+                    if self.dialog.is_some() {
+                        break Ok(None);
+                    }
                 }
                 // A read timeout is the clock, not a failure. Any other error is
                 // a real one: mistaking it for "the wait elapsed" would report

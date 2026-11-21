@@ -462,6 +462,24 @@ await withTab(`http://localhost:${fport}/dialogs`, async (tab, ev) => {
         !late.ok && /dialog/.test(JSON.stringify(late.v)) && late.ms < 4000,
         { ok: late.ok, ms: late.ms, v: JSON.stringify(late.v).slice(0, 140) });
   await s.tool("input", { tab, actions: [{ dialog: { accept: false } }] });
+
+  // idle must report the dialog instead of sitting out its timeout.
+  await s.tool("input", { tab, actions: [{ click: { i: at("Later")?.i } }] });
+  const woke = await s.tool("idle", { tab, timeoutMs: 5000, maxIdleMs: 5000 });
+  check("a dialog wakes idle with woke:dialog",
+        woke.ok && woke.v?.woke === "dialog" && woke.v?.dialog?.type === "confirm" && woke.ms < 4000,
+        { ok: woke.ok, ms: woke.ms, woke: woke.v?.woke, dialog: woke.v?.dialog });
+  await s.tool("input", { tab, actions: [{ dialog: { accept: false } }] });
+
+  // A dialog that opens *during* a settle window must end the window at once:
+  // neither the quiet wait nor the Network teardown can run against a blocked
+  // renderer. "Later" opens its dialog from a 150 ms timer, so it lands inside.
+  const settled = await s.tool("input", { tab, actions: [{ click: { i: at("Later")?.i } }], settleMs: 1500 });
+  check("a dialog that opens during settleMs ends the window instead of stalling",
+        settled.ok && settled.v?.dialog?.type === "confirm" && settled.ms < 1000,
+        { ok: settled.ok, ms: settled.ms, dialog: settled.v?.dialog });
+  const after = await s.tool("input", { tab, actions: [{ dialog: { accept: false } }], settleMs: 800 });
+  check("the dialog can be answered after a settle click", after.ok, JSON.stringify(after.v).slice(0, 140));
 });
 
 // A beforeunload guard asks before a navigation leaves; the dialog arrives

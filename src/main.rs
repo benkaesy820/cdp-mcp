@@ -209,6 +209,7 @@ fn with_conn_retry<R>(
             let mut attempt = |conn: &mut cdp::Conn| -> Result<R, String> {
                 conn.drain_arrived()?;
                 conn.enable_page()?;
+                conn.cleanup_domains()?;
                 if !allow_dialog {
                     if let Some(d) = conn.dialog.clone() {
                         return Err(dialog_block(&d));
@@ -254,6 +255,7 @@ fn with_conn_retry<R>(
     let mut attempt = |conn: &mut cdp::Conn| -> Result<R, String> {
         conn.drain_arrived()?;
         conn.enable_page()?;
+        conn.cleanup_domains()?;
         if !allow_dialog {
             if let Some(d) = conn.dialog.clone() {
                 return Err(dialog_block(&d));
@@ -1373,6 +1375,10 @@ fn wait_for_text(conn: &mut cdp::Conn, want: &str, ms: u64) -> Result<bool, Stri
     let started = std::time::Instant::now();
     loop {
         check_cancel()?;
+
+        if conn.dialog.is_some() {
+            return Err("dialog open: the page is blocked".into());
+        }
         let left = (ms as u128).saturating_sub(started.elapsed().as_millis()) as u64;
         let slice = left.min(1_000);
         let js = format!(
@@ -1397,6 +1403,7 @@ fn wait_for_text(conn: &mut cdp::Conn, want: &str, ms: u64) -> Result<bool, Stri
             Ok(Value::Bool(true)) => return Ok(true),
             // a navigation destroyed the context mid-wait: try again in the new one
             Err(e) if conn.dead => return Err(e),
+            Err(e) if conn.dialog.is_some() => return Err(e),
             Err(_) => nap(100)?,
             Ok(_) => {}
         }
@@ -1748,6 +1755,13 @@ impl Settled {
         self.shadow_chars = 0;
     }
 
+    /// A wake caused by a dialog: the same report, plus the dialog itself.
+    fn dialog_report(&self, d: Value, started: &std::time::Instant, last: &std::time::Instant) -> Value {
+        let mut o = self.report("dialog", started, last);
+        o["dialog"] = d;
+        o
+    }
+
     fn report(&self, woke: &str, started: &std::time::Instant, last: &std::time::Instant) -> Value {
         let mut o = json!({
             "woke": woke,
@@ -2027,11 +2041,22 @@ fn wait_page_settled_inner(
     // The watcher must not outlive the wait: a live observer keeps pushing into
     // a socket nobody is reading, and the next tool on this tab pays for it.
     let stop_watch = |conn: &mut cdp::Conn| {
+        if conn.dialog.is_some() {
+            // Blocked: the observer can run nothing, and the next wait
+            // replaces it. Waiting 2 s for the stop would be the hang.
+            return;
+        }
         let _ = conn.eval_within(STOP_WATCH_JS, 2_000);
     };
 
     loop {
         check_cancel()?;
+
+        // A dialog blocks the renderer: nothing can settle, and every page
+        // read from here would wait out its own timeout.
+        if let Some(d) = conn.dialog.clone() {
+            return Ok(settled.dialog_report(d, &started, &last_event));
+        }
 
         // Install on the first pass, and again after a document swap: the
         // observer died with the old document, the binding did not.
@@ -2102,6 +2127,12 @@ fn wait_page_settled_inner(
                     }
                 },
                 Err(e) if conn.dead => return Err(e),
+                Err(_) if conn.dialog.is_some() => {
+                    // "Not ready" here would nap and retry into the same blocked
+                    // renderer, once per pass, for the whole timeout.
+                    let d = conn.dialog.clone().unwrap_or(Value::Null);
+                    return Ok(settled.dialog_report(d, &started, &last_event));
+                }
                 Err(_) => {
                     installed = false;
                     let since = *failing_since.get_or_insert_with(std::time::Instant::now);
@@ -2148,6 +2179,8 @@ fn wait_page_settled_inner(
                 }
                 Look::Miss => {}
             }
+              // The look is where a dialog can appear; do not read the page
+              // again with a blocked renderer.
             // Last look before calling it quiet: a shadow root or an attribute
             // toggle can move the visible text without a light-DOM record, and
             // reporting idle mid-render is worse than one extra read.
@@ -2167,6 +2200,12 @@ fn wait_page_settled_inner(
                     continue;
                 }
             }
+            // A dialog opened around the look: report it instead of
+            // calling the page idle or timed out.
+            if let Some(d) = conn.dialog.clone() {
+                return Ok(settled.dialog_report(d, &started, &last_event));
+            }
+
             stop_watch(conn);
             let mut o = settled.report("idleLimit", &started, &last_event);
             o["note"] = json!("nothing changed for maxIdleMs");
@@ -2182,6 +2221,12 @@ fn wait_page_settled_inner(
                 stop_watch(conn);
                 return Ok(settled.report(&kind, &started, &last_event));
             }
+            // A dialog opened around the look: report it instead of
+            // calling the page idle or timed out.
+            if let Some(d) = conn.dialog.clone() {
+                return Ok(settled.dialog_report(d, &started, &last_event));
+            }
+
             stop_watch(conn);
             let mut o = settled.report("timeout", &started, &last_event);
             // Cold path only: one bounded look at the near miss, so the next
@@ -2242,6 +2287,9 @@ fn wait_idle(conn: &mut cdp::Conn, ms: u64, step: u64) -> Result<i64, String> {
     let mut last = -1i64;
     let mut stable_ms = 0u64;
     loop {
+        if conn.dialog.is_some() {
+            return Err("dialog open: the page is blocked".into());
+        }
         let n = conn
             .eval("performance.getEntriesByType('resource').length")
             .ok()
@@ -2750,16 +2798,38 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                 // Did we reach the state we were waiting for?
                 if until_text.is_some() || until_gone.is_some() {
                     // Asked in the page: only booleans cross the socket.
-                    let page_has = |want: &str| {
-                        with_conn(&cfg.endpoint, tab, |conn, _| conn.eval(&has_text_js(want)))
-                            .ok()
-                            .and_then(|v| v.as_bool())
+                    // A dialog is not "the text is absent": it blocks every later
+                    // step, so the flow stops here instead of sleeping and asking
+                    // a renderer that cannot answer.
+                    let mut stopped: Option<Value> = None;
+                    let mut page_has = |want: &str| -> Option<bool> {
+                        match with_conn(&cfg.endpoint, tab, |conn, _| conn.eval(&has_text_js(want))) {
+                            Ok(v) => Some(v.as_bool().unwrap_or(false)),
+                            Err(e) => {
+                                let raw = e.strip_prefix("ERROR: ").unwrap_or(&e);
+                                if let Ok(b) = serde_json::from_str::<Value>(raw) {
+                                    if let Some(d) = b.get("dialog") {
+                                        stopped = Some(d.clone());
+                                    }
+                                }
+                                None
+                            }
+                        }
                     };
                     if let Some(want) = &until_text {
                         if page_has(want) == Some(true) { hit = true; }
                     }
                     if let Some(gone) = &until_gone {
                         if page_has(gone) == Some(false) { hit = true; }
+                    }
+                    if let Some(d) = stopped {
+                        return Ok(json!({
+                            "iterations": iteration,
+                            "elapsedMs": started.elapsed().as_millis() as u64,
+                            "stoppedOnDialog": true,
+                            "dialog": d,
+                            "trail": all,
+                        }));
                     }
                     if hit { break; }
                 }
@@ -2969,7 +3039,7 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                             if !href.is_empty() && href != "about:blank" && (ready == "complete" || ready == "interactive") {
                                 break;
                             }
-                        } else if conn.dead {
+                        } else if conn.dead || conn.dialog.is_some() {
                             break;
                         }
                         nap(20)?; // a fresh tab is about:blank for a few ms
@@ -3012,7 +3082,17 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
         "eval" => {
             let expr = args.get("expression").and_then(Value::as_str).ok_or("eval needs expression")?;
             with_conn(&cfg.endpoint, tab, |conn, tab_id| {
-                Ok(json!({ "tab": tab_id, "value": conn.eval(expr)? }))
+                match conn.eval(expr) {
+                    Ok(v) => Ok(json!({ "tab": tab_id, "value": v })),
+                    Err(e) => {
+                        // A dialog can open mid-expression. Reporting it here is
+                        // the truth; the caller answers it on this turn.
+                        match conn.dialog.clone() {
+                            Some(d) => Ok(json!({ "tab": tab_id, "dialog": d })),
+                            None => Err(e),
+                        }
+                    }
+                }
             })
         }
         "elements" => {
@@ -3410,7 +3490,6 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                         let mut bytes = conn.eval(&js).ok().and_then(|v| v.as_str().and_then(|s| b64decode(s).ok())).unwrap_or_default();
                         if bytes.is_empty() {
                             // cross-origin: take it from the page's own cache
-                            let _ = conn.call("Page.enable", json!({}));
                             if let Ok(tree) = conn.call("Page.getFrameTree", json!({})) {
                                 if let Some(fid) = tree.pointer("/frameTree/frame/id").and_then(Value::as_str) {
                                     if let Ok(r) = conn.call("Page.getResourceContent",
@@ -3498,10 +3577,9 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                 // very often live on a CDN. Fall back to the resource the page
                 // already loaded, which CDP will hand over regardless of origin.
                 let bytes = if let Some(err) = v.get("error").and_then(Value::as_str) {
-                    // getResourceContent needs the Page domain, which is off by
-                    // default here to save a round trip per connection. Enable it
-                    // only on this path, and only once.
-                    let _ = conn.call("Page.enable", json!({}));
+                    // getResourceContent needs the Page domain, which every page
+                    // connection enables on first use (with_conn), so this path
+                    // no longer has to turn it on itself.
                     let tree = conn.call("Page.getFrameTree", json!({}))?;
                     let frame_id = tree
                         .pointer("/frameTree/frame/id")
