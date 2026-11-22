@@ -1094,6 +1094,9 @@ impl Conn {
         // "The stream started" is not "a frame arrived": the caller's fast-fail
         // for a window nobody is rendering depends on this being an error.
         if got == 0 {
+            // The stream was started and produces nothing; leaving it running
+            // would keep pushing events into a socket nobody reads.
+            self.stop_frames();
             return Err("no compositor frame arrived: the window is not being rendered".into());
         }
         Ok(())

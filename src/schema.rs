@@ -244,6 +244,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn removed_tools_and_system_paste_stay_out_of_the_schema() {
+        let defs = tool_defs();
+        let arr = defs.as_array().unwrap();
+        let names: Vec<&str> = arr.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names.len(), 14, "unexpected tool count: {names:?}");
+        for gone in ["report", "batch", "profile", "link", "images", "image", "clip"] {
+            assert!(!names.contains(&gone), "removed tool {gone} reappeared");
+        }
+        let text = defs.to_string();
+        assert!(!text.contains("method: \"system\"") && !text.contains("method:\"system\""));
+        assert!(!text.contains("index from images"));
+    }
+
+    #[test]
     fn tool_schemas_are_well_formed() {
         let defs = tool_defs();
         let names: Vec<&str> = defs.as_array().unwrap().iter()
