@@ -1212,7 +1212,6 @@ fn main() {
 mod tests {
     use super::*;
 
-
     #[test]
     fn clip_str_never_splits_a_character() {
         let s = "é".repeat(10); // two bytes each

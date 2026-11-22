@@ -314,6 +314,7 @@ fn clean_failure(e: &str) -> bool {
         || e.starts_with("select failed:")
         || e.starts_with("upload:")
         || e.contains("\"blocked\":true")
+        || e.contains("was already clicked in this run")
 }
 
 /// Compare what the page selected against what was asked for, and shape the log
@@ -972,6 +973,9 @@ mod tests {
         assert!(clean_failure("wait: text not found within 300ms: nope"));
         assert!(clean_failure("select failed: the <select> has no option \"z\""));
         assert!(clean_failure("{\"blocked\":true,\"reason\":\"obscured\"}"));
+        assert!(clean_failure(
+            "'Publish' was already clicked in this run. Verify the result first"
+        ));
         assert!(!clean_failure("Object reference chain is too long"));
         assert!(!clean_failure("the page closed the connection"));
     }

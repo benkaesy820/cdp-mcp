@@ -768,7 +768,7 @@ impl Conn {
                               binding: None, timed_out: false, contexts_cleared: false,
                               receipts: None, page_on: false, dialog: None, dialog_seq: 0, network_on: false,
                               destroyed: Vec::new(), file_chooser: None, file_chooser_on: false, download_on: false,
-                               nav_batch: false,
+                                nav_batch: false,
                                nav_committed: None, nav_same: None,
                               nav_dom_ready: false, media: MediaState::default(), touch_on: false };
         conn.set_read_timeout(ms);
@@ -1103,6 +1103,7 @@ impl Conn {
     pub fn cleanup_domains(&mut self) -> Res<()> {
         self.end_file_chooser();
         self.end_downloads();
+        let _ = self.set_focus_emulation(false);
         if self.network_on && self.dialog.is_none() {
             self.call_within("Network.disable", json!({}), 400)?;
             self.network_on = false;
@@ -1575,8 +1576,26 @@ impl Conn {
         if self.focus_on == on {
             return Ok(());
         }
-        self.call("Emulation.setFocusEmulationEnabled", json!({ "enabled": on }))?;
-        self.focus_on = on;
+        if !on {
+            // Teardown after a capture on a human's tab: a dialog or a dead
+            // socket must not turn that into a 30 s wait.
+            if self.dead {
+                self.focus_on = false;
+                return Ok(());
+            }
+            if self.dialog.is_some() {
+                return Ok(());
+            }
+            if self
+                .call_within("Emulation.setFocusEmulationEnabled", json!({ "enabled": false }), 400)
+                .is_ok()
+            {
+                self.focus_on = false;
+            }
+            return Ok(());
+        }
+        self.call("Emulation.setFocusEmulationEnabled", json!({ "enabled": true }))?;
+        self.focus_on = true;
         Ok(())
     }
 

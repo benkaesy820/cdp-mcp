@@ -81,81 +81,81 @@ pub const SCAN_JS: &str = r#"(() => {
   // index means the same element on every scan of the same page state.
   const collect = (node, chain, frameLabel) => {
     const fb = frameBox(chain);
-      for (const el of node.querySelectorAll(sel)) {
-        const r = placed(el, fb);
-        if (!shown(el, r)) continue;
-        const b = boxOf(r);
-        const key = b.x + ',' + b.y + ',' + b.w;
-        if (seen.has(key)) continue;
-        seen.add(key);
-      const rec = { i: elements.length, tag: el.tagName.toLowerCase(), label: labelOf(el) };
-      // Effective role, derived when the element does not carry one: a plain
-      // <a href> *is* a link, and filtering by role would miss every one of them.
-      const explicit = el.getAttribute('role');
-      const t = el.tagName;
-      const derived = t === 'A' ? 'link'
-        : t === 'BUTTON' ? 'button'
-        : t === 'SELECT' ? 'combobox'
-        : t === 'TEXTAREA' ? 'textbox'
-        : t === 'INPUT' ? (el.type === 'checkbox' ? 'checkbox' : el.type === 'radio' ? 'radio'
-                          : el.type === 'submit' ? 'button' : 'textbox')
-        : el.isContentEditable ? 'textbox'
-        : '';
-      const eff = explicit || derived;
-      if (eff) rec.role = eff;
-      // :disabled is the browser's own answer: the disabled attribute and an
-      // ancestor fieldset[disabled], minus the first-legend exception, and it
-      // leaves a link or a [role=button] inside the fieldset clickable.
-      let dis = !!el.disabled || el.getAttribute('aria-disabled') === 'true';
-      try { if (!dis && el.matches && el.matches(':disabled')) dis = true; } catch (e) {}
-      if (dis) rec.disabled = true;
-      // Current form state, so a scoped scan answers "what is typed here"
-      // without a second eval. Passwords never leave the page in plaintext.
-      const tagName = el.tagName;
-      if (tagName === 'INPUT') {
-          const ty = (el.type || 'text').toLowerCase();
-          if (ty === 'checkbox' || ty === 'radio') rec.checked = !!el.checked;
-          else if (ty === 'password') { if (el.value) rec.value = '***'; }
-          else if (el.value) rec.value = String(el.value).slice(0, 60);
-      } else if (tagName === 'TEXTAREA') {
-          if (el.value) rec.value = String(el.value).slice(0, 60);
-      } else if (tagName === 'SELECT') {
-          if (el.multiple) {
-              // `selectedIndex` reports one entry; a multiple select can have
-              // several, and hiding the rest is how a selection reads as lost.
-              rec.selected = [...el.selectedOptions].map((o) => String(o.text || '').trim().slice(0, 60));
-          } else {
-              const opt = el.options[el.selectedIndex];
-              if (opt) rec.selected = String(opt.text || '').trim().slice(0, 60);
-          }
-      } else if (el.isContentEditable || el.getAttribute('role') === 'textbox') {
-          const v = (el.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 60);
-          if (v) rec.value = v;
-      }
-      const roleAttr = el.getAttribute('role');
-      // A native control already answered: role=switch on a checked checkbox
-      // usually has no aria-checked, and must not read as false.
-      if (rec.checked === undefined && (roleAttr === 'checkbox' || roleAttr === 'switch' || roleAttr === 'radio')) {
-          rec.checked = el.getAttribute('aria-checked') === 'true';
-      }
-      if (frameLabel) rec.frame = frameLabel;
-      Object.assign(rec, b);
-      // off-screen (or outside its frame's visible area): needs scrolling
-      // before a coordinate click will land
-      if (r.top < fb.T - 4 || r.bottom > fb.B + 4) rec.off = true;
-      // Checked after visibility and dedupe, so `capped` means a real matching
-      // element was left out.
-      if (full()) { capped = true; return; }
-      elements.push(rec);
-      refs.push(el);
-      chains.push(chain);
+    for (const el of node.querySelectorAll(sel)) {
+      const r = placed(el, fb);
+      if (!shown(el, r)) continue;
+      const b = boxOf(r);
+      const key = b.x + ',' + b.y + ',' + b.w;
+      if (seen.has(key)) continue;
+      seen.add(key);
+    const rec = { i: elements.length, tag: el.tagName.toLowerCase(), label: labelOf(el) };
+    // Effective role, derived when the element does not carry one: a plain
+    // <a href> *is* a link, and filtering by role would miss every one of them.
+    const explicit = el.getAttribute('role');
+    const t = el.tagName;
+    const derived = t === 'A' ? 'link'
+      : t === 'BUTTON' ? 'button'
+      : t === 'SELECT' ? 'combobox'
+      : t === 'TEXTAREA' ? 'textbox'
+      : t === 'INPUT' ? (el.type === 'checkbox' ? 'checkbox' : el.type === 'radio' ? 'radio'
+                        : el.type === 'submit' ? 'button' : 'textbox')
+      : el.isContentEditable ? 'textbox'
+      : '';
+    const eff = explicit || derived;
+    if (eff) rec.role = eff;
+    // :disabled is the browser's own answer: the disabled attribute and an
+    // ancestor fieldset[disabled], minus the first-legend exception, and it
+    // leaves a link or a [role=button] inside the fieldset clickable.
+    let dis = !!el.disabled || el.getAttribute('aria-disabled') === 'true';
+    try { if (!dis && el.matches && el.matches(':disabled')) dis = true; } catch (e) {}
+    if (dis) rec.disabled = true;
+    // Current form state, so a scoped scan answers "what is typed here"
+    // without a second eval. Passwords never leave the page in plaintext.
+    const tagName = el.tagName;
+    if (tagName === 'INPUT') {
+        const ty = (el.type || 'text').toLowerCase();
+        if (ty === 'checkbox' || ty === 'radio') rec.checked = !!el.checked;
+        else if (ty === 'password') { if (el.value) rec.value = '***'; }
+        else if (el.value) rec.value = String(el.value).slice(0, 60);
+    } else if (tagName === 'TEXTAREA') {
+        if (el.value) rec.value = String(el.value).slice(0, 60);
+    } else if (tagName === 'SELECT') {
+        if (el.multiple) {
+            // `selectedIndex` reports one entry; a multiple select can have
+            // several, and hiding the rest is how a selection reads as lost.
+            rec.selected = [...el.selectedOptions].map((o) => String(o.text || '').trim().slice(0, 60));
+        } else {
+            const opt = el.options[el.selectedIndex];
+            if (opt) rec.selected = String(opt.text || '').trim().slice(0, 60);
+        }
+    } else if (el.isContentEditable || el.getAttribute('role') === 'textbox') {
+        const v = (el.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+        if (v) rec.value = v;
     }
+    const roleAttr = el.getAttribute('role');
+    // A native control already answered: role=switch on a checked checkbox
+    // usually has no aria-checked, and must not read as false.
+    if (rec.checked === undefined && (roleAttr === 'checkbox' || roleAttr === 'switch' || roleAttr === 'radio')) {
+        rec.checked = el.getAttribute('aria-checked') === 'true';
+    }
+    if (frameLabel) rec.frame = frameLabel;
+    Object.assign(rec, b);
+    // off-screen (or outside its frame's visible area): needs scrolling
+    // before a coordinate click will land
+    if (r.top < fb.T - 4 || r.bottom > fb.B + 4) rec.off = true;
+    // Checked after visibility and dedupe, so `capped` means a real matching
+    // element was left out.
+    if (full()) { capped = true; return; }
+    elements.push(rec);
+    refs.push(el);
+    chains.push(chain);
+  }
     for (const host of node.querySelectorAll('*')) {
-      if (full()) return;
+      if (PICK ? full() : capped) return;
       if (host.shadowRoot) collect(host.shadowRoot, chain, frameLabel);
     }
     for (const f of node.querySelectorAll('iframe, frame')) {
-      if (full()) return;
+      if (PICK ? full() : capped) return;
       let doc = null;
       try { doc = f.contentDocument; } catch (e) { /* cross-origin */ }
       if (!doc || !doc.documentElement || !shown(f, placed(f, fb))) continue;
@@ -412,7 +412,6 @@ pub const FRAME_ELEMENTS_JS: &str = r#"(() => {
   ).trim().replace(/\s+/g, ' ').slice(0, 90);
   const walk = (root) => {
     for (const el of root.querySelectorAll(sel)) {
-      if (out.length >= 300) return;
       const r = el.getBoundingClientRect();
       if (r.width < 2 || r.height < 2) continue;
       // Same rule as SCAN_JS: checkVisibility sees hidden ancestors, which
@@ -424,6 +423,8 @@ pub const FRAME_ELEMENTS_JS: &str = r#"(() => {
       }
       const key = Math.round(r.x) + ',' + Math.round(r.y) + ',' + Math.round(r.width);
       if (seen.has(key)) continue;
+      // After visibility and dedupe: a real matching element was left out.
+      if (out.length >= 300) { capped = true; return; }
       seen.add(key);
       const explicit = el.getAttribute('role');
       const tag = el.tagName.toLowerCase();
@@ -474,6 +475,7 @@ pub const FRAME_ELEMENTS_JS: &str = r#"(() => {
     out.push(rec);
     }
     for (const host of root.querySelectorAll('*')) {
+      if (capped) return;
       if (host.shadowRoot) walk(host.shadowRoot);
     }
   };
@@ -520,7 +522,7 @@ pub const FRAME_ELEMENTS_JS: &str = r#"(() => {
     const up = (n) => n.parentNode || n.host || (n.nodeType === 9 && n.defaultView ? n.defaultView.frameElement : null);
     const holds = (a, b) => { for (let n = b; n; n = up(n)) if (n === a) return true; return false; };
     const hit = deepAt(rec.lx, rec.ly);
-    rec.hit = !!hit && holds(el, hit);
+    rec.hit = !!hit && (holds(el, hit) || holds(hit, el));
     if (!rec.hit) {
       rec.blocker = hit ? String(hit.tagName || '').toLowerCase() : 'nothing';
       rec.blockerLabel = hit ? labelOf(hit).slice(0, 60) : '';
@@ -725,20 +727,26 @@ pub(crate) fn scan_with_frames(conn: &mut cdp::Conn, scope: Option<&str>, cap: u
                     o.insert("off".into(), json!(true));
                 }
             }
-            elements.push(k);
-            added += 1;
-            if elements.len() >= 600 {
+            if elements.len() >= cap as usize {
+                frame_capped = true;
                 break;
             }
+            elements.push(k);
+            added += 1;
+        }
+        if elements.len() >= cap as usize {
+            break;
+        }
+    }
+    if frame_capped {
+        if let Some(o) = scan_v.as_object_mut() {
+            o.insert("capped".into(), json!(true));
         }
     }
     if added > 0 {
         if let Some(o) = scan_v.as_object_mut() {
             o.insert("elements".into(), Value::Array(elements));
             o.insert("framesScanned".into(), json!(added));
-            if frame_capped {
-                o.insert("capped".into(), json!(true));
-            }
         }
     }
     Ok(scan_v)
@@ -1151,6 +1159,15 @@ pub(crate) fn text(cfg: &Cfg, args: &Value) -> Result<Value, String> {
 #[cfg(test)]
 mod moved_tests {
     use super::*;
+
+    #[test]
+    fn the_frame_scanner_has_a_pick_slot_and_a_cap() {
+        assert!(FRAME_ELEMENTS_JS.contains("__FRAME_PICK__"));
+        assert!(FRAME_ELEMENTS_JS.contains("out.length >= 300"));
+        let filled = FRAME_ELEMENTS_JS.replace("__FRAME_PICK__", "null");
+        assert!(!filled.contains("__FRAME_PICK__"));
+        assert!(filled.contains("capped"));
+    }
 
     #[test]
     fn a_box_model_quad_becomes_an_origin_and_a_size() {
