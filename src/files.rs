@@ -41,12 +41,6 @@ const PASTE_SNAP_JS: &str = r#"(() => {
     return true;
 })()"#;
 
-/// Scroll by `dy`, in one evaluation. The document first; when it does not
-/// move (an app whose content scrolls inside a container), the scrollable
-/// container under the middle of the viewport, like a wheel would.
-/// A multiple selection matches when the sets are equal. The page reports its
-/// options in its own order, and a repeated request value is the same request.
-
 pub(crate) fn images(cfg: &Cfg, args: &Value) -> Result<Value, String> {
     let tab = args.get("tab").and_then(Value::as_str);
     with_conn(&cfg.endpoint, tab, |conn, tab_id| {

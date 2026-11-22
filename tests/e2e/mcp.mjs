@@ -10,7 +10,7 @@ export function server(bin) {
     const t = performance.now(); const m = await rpc("tools/call", { name, arguments: args }); const ms = performance.now() - t;
     const txt = m.result?.content?.[0]?.text ?? JSON.stringify(m.error);
     let v; try { v = JSON.parse(txt); } catch { v = txt; }
-    return { ok: !m.result?.isError, v, ms: Math.round(ms) };
+    return { ok: !m.result?.isError, v, ms: Math.round(ms), blocks: m.result?.content ?? [] };
   };
   return { p, rpc, notify, tool, nextId: () => id + 1, close: () => p.kill() };
 }

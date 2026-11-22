@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 
 use crate::cdp;
 use crate::input::{blocked_click, guard_irreversible, irreversible};
-use crate::shot::{capture_png, parse_region};
+use crate::shot::{capture_guarded, parse_region};
 use crate::{b64encode, clip_str, nonempty_scope, scan_cache, scope_cache, with_conn, Cfg};
 
 pub const SCAN_JS: &str = r#"(() => {
@@ -911,7 +911,8 @@ pub(crate) fn elements(cfg: &Cfg, args: &Value) -> Result<Value, String> {
         if shot_mode == "none" {
             return Ok(payload);
         }
-        let (bytes, clipped, mime) = capture_png(conn, &shot_mode, region, Some(max_w), &shot_fmt, 82)?;
+        let (bytes, clipped, mime) =
+                capture_guarded(conn, tab_id, &shot_mode, region, Some(max_w), &shot_fmt, 82)?;
         Ok(json!({ "__content": [
             { "type": "text", "text": payload.to_string() },
             { "type": "image", "data": b64encode(&bytes), "mimeType": mime },

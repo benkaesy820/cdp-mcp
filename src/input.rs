@@ -279,6 +279,8 @@ pub(crate) fn drag_path(conn: &mut cdp::Conn, from: (f64, f64), to: (f64, f64), 
 /// JS: does the page's text contain `want`? Evaluated in the page, so only a
 /// boolean crosses the socket instead of the whole body text.
 
+/// A multiple selection matches when the sets are equal. The page reports its
+/// options in its own order, and a repeated request value is the same request.
 pub(crate) fn selection_matches(want: &[String], got: &Value) -> bool {
     let mut want: Vec<&str> = want.iter().map(String::as_str).collect();
     let mut have: Vec<&str> = got

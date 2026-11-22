@@ -194,9 +194,41 @@ pub(crate) fn plan(args: &Value, current: &MediaState) -> Result<Plan, String> {
     })
 }
 
+/// The page's own viewport, as the settle compares it.
+fn viewport(conn: &mut Conn) -> Option<Value> {
+    conn.eval("[innerWidth, innerHeight, Math.round(devicePixelRatio * 100)]")
+        .ok()
+}
+
+/// A metrics override changes the renderer's layout on its next frame, not
+/// inside the protocol reply: an immediate read still sees the old size, which
+/// made `reset` look as though it had restored nothing. Wait for the change and
+/// then for it to hold still, bounded.
+fn settle_viewport(conn: &mut Conn, before: &Value) {
+    let Some(mut last) = viewport(conn) else { return };
+    let mut changed = false;
+    for _ in 0..10 {
+        let _ = crate::nap(30);
+        let Some(now) = viewport(conn) else { return };
+        if now != last {
+            changed = true;
+            last = now;
+            continue;
+        }
+        if changed || now == *before {
+            break;
+        }
+    }
+}
+
 /// Apply a call and report what is active, plus what the page itself measures.
 pub(crate) fn run(conn: &mut Conn, tab: &str, args: &Value) -> Result<Value, String> {
     let plan = plan(args, &conn.media)?;
+    let viewport_before = if plan.reset || plan.metrics.is_some() {
+        viewport(conn)
+    } else {
+        None
+    };
     let mut applied = json!({ "tab": tab });
     // Touch events are bound when the document is created, so a change here only
     // reaches a page loaded afterwards. The caller is told rather than left to
@@ -263,6 +295,12 @@ pub(crate) fn run(conn: &mut Conn, tab: &str, args: &Value) -> Result<Value, Str
         }
         applied["media"] = json!({ "media": media.media, "features": Value::Object(map) });
         conn.media = media;
+    }
+
+    if let Some(b) = &viewport_before {
+        if conn.dialog.is_none() {
+            settle_viewport(conn, b);
+        }
     }
 
     // The page's own answer. A dialog blocks the renderer, so ask only when it is

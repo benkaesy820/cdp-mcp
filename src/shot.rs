@@ -2,7 +2,7 @@
 
 use serde_json::{json, Value};
 
-use crate::cdp;
+use crate::cdp::{self, Conn};
 use crate::scan::pick;
 use crate::{b64decode, nonempty_scope, scope_for, with_conn, Cfg};
 
@@ -75,6 +75,46 @@ pub(crate) fn capture_png(
     let b64 = r.get("data").and_then(Value::as_str).ok_or("screenshot returned no data")?;
     let mime = mime_for(format).to_string();
     Ok((b64decode(b64)?, clipped, mime))
+}
+
+/// Capture with the two things a background tab needs: frames while it runs, and
+/// a human-opened tab's focus behaviour handed back afterwards. Both `shot` and
+/// `elements { shot }` go through here, so the borrow/restore cannot drift.
+pub(crate) fn capture_guarded(
+    conn: &mut Conn,
+    tab_id: &str,
+    mode: &str,
+    region: Option<(f64, f64, f64, f64)>,
+    max_w: Option<f64>,
+    fmt: &str,
+    quality: u32,
+) -> Result<(Vec<u8>, bool, String), String> {
+    let borrowed = !cdp::is_owned(tab_id);
+    if borrowed {
+        conn.set_focus_emulation(true).ok();
+    }
+    // A capture needs a frame from the browser's compositor, and a window that
+    // niri is not showing produces none: measured 12 s either way with
+    // `fromSurface` true or false, against ~150 ms with the window on the visible
+    // workspace. A live screencast forces frames while it runs, so the frame
+    // arriving (or not) is also the honest answer to "can this be captured at
+    // all".
+    if let Err(why) = conn.start_frames() {
+        if borrowed {
+            let _ = conn.set_focus_emulation(false);
+        }
+        return Err(format!(
+            "no frame: the browser window is not on the workspace you are viewing, \
+             so it is not being rendered. Switch to it and retry, or skip the \
+             screenshot — every other tool works without it. ({why})"
+        ));
+    }
+    let shot = capture_png(conn, mode, region, max_w, fmt, quality);
+    conn.stop_frames();
+    if borrowed {
+        let _ = conn.set_focus_emulation(false);
+    }
+    shot
 }
 
 /// The capture box for an element, widened by padding but never past the
@@ -184,34 +224,8 @@ pub(crate) fn run(cfg: &Cfg, args: &Value) -> Result<Value, String> {
         };
         // Someone else's tab: let it render just long enough to be
         // captured, then hand its normal behaviour back.
-        let borrowed = !cdp::is_owned(tab_id);
-        if borrowed {
-            conn.set_focus_emulation(true).ok();
-        }
-        // A capture needs a frame from the browser's compositor, and a
-        // window that niri is not showing produces none: measured 12 s
-        // either way with `fromSurface` true or false, against ~150 ms
-        // with the window on the visible workspace. A live screencast
-        // forces frames while it runs, so the frame arriving (or not)
-        // is also the honest answer to "can this be captured at all".
-        if let Err(why) = conn.start_frames() {
-            // Hand the tab back before returning: a borrowed tab must not
-            // keep rendering because a capture failed.
-            if borrowed {
-                let _ = conn.set_focus_emulation(false);
-            }
-            return Err(format!(
-                "no frame: the browser window is not on the workspace you are viewing, \
-                 so it is not being rendered. Switch to it and retry, or skip the \
-                 screenshot — every other tool works without it. ({why})"
-            ));
-        }
-        let shot = capture_png(conn, &effective_mode, region, None, &fmt, quality);
-        conn.stop_frames();
-        if borrowed {
-            let _ = conn.set_focus_emulation(false);
-        }
-        let (bytes, clipped, _mime) = shot?;
+        let (bytes, clipped, _mime) =
+            capture_guarded(conn, tab_id, &effective_mode, region, None, &fmt, quality)?;
         std::fs::write(&path, &bytes).map_err(|e| format!("cannot write {path}: {e}"))?;
         let mut out = json!({
             "tab": tab_id, "path": path, "bytes": bytes.len(),

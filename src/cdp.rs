@@ -988,8 +988,13 @@ impl Conn {
         Ok(())
     }
 
+    /// Stop the screencast only when the connection can still answer. An open
+    /// dialog or a dead socket would otherwise sit out the full 30 s timeout on a
+    /// teardown path that runs after every capture and every wheel.
     pub fn stop_frames(&mut self) {
-        let _ = self.call("Page.stopScreencast", json!({}));
+        if !self.dead && self.dialog.is_none() {
+            let _ = self.call_within("Page.stopScreencast", json!({}), 400);
+        }
     }
 
     /// Turn the Runtime domain on once per connection.

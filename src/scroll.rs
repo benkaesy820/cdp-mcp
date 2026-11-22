@@ -210,10 +210,10 @@ fn dispatch(
                 "type": "mouseWheel", "x": x, "y": y, "deltaX": dx, "deltaY": dy,
             })),
         ])?;
-        std::thread::sleep(std::time::Duration::from_millis(60));
+        crate::nap(60)?;
         let mut seen = conn.eval(&js("read"))?;
         if !reached_page(&seen) && attempt == 0 {
-            std::thread::sleep(std::time::Duration::from_millis(120));
+            crate::nap(120)?;
             seen = conn.eval(&js("read"))?;
         }
         if !reached_page(&seen) {
@@ -224,7 +224,7 @@ fn dispatch(
         if !report(begin, &seen, dx, dy).moved {
             // A compositor-driven scroll may land a beat later; without this the
             // canvas answer and a slow scroll look alike.
-            std::thread::sleep(std::time::Duration::from_millis(80));
+            crate::nap(80)?;
         }
         break;
     }

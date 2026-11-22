@@ -789,6 +789,14 @@ await withTab(`http://localhost:${fport}/tall`, async (tab) => {
         { v: a4, head: head2 });
   try { unlinkSync(explicit); } catch {}
 
+  const withShot = await s.tool("elements", { tab, limit: 5, shot: "viewport", maxWidth: 400 });
+  const shotBlocks = withShot.blocks || [];
+  check("elements {shot} attaches a capture of the viewport",
+        withShot.ok &&
+        shotBlocks.some(b => b.type === "image" && (b.data || "").length > 100) &&
+        shotBlocks.some(b => /attached viewport capture/.test(b.text || "")),
+        { ok: withShot.ok, types: shotBlocks.map(b => b.type) });
+
   const bad = await s.tool("pdf", { tab, format: "legal" });
   check("pdf rejects an unknown paper size", !bad.ok && /letter or a4/.test(String(bad.v)), String(bad.v).slice(0, 120));
 });
