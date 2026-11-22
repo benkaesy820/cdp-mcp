@@ -304,6 +304,34 @@ pub(crate) fn select_values(v: Option<&Value>) -> Result<Value, String> {
     }
 }
 
+/// Compare what the page selected against what was asked for, and shape the log
+/// entry. Shared by the page path and the frame path so their answers cannot
+/// drift.
+fn selected_entry(i: u64, value: &Value, got: Value, in_frame: bool) -> Result<Value, String> {
+    match value {
+        Value::Array(want) => {
+            let want: Vec<String> =
+                want.iter().filter_map(Value::as_str).map(str::to_string).collect();
+            if !selection_matches(&want, &got) {
+                return Err(format!("select failed: asked for {want:?}, the page has {got}"));
+            }
+        }
+        Value::String(want) => {
+            if got.as_str() != Some(want.as_str()) {
+                return Err(format!(
+                    "select failed: the <select> has no option {want:?} (it is {got})"
+                ));
+            }
+        }
+        _ => {}
+    }
+    let mut entry = json!({ "i": i, "value": got });
+    if in_frame {
+        entry["inFrame"] = json!(true);
+    }
+    Ok(entry)
+}
+
 pub(crate) fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], force: bool, scope: Option<&str>) -> Result<Value, String> {
     let mut log = Vec::new();
     for a in actions {
@@ -515,9 +543,22 @@ pub(crate) fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], forc
                                          "candidates": cands.iter().map(|(l, _)| l.clone()).collect::<Vec<_>>() })),
             }
         } else if let Some(h) = obj.get("hover") {
-            let (x, y) = point_of(conn, scope, h)?;
-            conn.call_many(&[("Input.dispatchMouseEvent", json!({ "type": "mouseMoved", "x": x, "y": y }))])?;
-            log.push(json!({ "hovered": { "x": x, "y": y } }));
+            let frame = match h.get("i").and_then(Value::as_u64) {
+                Some(i) => scan::frame_pick(conn, tab, i, true, None)?,
+                None => None,
+            };
+            if let Some(f) = frame {
+                let x = f.get("lx").and_then(Value::as_f64).unwrap_or(0.0);
+                let y = f.get("ly").and_then(Value::as_f64).unwrap_or(0.0);
+                let session = f.get("session").and_then(Value::as_str).unwrap_or_default();
+                conn.call_in(Some(session), "Input.dispatchMouseEvent",
+                    json!({ "type": "mouseMoved", "x": x, "y": y }))?;
+                log.push(json!({ "hovered": { "x": x, "y": y, "inFrame": true } }));
+            } else {
+                let (x, y) = point_of(conn, scope, h)?;
+                conn.call_many(&[("Input.dispatchMouseEvent", json!({ "type": "mouseMoved", "x": x, "y": y }))])?;
+                log.push(json!({ "hovered": { "x": x, "y": y } }));
+            }
         } else if let Some(d) = obj.get("drag") {
             let from = point_of(conn, scope, d.get("from").ok_or("drag needs from")?)?;
             let to = point_of(conn, scope, d.get("to").ok_or("drag needs to")?)?;
@@ -557,30 +598,23 @@ pub(crate) fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], forc
             // would need a second overlay navigation.
             let i = v.get("i").and_then(Value::as_u64).ok_or("select needs i")?;
             let value = select_values(v.get("value"))?;
-            let at = pick(conn, scope, i, false, Some(&value))?;
-            if let Some(e) = at.get("selectError").and_then(Value::as_str) {
-                return Err(format!("select failed: {e}"));
-            }
-            let got = at.get("selected").cloned().unwrap_or(Value::Null);
-            match &value {
-                Value::Array(want) => {
-                    let want: Vec<String> =
-                        want.iter().filter_map(Value::as_str).map(str::to_string).collect();
-                    if !selection_matches(&want, &got) {
-                        return Err(format!("select failed: asked for {want:?}, the page has {got}"));
-                    }
-                    log.push(json!({ "selected": { "i": i, "value": got } }));
+            // A frame element is a different document: resolve it there, live, and
+            // validate against the answer that document gave.
+            let entry = if let Some(f) = scan::frame_pick(conn, tab, i, false, Some(&value))? {
+                if let Some(e) = f.get("selectError").and_then(Value::as_str) {
+                    return Err(format!("select failed: {e}"));
                 }
-                Value::String(want) => {
-                    if got.as_str() != Some(want.as_str()) {
-                        return Err(format!(
-                            "select failed: the <select> has no option {want:?} (it is {got})"
-                        ));
-                    }
-                    log.push(json!({ "selected": { "i": i, "value": got } }));
+                let got = f.get("selected").cloned().unwrap_or(Value::Null);
+                selected_entry(i, &value, got, true)?
+            } else {
+                let at = pick(conn, scope, i, false, Some(&value))?;
+                if let Some(e) = at.get("selectError").and_then(Value::as_str) {
+                    return Err(format!("select failed: {e}"));
                 }
-                _ => {}
-            }
+                let got = at.get("selected").cloned().unwrap_or(Value::Null);
+                selected_entry(i, &value, got, false)?
+            };
+            log.push(json!({ "selected": entry }));
         } else if let Some(w) = obj.get("wait") {
             let ms = w.get("ms").and_then(Value::as_u64).unwrap_or(15_000);
             if w.get("idle").and_then(Value::as_bool).unwrap_or(false) {

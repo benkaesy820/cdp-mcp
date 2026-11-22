@@ -393,7 +393,9 @@ pub const OVERLAYS_QUICK_JS: &str = r#"(() => {
 /// interactive set only — because it runs once per frame on every scan.
 pub const FRAME_ELEMENTS_JS: &str = r#"(() => {
   const sel = 'a[href], button, input, select, textarea, summary, [role="button"], [role="link"], [role="tab"], [role="menuitem"], [role="checkbox"], [role="radio"], [role="switch"], [role="combobox"], [contenteditable]:not([contenteditable="false"]), [onclick], [tabindex]:not([tabindex="-1"])';
+  const PICK = __FRAME_PICK__;
   const out = [];
+  const nodes = [];
   const seen = new Set();
   // Same order and cap as SCAN_JS. The label decides the irreversible-click
   // guard, so a frame must not name a button differently from the page.
@@ -461,13 +463,61 @@ pub const FRAME_ELEMENTS_JS: &str = r#"(() => {
       if (rec.checked === undefined && (roleAttr === 'checkbox' || roleAttr === 'switch' || roleAttr === 'radio')) {
           rec.checked = el.getAttribute('aria-checked') === 'true';
       }
-      out.push(rec);
+      nodes.push(el);
+    out.push(rec);
     }
     for (const host of root.querySelectorAll('*')) {
       if (host.shadowRoot) walk(host.shadowRoot);
     }
   };
   walk(document);
+  if (PICK) {
+    const el = nodes[PICK.i];
+    if (!el || !el.isConnected) return JSON.stringify({ missing: true, total: nodes.length });
+    if (PICK.scroll) el.scrollIntoView({ block: 'center', inline: 'center' });
+    const r = el.getBoundingClientRect();
+    const rec = {
+      i: PICK.i, tag: el.tagName.toLowerCase(), label: labelOf(el),
+      connected: el.isConnected, zero: r.width < 2 || r.height < 2,
+      x: Math.round(r.x), y: Math.round(r.y),
+      w: Math.round(r.width), h: Math.round(r.height),
+      lx: Math.round(r.x + r.width / 2), ly: Math.round(r.y + r.height / 2),
+    };
+    let dis = !!el.disabled || el.getAttribute('aria-disabled') === 'true';
+    try { if (!dis && el.matches && el.matches(':disabled')) dis = true; } catch (e) {}
+    if (dis) rec.disabled = true;
+    rec.outside = rec.lx < 0 || rec.ly < 0 || rec.lx > innerWidth || rec.ly > innerHeight;
+    const hit = document.elementFromPoint(rec.lx, rec.ly);
+    rec.hit = !!hit && (hit === el || el.contains(hit) || (hit.closest && hit.closest(sel) === el));
+    if (!rec.hit) {
+      rec.blocker = hit ? String(hit.tagName || '').toLowerCase() : 'nothing';
+      rec.blockerLabel = hit ? labelOf(hit).slice(0, 60) : '';
+    }
+    if (PICK.select !== undefined) {
+      const sb = el.tagName === 'SELECT' ? el : el.closest('select');
+      if (!sb) rec.selectError = 'not a select';
+      else if (Array.isArray(PICK.select)) {
+        const wanted = PICK.select.map(String);
+        const missing = wanted.filter((v) => ![...sb.options].some((o) => o.value === v));
+        if (missing.length) rec.selectError = 'no option ' + missing.join(', ');
+        else if (!sb.multiple && wanted.length > 1)
+          rec.selectError = 'this <select> takes one value; it is not multiple';
+        else {
+          const set = new Set(wanted);
+          for (const o of sb.options) o.selected = set.has(o.value);
+          sb.dispatchEvent(new Event('input', { bubbles: true }));
+          sb.dispatchEvent(new Event('change', { bubbles: true }));
+          rec.selected = [...sb.options].filter((o) => o.selected).map((o) => o.value);
+        }
+      } else {
+        sb.value = PICK.select;
+        sb.dispatchEvent(new Event('input', { bubbles: true }));
+        sb.dispatchEvent(new Event('change', { bubbles: true }));
+        rec.selected = sb.value;
+      }
+    }
+    return JSON.stringify(rec);
+  }
   return JSON.stringify({ elements: out, title: document.title.slice(0, 80), url: location.href.slice(0, 200) });
 })()"#;
 
@@ -504,6 +554,46 @@ pub(crate) fn pick(conn: &mut cdp::Conn, scope: Option<&str>, i: u64, scroll: bo
     Ok(v)
 }
 
+/// Top-left corner and size from `DOM.getBoxModel`'s content quad: eight numbers
+/// in top-viewport coordinates, four corners clockwise.
+fn quad_box(quad: &[f64]) -> Option<(f64, f64, f64, f64)> {
+    if quad.len() < 8 {
+        return None;
+    }
+    let xs: Vec<f64> = quad.iter().step_by(2).map(|v| *v).collect();
+    let ys: Vec<f64> = quad.iter().skip(1).step_by(2).map(|v| *v).collect();
+    let x0 = xs.iter().cloned().fold(f64::INFINITY, f64::min);
+    let y0 = ys.iter().cloned().fold(f64::INFINITY, f64::min);
+    let x1 = xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let y1 = ys.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let (w, h) = (x1 - x0, y1 - y0);
+    if w < 2.0 || h < 2.0 {
+        None
+    } else {
+        Some((x0, y0, w, h))
+    }
+}
+
+/// Where a cross-origin frame sits in the top page's viewport. The target id
+/// from `Target.attachedToTarget` is accepted as the frame id, and the content
+/// quad is viewport-space — measured at scrollY 0: y=1500, at scrollY 1000: y=500.
+fn frame_box(conn: &mut cdp::Conn, target: &str) -> Option<(f64, f64, f64, f64)> {
+    let owner = conn
+        .call("DOM.getFrameOwner", json!({ "frameId": target }))
+        .ok()?;
+    let node = owner.get("backendNodeId").and_then(Value::as_u64)?;
+    let model = conn
+        .call("DOM.getBoxModel", json!({ "backendNodeId": node }))
+        .ok()?;
+    let quad: Vec<f64> = model
+        .pointer("/model/content")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_f64)
+        .collect();
+    quad_box(&quad)
+}
+
 /// Scan the page plus every cross-origin iframe inside it.
 ///
 /// The page's own script cannot read across a site boundary — that is site
@@ -538,7 +628,7 @@ pub(crate) fn scan_with_frames(conn: &mut cdp::Conn, scope: Option<&str>) -> Res
         // parent so local coordinates can be made absolute.
         // The frame returns a JSON string: one value in, one value out, and no
         // surprise about how deep the protocol will serialise.
-        let body = match conn.eval_in(&session, FRAME_ELEMENTS_JS) {
+        let body = match conn.eval_in(&session, &FRAME_ELEMENTS_JS.replace("__FRAME_PICK__", "null")) {
             Ok(Value::String(body)) => serde_json::from_str::<Value>(&body).unwrap_or(Value::Null),
             Ok(v) => v,
             Err(_) => continue, // sandboxed, detached, or no document yet
@@ -547,30 +637,18 @@ pub(crate) fn scan_with_frames(conn: &mut cdp::Conn, scope: Option<&str>) -> Res
         if kids.is_empty() {
             continue;
         }
-        let origin = match conn.eval(&format!(
-            "(() => {{ const f = [...document.querySelectorAll('iframe, frame')].find(f => (f.src || '') === {src}); \
-               if (!f) return null; const r = f.getBoundingClientRect(); \
-               if (r.width < 2 || r.height < 2) return null; \
-               if (f.checkVisibility && !f.checkVisibility({{ checkOpacity: true, checkVisibilityCSS: true }})) return null; \
-               return JSON.stringify({{ x: r.left + f.clientLeft, y: r.top + f.clientTop, w: f.clientWidth, h: f.clientHeight }}); }})()",
-            src = serde_json::to_string(&url).unwrap_or_else(|_| "null".into())
-        )) {
-            Ok(Value::String(s)) => serde_json::from_str::<Value>(&s).ok(),
-            _ => None,
+        // The frame's own target id is a frame id to DOM.getFrameOwner, and its
+        // content quad is where the frame sits in this viewport. This replaced a
+        // `src === url` lookup that missed redirects and relative srcs.
+        let (ox, oy, fw, fh) = match frame_box(conn, &target) {
+            Some(b) => b,
+            None => continue, // cannot place it on screen, so a click there is a guess
         };
-        let origin = match origin {
-            Some(o) if !o.is_null() => o,
-            _ => continue, // cannot place it on screen, so a click there is a guess
-        };
-        let (ox, oy) = (
-            origin.get("x").and_then(Value::as_f64).unwrap_or(0.0),
-            origin.get("y").and_then(Value::as_f64).unwrap_or(0.0),
-        );
         let label = url
             .split("://").nth(1).unwrap_or(&url)
             .split('/').next().unwrap_or(&url)
             .chars().take(40).collect::<String>();
-        for mut k in kids {
+        for (fi, mut k) in kids.into_iter().enumerate() {
             // A frame can be scrolled: only what the parent actually shows is
             // clickable, so anything outside the frame's box is marked off-screen.
             let (x, y) = (
@@ -594,12 +672,13 @@ pub(crate) fn scan_with_frames(conn: &mut cdp::Conn, scope: Option<&str>) -> Res
                 o.insert("session".into(), json!(session));
                 // The target id survives a reconnect; the session id does not.
                 o.insert("target".into(), json!(target));
+              // Frame-local index: re-resolving by position is stable where a
+              // cached coordinate is not.
+              o.insert("fi".into(), json!(fi as u64));
                 // Local centre, which is what a click inside the frame needs.
                 o.insert("lx".into(), json!(lx as i64));
                 o.insert("ly".into(), json!(ly as i64));
             }
-            let fw = origin.get("w").and_then(Value::as_f64).unwrap_or(0.0);
-            let fh = origin.get("h").and_then(Value::as_f64).unwrap_or(0.0);
             let inside = lx >= 0.0 && ly >= 0.0 && lx <= fw && ly <= fh;
             if !inside {
                 if let Some(o) = k.as_object_mut() {
@@ -622,16 +701,83 @@ pub(crate) fn scan_with_frames(conn: &mut cdp::Conn, scope: Option<&str>) -> Res
     Ok(scan_v)
 }
 
-/// If element `i` of tab `tab` lives inside a cross-origin frame, where to
-/// click it.
-///
-/// Returns `(local x, local y, session)`. Cheap in the common case: one cached
-/// scan lookup, no protocol traffic; the browser is only asked when the element
-/// carries a `session`, which `scan_with_frames` sets only for frames.
-///
-/// The target id proves the frame is the same one, not that the document inside
-/// it still shows the same element: a same-site navigation keeps both the target
-/// and the old coordinates, so the click can land on whatever moved there.
+/// The cached frame element at index `i`, if the last scan put one there.
+fn cached_frame_element(tab: &str, i: u64) -> Option<Value> {
+    let cache = scan_cache().lock().ok()?;
+    let els = cache.get(tab)?.get("elements")?.as_array()?.clone();
+    els.get(i as usize)
+        .cloned()
+        .filter(|e| e.get("target").and_then(Value::as_str).is_some())
+}
+
+/// Resolve a cached frame element's session by target id: a cached session id
+/// goes stale when the page reconnects.
+fn frame_session(conn: &mut cdp::Conn, i: u64, el: &Value) -> Result<String, String> {
+    let want = el.get("target").and_then(Value::as_str).unwrap_or_default().to_string();
+    if want.is_empty() {
+        return Err(format!(
+            "element {i} is not inside a frame any more; call elements again"
+        ));
+    }
+    match conn.frames() {
+        Ok(frames) => frames
+            .iter()
+            .find(|f| f.0 == want)
+            .map(|f| f.1.clone())
+            .ok_or_else(|| {
+                format!(
+                    "element {i} was inside a frame that is no longer there; call elements again"
+                )
+            }),
+        Err(e) => Err(format!(
+            "cannot resolve the frame for element {i} ({e}); call elements again"
+        )),
+    }
+}
+
+/// Re-resolve element `i` inside its cross-origin frame, live: scroll it into
+/// view, measure it again, and report hit-testing and form state. `None` means
+/// `i` is not a frame element.
+pub(crate) fn frame_pick(
+    conn: &mut cdp::Conn,
+    tab: &str,
+    i: u64,
+    scroll: bool,
+    select: Option<&Value>,
+) -> Result<Option<Value>, String> {
+    let Some(el) = cached_frame_element(tab, i) else {
+        return Ok(None);
+    };
+    let session = frame_session(conn, i, &el)?;
+    let fi = el.get("fi").and_then(Value::as_u64).unwrap_or(0);
+    let mut p = json!({ "i": fi, "scroll": scroll });
+    if let Some(v) = select {
+        p["select"] = json!(v);
+    }
+    let js = FRAME_ELEMENTS_JS.replace("__FRAME_PICK__", &p.to_string());
+    let body = match conn.eval_in(&session, &js) {
+        Ok(Value::String(body)) => body,
+        Ok(v) => v.to_string(),
+        Err(e) => {
+            return Err(format!(
+                "element {i} could not be resolved in its frame ({e}); call elements again"
+            ))
+        }
+    };
+    let mut v: Value = serde_json::from_str(&body)
+        .map_err(|e| format!("the frame scan returned something unexpected: {e}"))?;
+    if v.get("missing").and_then(Value::as_bool) == Some(true) {
+        return Err(format!(
+            "element {i} is gone from its frame; call elements again"
+        ));
+    }
+    v["session"] = json!(session);
+    Ok(Some(v))
+}
+
+/// Resolve a frame click through `frame_pick`: the refusals come from the live
+/// state, not from coordinates that may be stale, and the irreversible guard
+/// runs on the live label.
 pub(crate) fn frame_target(
     conn: &mut cdp::Conn,
     tab: &str,
@@ -640,68 +786,32 @@ pub(crate) fn frame_target(
     force: bool,
 ) -> Result<Option<(f64, f64, String)>, String> {
     // A scoped click indexes the scoped list, which holds no frame elements: a
-    // CSS selector cannot reach into a child document. Resolving it in the tab's
-    // unscoped cache would click a different element than the one named.
+    // CSS selector cannot reach into a child document.
     if scope.is_some() {
         return Ok(None);
     }
-    // The cache holds one entry per tab. Reading whichever entry came first sent
-    // this click into a session that belongs to a different page's connection.
-    let cached = {
-        let cache = scan_cache().lock().unwrap();
-        cache
-            .get(tab)
-            .and_then(|v| v.get("elements").and_then(Value::as_array).cloned())
-    };
-    let el = cached
-        .and_then(|els| els.get(i as usize).cloned())
-        .filter(|e| e.get("session").and_then(Value::as_str).is_some());
-    let el = match el {
-        Some(e) => e,
-        None => return Ok(None),
-    };
-    let mut session = el.get("session").and_then(Value::as_str).unwrap_or_default().to_string();
-    if session.is_empty() {
+    let Some(el) = frame_pick(conn, tab, i, true, None)? else {
         return Ok(None);
-    }
-    // Resolve the session on this connection: a cached id goes stale when the
-    // page reconnects, and ids attached elsewhere are not usable here. The
-    // target id survives both, which is why the scan records it.
-    let want = el.get("target").and_then(Value::as_str).unwrap_or_default();
-    if !want.is_empty() {
-        match conn.frames() {
-            Ok(frames) => match frames.iter().find(|f| f.0 == want) {
-                Some((_, s, _)) => session = s.clone(),
-                // The frame is gone, or it is same-origin now. Falling through to
-                // the main document would act on a different element with this index.
-                None => {
-                    return Err(format!(
-                        "element {i} was inside a frame that is no longer there; call elements again"
-                    ));
-                }
-            },
-            // Without the frame list the cached session cannot be trusted: it may
-            // belong to a connection that is gone.
-            Err(e) => {
-                return Err(format!(
-                    "cannot resolve the frame for element {i} ({e}); call elements again"
-                ));
-            }
-        }
-    }
-    // The same refusals the page path makes, from the state the frame scan
-    // recorded: without them a frame was a way around both. They come after the
-    // resolution, so a frame that is gone does not consume the guard.
+    };
     let tag = el.get("tag").unwrap_or(&Value::Null);
     let label = el.get("label").unwrap_or(&Value::Null);
     if !force && el.get("disabled").and_then(Value::as_bool) == Some(true) {
         return Err(blocked_click("disabled", i, tag, label, Value::Null, true));
     }
-    // Below the frame's own fold: what scrolls is the frame's document, not the
-    // page, so a dispatch at these coordinates lands outside its viewport. An
-    // unfelt click that still burns the guard is the worst of both.
-    if !force && el.get("off").and_then(Value::as_bool) == Some(true) {
+    if !force && el.get("zero").and_then(Value::as_bool) == Some(true) {
+        return Err(blocked_click("zero", i, tag, label, Value::Null, true));
+    }
+    // The frame's own viewport: what is below its fold needs a scroll inside the
+    // frame, and a dispatch at these coordinates would land outside it.
+    if !force && el.get("outside").and_then(Value::as_bool) == Some(true) {
         return Err(blocked_click("outside_frame", i, tag, label, Value::Null, true));
+    }
+    if !force && el.get("hit").and_then(Value::as_bool) == Some(false) {
+        let obscured = json!({
+            "tag": el.get("blocker").cloned().unwrap_or(Value::Null),
+            "label": el.get("blockerLabel").cloned().unwrap_or(Value::Null),
+        });
+        return Err(blocked_click("covered", i, tag, label, obscured, true));
     }
     if let Some(text) = label.as_str() {
         if irreversible(text) {
@@ -710,10 +820,10 @@ pub(crate) fn frame_target(
     }
     let x = el.get("lx").and_then(Value::as_f64).unwrap_or(0.0);
     let y = el.get("ly").and_then(Value::as_f64).unwrap_or(0.0);
+    let session = el.get("session").and_then(Value::as_str).unwrap_or_default().to_string();
     Ok(Some((x, y, session)))
 }
 
-/// Send one mouse event to a frame's own session, at frame-local coordinates.
 pub(crate) fn frame_click(
     conn: &mut cdp::Conn,
     session: &str,
@@ -928,6 +1038,7 @@ pub(crate) fn text(cfg: &Cfg, args: &Value) -> Result<Value, String> {
         Some(_) => return Err("within must be a CSS selector".into()),
     };
     let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(4000) as usize;
+    let frames = args.get("frames").and_then(Value::as_bool).unwrap_or(false);
     with_conn(&cfg.endpoint, tab, |conn, tab_id| {
         let js = format!(
             "(() => {{ \
@@ -947,13 +1058,38 @@ pub(crate) fn text(cfg: &Cfg, args: &Value) -> Result<Value, String> {
         // A selector that matches nothing is not the body: saying so
         // beats handing back the whole page as if it were the scope.
         let scope_missing = v.get("missing").and_then(Value::as_bool) == Some(true);
-        let text = v.get("text").and_then(Value::as_str).unwrap_or("").to_string();
+        let mut text = v.get("text").and_then(Value::as_str).unwrap_or("").to_string();
+        // Cross-origin frames are separate documents; their words are only
+        // reachable through their own session. Off unless asked: it costs a frame
+        // list and one evaluation per visible frame.
+        if frames && !scope_missing {
+            for (target, session, url) in conn.frames().unwrap_or_default() {
+                if frame_box(conn, &target).is_none() {
+                    continue; // not on screen: its text is not part of the page you see
+                }
+                let host = url
+                    .split("://").nth(1).unwrap_or(&url)
+                    .split('/').next().unwrap_or(&url)
+                    .chars().take(40).collect::<String>();
+                let js = "JSON.stringify((document.body && document.body.innerText || '') \
+                          .replace(/\\n{3,}/g, '\\n\\n').trim().slice(0, 2000))";
+                let Ok(Value::String(inner)) = conn.eval_in(&session, js) else { continue };
+                let Ok(inner) = serde_json::from_str::<String>(&inner) else { continue };
+                let inner = inner.trim();
+                if inner.is_empty() {
+                    continue;
+                }
+                text.push_str(&format!("\n\n[frame {host}]\n{inner}"));
+            }
+        }
+        let text: String = text.chars().take(limit).collect();
         Ok(json!({
             "tab": tab_id,
             "within": within,
             "scopeMissing": scope_missing,
             "chars": text.chars().count(),
             "truncated": text.chars().count() >= limit,
+            "frames": frames,
             "text": text,
         }))
     })
@@ -962,6 +1098,22 @@ pub(crate) fn text(cfg: &Cfg, args: &Value) -> Result<Value, String> {
 #[cfg(test)]
 mod moved_tests {
     use super::*;
+
+    #[test]
+    fn a_box_model_quad_becomes_an_origin_and_a_size() {
+        // Content quad at scroll 0: y 1500, size 600x400.
+        assert_eq!(
+            quad_box(&[0.0, 1500.0, 600.0, 1500.0, 600.0, 1900.0, 0.0, 1900.0]),
+            Some((0.0, 1500.0, 600.0, 400.0))
+        );
+        // At scroll 1000 the same frame is at y 500: the quad is viewport-space.
+        assert_eq!(
+            quad_box(&[0.0, 500.0, 600.0, 500.0, 600.0, 900.0, 0.0, 900.0]),
+            Some((0.0, 500.0, 600.0, 400.0))
+        );
+        assert_eq!(quad_box(&[0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]), None);
+        assert_eq!(quad_box(&[1.0, 2.0]), None);
+    }
 
     #[test]
     fn a_bare_document_is_suspected_but_a_loaded_one_is_not() {

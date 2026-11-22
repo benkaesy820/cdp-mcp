@@ -45,6 +45,28 @@ async function serveFrames() {
       res.end("server error");
       return;
     }
+    if (path === "/frame-top") {
+      // A cross-origin frame that redirected away from the attribute's value.
+      res.writeHead(200, { "content-type": "text/html" });
+      res.end(`<!doctype html><meta charset="utf-8"><title>frame top</title>
+        <body style="margin:0">
+        <div style="height:1500px;background:#eee">spacer</div>
+        <iframe src="http://127.0.0.1:${framePort}/redir" style="width:600px;height:400px;border:0"></iframe>
+        <script>window.__msgs=[];addEventListener('message',e=>{
+          if(e.data==='clicked'||e.data==='hovered')__msgs.push(e.data)})</script>
+        </body>`);
+      return;
+    }
+    if (path === "/redir") {
+      res.writeHead(302, { location: `http://127.0.0.1:${framePort}/frame-inner` });
+      res.end();
+      return;
+    }
+    if (path === "/frame-inner") {
+      res.writeHead(200, { "content-type": "text/html" });
+      res.end(readFileSync(join(here, "pages", "frame-inner.html")));
+      return;
+    }
     if (path === "/file.bin") {
       // A download that changes no DOM state: only the receipt can show it.
       res.writeHead(200, {
@@ -405,13 +427,16 @@ await withTab(page("frames.html?port=" + fport), async (tab, ev) => {
   check("force bypasses the frame refusals", g3.ok && fforce.ok,
         { guarded: g3.ok, disabled: fforce.ok, v: String(fforce.v).slice(0, 120) });
 
-  // Below the frame's own fold: the page cannot scroll the frame's document, so
-  // clicking would dispatch outside its viewport and burn the guard for nothing.
+  // Below the frame's own fold: the click path scrolls the frame's document, so
+  // the element becomes visible instead of the dispatch landing outside.
   const offEl = els.find(e => (e.label || "").trim() === "Cross far");
+  const farBefore = (await H())["cross-far"] || 0;
   const offClick = await s.tool("input", { tab, actions: [{ click: { i: offEl?.i } }] });
-  check("a frame element outside the frame's box is refused",
-        !offClick.ok && /"reason":"outside_frame"/.test(String(offClick.v)),
-        String(offClick.v).slice(0, 140));
+  await sleep(300);
+  check("a frame element below the fold is scrolled into view and clicked",
+        offClick.ok && offClick.v.log?.[0]?.clicked?.inFrame === true &&
+        ((await H())["cross-far"] || 0) === farBefore + 1,
+        { log: offClick.v.log, hits: await H() });
 
   // A scoped click indexes the scoped list, which holds no frame elements; it
   // must not fall back to the tab's unscoped scan and hit the frame anyway.
@@ -633,6 +658,67 @@ await withTab(`http://localhost:${fport}/download`, async (tab) => {
     try { unlinkSync(`${process.env.HOME}/Downloads/${n}`); } catch {}
   }
   rmSync(dir, { recursive: true, force: true });
+});
+
+// A cross-origin frame that redirected away from its src, with the top page
+// scrolled: located by box model, acted on inside its own session.
+await withTab(`http://localhost:${fport}/frame-top`, async (tab, ev) => {
+  // The iframe attaches and loads asynchronously; a scan before that is honestly
+  // empty, so wait for the frame instead of racing it.
+  let els = [];
+  for (let n = 0; n < 24; n++) {
+    els = (await s.tool("elements", { tab, limit: 600 })).v.elements || [];
+    if (els.some(e => e.frame)) break;
+    await sleep(250);
+  }
+  const inFrame = els.filter(e => e.frame);
+  check("elements locates a cross-origin frame that redirected",
+        inFrame.length >= 3 && inFrame.some(e => /Inner button/.test(e.label || "")),
+        inFrame.slice(0, 3));
+  const at = l => els.find(e => (e.label || "").trim() === l)?.i;
+
+  await ev("scrollTo(0, 1200)");
+  const click = await s.tool("input", { tab, actions: [{ click: { i: at("Inner button") } }] });
+  await sleep(400);
+  const msgs = JSON.parse(await ev("JSON.stringify(window.__msgs)"));
+  check("a frame click lands after the top page scrolled",
+        click.ok && msgs.includes("clicked"), { click: click.v, msgs });
+
+  const hov = await s.tool("input", { tab, actions: [{ hover: { i: at("Inner button") } }] });
+  check("hover reaches an element inside a cross-origin frame",
+        hov.ok && hov.v.log?.[0]?.hovered?.inFrame === true, hov.v.log);
+
+  const sel1 = await s.tool("input", { tab, actions: [{ select: { i: at("Inner plan"), value: "b" } }] });
+  check("select reaches a single select inside a frame",
+        sel1.ok && sel1.v.log?.[0]?.selected?.value === "b" &&
+        sel1.v.log[0].selected.inFrame === true, sel1.v.log);
+
+  const sel2 = await s.tool("input", { tab, actions: [{ select: { i: at("Inner tags"), value: ["a", "c"] } }] });
+  check("select reaches a multiple select inside a frame",
+        sel2.ok && JSON.stringify(sel2.v.log?.[0]?.selected?.value) === '["a","c"]' &&
+        sel2.v.log[0].selected.inFrame === true, sel2.v.log);
+
+  // The state changes after the scan: the click must check again, not trust it.
+  await ev("document.querySelector('iframe').contentWindow.postMessage('disable','*')");
+  await sleep(150);
+  const blocked = await s.tool("input", { tab, actions: [{ click: { i: at("Late button") } }] });
+  check("a frame click is refused when the element became disabled after the scan",
+        !blocked.ok && /"reason":"disabled"/.test(String(blocked.v)) &&
+        /"inFrame":true/.test(String(blocked.v)), String(blocked.v).slice(0, 220));
+
+  await ev("document.querySelector('iframe').contentWindow.postMessage('cover','*')");
+  await sleep(150);
+  const covered = await s.tool("input", { tab, actions: [{ click: { i: at("Inner button") } }] });
+  check("a frame click is refused when something covers it",
+        !covered.ok && /"reason":"covered"/.test(String(covered.v)) &&
+        /"inFrame":true/.test(String(covered.v)), String(covered.v).slice(0, 220));
+
+  const withFrames = (await s.tool("text", { tab, frames: true, limit: 4000 })).v;
+  const plain = (await s.tool("text", { tab, limit: 4000 })).v;
+  check("text {frames:true} includes a cross-origin frame's words",
+        /inner readable text/.test(withFrames.text || "") &&
+        !/inner readable text/.test(plain.text || ""),
+        { framed: (withFrames.text || "").slice(-120), plainHasIt: /inner readable text/.test(plain.text || "") });
 });
 
 // A cross-origin navigation is the action's outcome: the settle window must stay

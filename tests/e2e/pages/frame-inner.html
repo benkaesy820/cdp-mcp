@@ -1,0 +1,17 @@
+<!doctype html><meta charset="utf-8"><title>inner</title>
+<body style="margin:0;padding:10px;font:14px system-ui">
+<p>inner readable text</p>
+<button id="inner">Inner button</button>
+<button id="late">Late button</button>
+<select id="single" aria-label="Inner plan"><option value="a">A</option><option value="b">B</option></select>
+<select id="multi" multiple aria-label="Inner tags"><option value="a">A</option><option value="b">B</option><option value="c">C</option></select>
+<div id="mask" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.08);z-index:9">mask</div>
+<script>
+document.getElementById('inner').addEventListener('click', () => parent.postMessage('clicked', '*'));
+document.getElementById('inner').addEventListener('mouseover', () => parent.postMessage('hovered', '*'));
+addEventListener('message', (e) => {
+  if (e.data === 'disable') document.getElementById('late').disabled = true;
+  if (e.data === 'cover') document.getElementById('mask').style.display = 'block';
+});
+</script>
+</body>
