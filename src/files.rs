@@ -4,9 +4,9 @@ use serde_json::{json, Value};
 
 use crate::cdp;
 use crate::clip::{clip_append, clip_backend, clip_read, clip_restore_script, clip_save, clip_stage, clip_temp, clip_write};
-use crate::input::click_index;
+use crate::input::{click_at, click_index};
 use crate::scan::pick;
-use crate::{b64decode, b64encode, current_os, nap, scope_for, with_conn, Cfg, Os};
+use crate::{b64decode, b64encode, current_os, nap, nonempty_scope, scope_for, with_conn, Cfg, Os};
 
 /// Did the editor take the paste after all? Compared against the snapshot the
 /// page stored when a handler cancelled the event and nothing had changed yet.
@@ -260,36 +260,214 @@ pub(crate) fn download(cfg: &Cfg, args: &Value) -> Result<Value, String> {
     })
 }
 
-pub(crate) fn upload(cfg: &Cfg, args: &Value) -> Result<Value, String> {
-    let tab = args.get("tab").and_then(Value::as_str);
-    let path = args.get("path").and_then(Value::as_str).ok_or("upload needs path")?.to_string();
-    let selector = args.get("selector").and_then(Value::as_str).unwrap_or("input[type=file]").to_string();
-    // Pages often carry several identical file inputs (an avatar and a
-    // banner on the same form). Picking the first match silently uploads
-    // to the wrong one, so the caller can name which.
-    let index = args.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-    if !std::path::Path::new(&path).exists() {
-        return Err(format!("no such file: {path}"));
-    }
-    with_conn(&cfg.endpoint, tab, |conn, tab_id| {
-        let doc = conn.call("DOM.getDocument", json!({ "depth": 0, "pierce": true }))?;
-        let root = doc.pointer("/root/nodeId").and_then(Value::as_u64).ok_or("no document")?;
-        let found = conn.call("DOM.querySelectorAll", json!({ "nodeId": root, "selector": selector }));
-        let node = found
-            .ok()
-            .and_then(|v| v.get("nodeIds").and_then(Value::as_array).cloned())
-            .and_then(|ids| ids.get(index).and_then(Value::as_u64))
-            .unwrap_or(0);
-        if node == 0 {
-            let n = conn.eval("document.querySelectorAll('input[type=file]').length")
-                .ok().and_then(|v| v.as_i64()).unwrap_or(0);
-            return Err(format!("no element matched {selector} at index {index} ({n} file inputs on the page). \
-                If the picker only exists after clicking a button, click it first."));
+/// A validated upload request. Pure, so the argument rules are unit-tested
+/// instead of discovered after interception is armed on someone's tab.
+#[derive(Debug, PartialEq)]
+struct Upload {
+    paths: Vec<String>,
+    /// Click this element and intercept the chooser it opens. None is the
+    /// DOM-selector path.
+    index: Option<u64>,
+    selector: String,
+    dom_index: usize,
+    timeout_ms: u64,
+}
+
+fn plan(args: &Value) -> Result<Upload, String> {
+    let paths = match (args.get("path"), args.get("paths")) {
+        (Some(Value::String(p)), None) => vec![p.clone()],
+        (None, Some(Value::Array(a))) => {
+            if a.is_empty() {
+                return Err("paths needs at least one file".into());
+            }
+            let mut out = Vec::with_capacity(a.len());
+            for x in a {
+                out.push(x.as_str().ok_or("paths must be strings")?.to_string());
+            }
+            out
         }
-        conn.call("DOM.setFileInputFiles", json!({ "nodeId": node, "files": [path] }))?;
-        Ok(json!({ "tab": tab_id, "uploaded": path, "selector": selector, "index": index, "ok": true }))
+        (Some(_), Some(_)) => return Err("upload: give path or paths, not both".into()),
+        (Some(_), None) => return Err("path must be a string".into()),
+        (None, Some(_)) => return Err("paths must be an array of strings".into()),
+        (None, None) => return Err("upload needs path or paths".into()),
+    };
+    let index = args.get("i").and_then(Value::as_u64);
+    if index.is_some() && (args.get("selector").is_some() || args.get("index").is_some()) {
+        return Err(
+            "upload: i clicks a chooser open, so it cannot be combined with selector or index"
+                .into(),
+        );
+    }
+    Ok(Upload {
+        paths,
+        index,
+        selector: args
+            .get("selector")
+            .and_then(Value::as_str)
+            .unwrap_or("input[type=file]")
+            .to_string(),
+        dom_index: args.get("index").and_then(Value::as_u64).unwrap_or(0) as usize,
+        timeout_ms: args
+            .get("timeoutMs")
+            .and_then(Value::as_u64)
+            .unwrap_or(5_000)
+            .clamp(500, 15_000),
     })
 }
+
+pub(crate) fn upload(cfg: &Cfg, args: &Value) -> Result<Value, String> {
+    let plan = plan(args)?;
+    // A missing file is the caller's mistake; discovering it after the chooser is
+    // open and interception is armed on their tab is not acceptable.
+    for p in &plan.paths {
+        match std::fs::metadata(p) {
+            Ok(m) if m.is_file() => {}
+            Ok(_) => return Err(format!("not a file: {p}")),
+            Err(_) => return Err(format!("no such file: {p}")),
+        }
+    }
+    let tab = args.get("tab").and_then(Value::as_str);
+    match plan.index {
+        None => with_conn(&cfg.endpoint, tab, |conn, tab_id| dom_upload(conn, tab_id, &plan)),
+        Some(i) => {
+            let within_given = matches!(args.get("within"), Some(v) if !v.is_null());
+            let within = match args.get("within") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => nonempty_scope(s),
+                Some(_) => return Err("upload: within must be a CSS selector".into()),
+            };
+            with_conn(&cfg.endpoint, tab, |conn, tab_id| {
+                let scope = if within_given { within.clone() } else { scope_for(tab_id) };
+                conn.begin_file_chooser()?;
+                let out = click_upload(conn, tab_id, &plan, i, scope.as_deref());
+                conn.end_file_chooser();
+                out
+            })
+        }
+    }
+}
+
+fn uploaded(paths: &[String]) -> Value {
+    if paths.len() == 1 {
+        json!(paths[0])
+    } else {
+        json!(paths)
+    }
+}
+
+fn dom_upload(conn: &mut cdp::Conn, tab_id: &str, plan: &Upload) -> Result<Value, String> {
+    let doc = conn.call("DOM.getDocument", json!({ "depth": 0, "pierce": true }))?;
+    let root = doc.pointer("/root/nodeId").and_then(Value::as_u64).ok_or("no document")?;
+    let found = conn.call("DOM.querySelectorAll", json!({ "nodeId": root, "selector": plan.selector }));
+    let node = found
+        .ok()
+        .and_then(|v| v.get("nodeIds").and_then(Value::as_array).cloned())
+        .and_then(|ids| ids.get(plan.dom_index).and_then(Value::as_u64))
+        .unwrap_or(0);
+    if node == 0 {
+        let n = conn.eval("document.querySelectorAll('input[type=file]').length")
+            .ok().and_then(|v| v.as_i64()).unwrap_or(0);
+        return Err(format!(
+            "no element matched {} at index {} ({} file inputs on the page). \
+             If the picker only exists after clicking a button, upload with `i` instead.",
+            plan.selector, plan.dom_index, n
+        ));
+    }
+    conn.call("DOM.setFileInputFiles", json!({ "nodeId": node, "files": plan.paths }))?;
+    Ok(json!({ "tab": tab_id, "uploaded": uploaded(&plan.paths),
+               "selector": plan.selector, "index": plan.dom_index, "ok": true }))
+}
+
+/// Click an element and fulfil the chooser it opens. Interception is armed by the
+/// caller and disarmed on every exit path.
+fn click_upload(
+    conn: &mut cdp::Conn,
+    tab_id: &str,
+    plan: &Upload,
+    i: u64,
+    scope: Option<&str>,
+) -> Result<Value, String> {
+    let at = pick(conn, scope, i, true, None)?;
+    if at.get("connected").and_then(Value::as_bool) == Some(false) {
+        return Err(format!("upload: element {i} is detached; call elements again"));
+    }
+    let x = at.get("x").and_then(Value::as_f64).unwrap_or(0.0);
+    let y = at.get("y").and_then(Value::as_f64).unwrap_or(0.0);
+    if let Err(e) = click_at(conn, x, y) {
+        if let Some(d) = conn.dialog.clone() {
+            return Ok(json!({ "tab": tab_id, "clicked": i, "files": plan.paths, "dialog": d }));
+        }
+        return Err(e);
+    }
+    let Some(ev) = conn.wait_file_chooser(plan.timeout_ms)? else {
+        if let Some(d) = conn.dialog.clone() {
+            return Ok(json!({ "tab": tab_id, "clicked": i, "files": plan.paths, "dialog": d }));
+        }
+        return Err(format!(
+            "no file chooser opened within {} ms: element {i} did not open one \
+             (interception is off again)",
+            plan.timeout_ms
+        ));
+    };
+    let mode = ev.get("mode").and_then(Value::as_str).unwrap_or("").to_string();
+    if mode == "selectSingle" && plan.paths.len() > 1 {
+        return Err(format!(
+            "this chooser takes one file, but {} were given: {}",
+            plan.paths.len(),
+            plan.paths.join(", ")
+        ));
+    }
+    let node = ev.get("backendNodeId").and_then(Value::as_u64).ok_or_else(|| {
+        "the file chooser has no input node: showOpenFilePicker-style pickers cannot be \
+         fulfilled over CDP"
+            .to_string()
+    })?;
+    conn.call("DOM.setFileInputFiles", json!({ "backendNodeId": node, "files": plan.paths }))?;
+    Ok(json!({ "tab": tab_id, "clicked": i, "mode": mode,
+               "files": plan.paths, "ok": true }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_path_or_many_is_a_list() {
+        let one = plan(&json!({ "path": "/tmp/a" })).unwrap();
+        assert_eq!(one.paths, vec!["/tmp/a"]);
+        assert_eq!(
+            (one.index, one.selector.as_str(), one.dom_index, one.timeout_ms),
+            (None, "input[type=file]", 0, 5000)
+        );
+
+        let two = plan(&json!({ "paths": ["/tmp/a", "/tmp/b"] })).unwrap();
+        assert_eq!(two.paths, vec!["/tmp/a", "/tmp/b"]);
+    }
+
+    #[test]
+    fn conflicting_or_empty_arguments_are_named() {
+        let err = |v: Value| plan(&v).unwrap_err();
+        assert!(err(json!({ "path": "/tmp/a", "paths": ["/tmp/b"] })).contains("not both"));
+        assert!(err(json!({})).contains("needs path or paths"));
+        assert!(err(json!({ "paths": [] })).contains("at least one"));
+        assert!(err(json!({ "paths": [1] })).contains("must be strings"));
+        assert!(err(json!({ "path": "/tmp/a", "i": 3, "selector": "#x" }))
+            .contains("cannot be combined"));
+        assert!(err(json!({ "path": "/tmp/a", "i": 3, "index": 1 }))
+            .contains("cannot be combined"));
+    }
+
+    #[test]
+    fn the_wait_is_bounded() {
+        assert_eq!(plan(&json!({ "path": "/tmp/a", "timeoutMs": 100 })).unwrap().timeout_ms, 500);
+        assert_eq!(
+            plan(&json!({ "path": "/tmp/a", "timeoutMs": 99999 })).unwrap().timeout_ms,
+            15000
+        );
+        assert_eq!(plan(&json!({ "path": "/tmp/a", "i": 2, "within": "main" })).unwrap().index, Some(2));
+    }
+}
+
 
 pub(crate) fn paste(cfg: &Cfg, args: &Value) -> Result<Value, String> {
     let tab = args.get("tab").and_then(Value::as_str);

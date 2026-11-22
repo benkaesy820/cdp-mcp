@@ -8,7 +8,7 @@
 // Each check pins a bug that actually happened; the comment says which.
 import { server } from "./mcp.mjs";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const bin = process.argv[2] || join(here, "../../target/release/cdp-mcp");
@@ -20,7 +20,7 @@ await s.rpc("initialize", { protocolVersion: "2024-11-05" });
 // two ports on 127.0.0.1 are the same site, so Chromium keeps them in one
 // process and site isolation never comes into play.
 import { createServer } from "node:http";
-import { readFileSync, unlinkSync } from "node:fs";
+import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
 let framePort = 0;
 async function serveFrames() {
   if (framePort) return framePort;
@@ -184,8 +184,64 @@ await withTab(page("upload.html"), async (tab, ev) => {
     tab, path: join(here, "pages", "red.png"), selector: "input[type=file]", index: 1,
   })).v;
   const counts = await ev("[...document.querySelectorAll('input[type=file]')].map(i => i.files.length)");
-  check("upload honours the index when several inputs match", JSON.stringify(counts) === "[0,1]", counts);
+  check("upload honours the index when several inputs match", JSON.stringify(counts) === "[0,1,0]", counts);
   check("upload reports which index it used", r.index === 1, r);
+
+  const a = `/tmp/opencode/e2e-dom-a-${process.pid}.txt`;
+  const b = `/tmp/opencode/e2e-dom-b-${process.pid}.txt`;
+  writeFileSync(a, "alpha-file\n");
+  writeFileSync(b, "beta-file-two\n");
+  const many = (await s.tool("upload", { tab, paths: [a, b], selector: "#many" })).v;
+  const manyCount = await ev("document.querySelector('#many').files.length");
+  check("upload sets several files on a multiple input",
+        many.ok && manyCount === 2 && Array.isArray(many.uploaded),
+        { many, manyCount });
+  for (const f of [a, b]) { try { unlinkSync(f); } catch {} }
+});
+
+// ---- the chooser a click opens, with no input in the DOM ----------------
+await withTab(page("chooser.html"), async (tab, ev) => {
+  const a = `/tmp/opencode/e2e-up-a-${process.pid}.txt`;
+  const b = `/tmp/opencode/e2e-up-b-${process.pid}.txt`;
+  writeFileSync(a, "alpha-file\n");
+  writeFileSync(b, "beta-file-two\n");
+  const els = (await s.tool("elements", { tab, limit: 20 })).v.elements || [];
+  const idx = l => els.find(e => (e.label || "").trim() === l)?.i;
+
+  const count = await ev("document.querySelectorAll('input[type=file]').length");
+  check("the fixture has no file input in the DOM", count === 0, count);
+
+  const one = await s.tool("upload", { tab, i: idx("Open detached"), path: a });
+  const log1 = JSON.parse(await ev("JSON.stringify(window.log)"));
+  check("upload intercepts a chooser opened by a detached input",
+        one.ok && log1[0]?.[0] === "detached" &&
+        log1[0][1][0][0] === basename(a) && log1[0][1][0][1] === 11,
+        { one, log1 });
+
+  const two = await s.tool("upload", { tab, i: idx("Open multiple"), paths: [a, b] });
+  const log2 = JSON.parse(await ev("JSON.stringify(window.log)"));
+  check("upload fills a multiple chooser with both files",
+        two.ok && JSON.stringify(log2[1]?.[1]) ===
+          JSON.stringify([[basename(a), 11], [basename(b), 14]]),
+        { two, log2 });
+
+  const single = await s.tool("upload", { tab, i: idx("Open detached"), paths: [a, b] });
+  check("two files on a single-file chooser are refused by name",
+        !single.ok && /takes one file/.test(String(single.v)), String(single.v).slice(0, 160));
+
+  const none = await s.tool("upload", { tab, i: idx("Open nothing"), path: a, timeoutMs: 800 });
+  check("a click that opens no chooser fails fast and disarms",
+        !none.ok && /no file chooser opened/.test(String(none.v)) && none.ms < 2500,
+        { ms: none.ms, v: String(none.v).slice(0, 160) });
+
+  const again = await s.tool("upload", { tab, i: idx("Open detached"), path: a });
+  check("interception works again after the timeout", again.ok, again.v);
+
+  const missing = await s.tool("upload", { tab, i: idx("Open detached"), path: "/tmp/opencode/no-such-upload" });
+  check("a missing local file is refused before the click",
+        !missing.ok && /no such file/.test(String(missing.v)), String(missing.v).slice(0, 160));
+
+  for (const f of [a, b]) { try { unlinkSync(f); } catch {} }
 });
 
 // ---- reading a page as text, and waiting for a selector -----------------

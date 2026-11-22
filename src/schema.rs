@@ -205,16 +205,19 @@ pub(crate) fn tool_defs() -> Value {
         },
         {
             "name": "upload",
-            "description": "Attach a local file to the page by setting it on a file input (default selector input[type=file]). Works for images and video. If the picker only exists after a button press, click that first.",
+            "description": "Attach local files to a file input, or to the chooser an element opens. Selector mode sets them on the input matching `selector`/`index` (default input[type=file]); `i` mode clicks that element and intercepts the file chooser it opens — a button that creates a detached input, a styled dropzone — then sets the files on it. Use `paths` for several files; a single-file chooser refuses more than one. Every local path is checked before anything is clicked, and interception is disarmed before the call returns.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "absolute local path" },
+                    "path": { "type": "string", "description": "one absolute local path" },
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "several files, for a multiple input or chooser" },
                     "selector": { "type": "string", "description": "CSS selector for the file input (default input[type=file])" },
                     "index": { "type": "integer", "description": "which match to use when several inputs share the selector (default 0). An avatar and a banner on one form are the common case." },
+                    "i": { "type": "integer", "description": "click this element and intercept the file chooser it opens; cannot be combined with selector or index" },
+                    "within": { "type": "string", "description": "scope for i; defaults to the tab's last elements scope" },
+                    "timeoutMs": { "type": "integer", "description": "how long to wait for the chooser after the click, 500..15000 (default 5000)" },
                     "tab": { "type": "string" }
-                },
-                "required": ["path"]
+                }
             }
         },
         {

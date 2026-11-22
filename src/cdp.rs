@@ -627,6 +627,14 @@ pub struct Conn {
     /// Touch emulation is on. Tracked because disabling it only affects
     /// documents created afterwards: an existing page keeps `ontouchstart`.
     pub touch_on: bool,
+    /// The last `Page.fileChooserOpened` this connection saw, waiting to be
+    /// consumed. Recorded in the funnel because the event can arrive before the
+    /// click's own reply.
+    file_chooser: Option<Value>,
+    /// `Page.setInterceptFileChooserDialog` is armed here. It must be disarmed
+    /// before the call returns, or a human click in that tab would stop opening
+    /// their file picker.
+    file_chooser_on: bool,
 }
 
 /// Events that mean the page is still doing something. `Page.*` is deliberately
@@ -688,7 +696,8 @@ impl Conn {
                               oopifs: Vec::new(), auto_attach: false, runtime_on: false,
                               binding: None, timed_out: false, contexts_cleared: false,
                               receipts: None, page_on: false, dialog: None, dialog_seq: 0, network_on: false,
-                              destroyed: Vec::new(), nav_committed: None, nav_same: None,
+                              destroyed: Vec::new(), file_chooser: None, file_chooser_on: false,
+                               nav_committed: None, nav_same: None,
                               nav_dom_ready: false, media: MediaState::default(), touch_on: false };
         conn.set_read_timeout(ms);
         // No domain is enabled on connect: each enable costs a round trip, and
@@ -853,6 +862,11 @@ impl Conn {
                 }));
             }
             Some("Page.javascriptDialogClosed") => self.dialog = None,
+            // Only delivered while interception is armed. A click can answer with
+            // the chooser before its own reply is read, so record it here.
+            Some("Page.fileChooserOpened") => {
+                self.file_chooser = Some(v["params"].clone());
+            }
             // Recorded here, not by the caller: a fast navigation (a same-document
             // history move, a BFCache restore) can answer before the command's own
             // reply, and a reply-waiting call discards what it does not expect.
@@ -1015,6 +1029,7 @@ impl Conn {
     /// was blocked. Called before the next use of the connection, so a dialog
     /// that has since been answered does not leave an event stream on.
     pub fn cleanup_domains(&mut self) -> Res<()> {
+        self.end_file_chooser();
         if self.network_on && self.dialog.is_none() {
             self.call_within("Network.disable", json!({}), 400)?;
             self.network_on = false;
@@ -1170,6 +1185,70 @@ impl Conn {
         let out = self.wait_navigation_inner(ms);
         self.set_read_timeout(self.timeout_ms);
         out
+    }
+
+    /// Arm file-chooser interception and forget any event from before it.
+    pub fn begin_file_chooser(&mut self) -> Res<()> {
+        self.file_chooser = None;
+        self.call("Page.setInterceptFileChooserDialog", json!({ "enabled": true }))?;
+        self.file_chooser_on = true;
+        Ok(())
+    }
+
+    /// Disarm it. Runs on every exit path of an upload. When a dialog is blocking
+    /// the page the request cannot be sent, so the flag stays set and
+    /// `cleanup_domains` tries again once the page answers.
+    pub fn end_file_chooser(&mut self) {
+        if !self.file_chooser_on || self.dead {
+            self.file_chooser_on = false;
+            return;
+        }
+        if self.dialog.is_some() {
+            return;
+        }
+        let _ = self.call_within(
+            "Page.setInterceptFileChooserDialog",
+            json!({ "enabled": false }),
+            400,
+        );
+        self.file_chooser_on = false;
+    }
+
+    /// Wait for a file chooser to open. `None` is a timeout, or a dialog: the
+    /// caller checks `dialog` to tell them apart.
+    pub fn wait_file_chooser(&mut self, ms: u64) -> Res<Option<Value>> {
+        let out = self.wait_file_chooser_inner(ms);
+        self.set_read_timeout(self.timeout_ms);
+        out
+    }
+
+    fn wait_file_chooser_inner(&mut self, ms: u64) -> Res<Option<Value>> {
+        let deadline = std::time::Instant::now() + Duration::from_millis(ms);
+        loop {
+            if let Some(v) = self.file_chooser.take() {
+                return Ok(Some(v));
+            }
+            // A dialog blocks the renderer, so no chooser can open behind it.
+            // Returning now is what lets the caller report the dialog instead of
+            // sitting out the timeout.
+            if self.dialog.is_some() {
+                return Ok(None);
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Ok(None);
+            }
+            let left = left.as_millis().max(1) as u64;
+            self.set_read_timeout(left);
+            match self.next_msg("file chooser", left) {
+                Ok(_) => {}
+                Err(_) if self.timed_out => {
+                    self.timed_out = false;
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     fn wait_navigation_inner(&mut self, ms: u64) -> Res<Option<NavOutcome>> {

@@ -1,0 +1,23 @@
+<!doctype html><meta charset="utf-8"><title>chooser</title>
+<body style="font:16px system-ui;padding:20px">
+<button id="detached">Open detached</button>
+<button id="multi">Open multiple</button>
+<button id="nothing">Open nothing</button>
+<script>
+window.log = [];
+// No file input exists in the DOM: both are created by the click handlers, which
+// is the case the DOM-selector path cannot reach.
+const many = document.createElement('input');
+many.type = 'file';
+many.multiple = true;
+many.onchange = () => log.push(['multiple', [...many.files].map(f => [f.name, f.size])]);
+document.getElementById('detached').onclick = () => {
+  const i = document.createElement('input');
+  i.type = 'file';
+  i.onchange = () => log.push(['detached', [...i.files].map(f => [f.name, f.size])]);
+  i.click();
+};
+document.getElementById('multi').onclick = () => many.click();
+document.getElementById('nothing').onclick = () => log.push(['nothing']);
+</script>
+</body>
