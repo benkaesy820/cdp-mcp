@@ -147,7 +147,13 @@ impl Receipts {
                 // navigation is the action's outcome, and a slow one must not let
                 // the quiet window close before it lands. XHR and fetch stay
                 // filtered to the page's own origin.
-                let wanted = ty == "Document" || self.same_origin(url);
+                // A Document counts only when it is the page's own top frame:
+                // a slow or failing third-party widget must neither hold the
+                // window nor leak into the page's errors. Measured: top-frame
+                // requests carry `frameId == tab id`, subframe documents do not.
+                let top = p.get("frameId").and_then(Value::as_str)
+                    .map(|f| f == self.opener).unwrap_or(false);
+                let wanted = (ty == "Document" && top) || self.same_origin(url);
                 if wanted && matches!(ty, "XHR" | "Fetch" | "Document") {
                     if self.requests.len() > 2_000 {
                         self.requests.clear();
@@ -165,7 +171,13 @@ impl Receipts {
                 let ty = p.get("type").and_then(Value::as_str).unwrap_or("");
                 // A failed destination document is the navigation's outcome,
                 // whatever the origin was when the action started.
-                let wanted = ty == "Document" || self.same_origin(url);
+                // A Document counts only when it is the page's own top frame:
+                // a slow or failing third-party widget must neither hold the
+                // window nor leak into the page's errors. Measured: top-frame
+                // requests carry `frameId == tab id`, subframe documents do not.
+                let top = p.get("frameId").and_then(Value::as_str)
+                    .map(|f| f == self.opener).unwrap_or(false);
+                let wanted = (ty == "Document" && top) || self.same_origin(url);
                 if status >= 400 && wanted && matches!(ty, "XHR" | "Fetch" | "Document") {
                     self.push(json!({ "kind": "http", "status": status, "url": clip_event(url) }));
                 }
@@ -685,6 +697,10 @@ pub struct Conn {
     /// `Browser.setDownloadBehavior` is redirected to a folder. It must be
     /// restored on every exit path: the human's own downloads use it too.
     download_on: bool,
+    /// An action in the current input batch navigated (an execution context was
+    /// cleared). Reset by `run_batch`, so a later failure is not blamed on an
+    /// earlier navigation.
+    pub nav_batch: bool,
 }
 
 /// Events that mean the page is still doing something. `Page.*` is deliberately
@@ -700,7 +716,10 @@ fn settle_activity(v: &Value) -> bool {
                 || m == "Runtime.consoleAPICalled"
                 // A commit and a started download both mean the action is still
                 // unfolding; without them the quiet window can close first.
-                || m == "Page.frameNavigated"
+                // Only a top-frame commit is the action still unfolding; a slow
+                // ad iframe must not stretch every settle window.
+                || (m == "Page.frameNavigated"
+                    && v.pointer("/params/frame/parentId").map(Value::is_null).unwrap_or(true))
                 || m == "Page.downloadWillBegin"
                 || m == "Browser.downloadWillBegin"
                 || m == "Browser.downloadProgress"
@@ -749,6 +768,7 @@ impl Conn {
                               binding: None, timed_out: false, contexts_cleared: false,
                               receipts: None, page_on: false, dialog: None, dialog_seq: 0, network_on: false,
                               destroyed: Vec::new(), file_chooser: None, file_chooser_on: false, download_on: false,
+                               nav_batch: false,
                                nav_committed: None, nav_same: None,
                               nav_dom_ready: false, media: MediaState::default(), touch_on: false };
         conn.set_read_timeout(ms);
@@ -1758,11 +1778,33 @@ mod receipt_tests {
     fn a_cross_origin_document_is_tracked_and_its_failure_reported() {
         let mut r = Receipts::new(origin_of("http://app.test/"), "T".into());
         r.note(&json!({"method":"Network.requestWillBeSent","params":{
-            "requestId":"d1","type":"Document","request":{"url":"http://other.test/page"}}}));
+            "requestId":"d1","type":"Document","frameId":"T","request":{"url":"http://other.test/page"}}}));
         r.note(&json!({"method":"Network.responseReceived","params":{
-            "requestId":"d1","type":"Document","response":{"status":500,"url":"http://other.test/page"}}}));
+            "requestId":"d1","type":"Document","frameId":"T",
+            "response":{"status":500,"url":"http://other.test/page"}}}));
         assert!(r.entries.iter().any(|e| e["kind"] == "http" && e["status"] == 500),
                 "{:?}", r.entries);
+    }
+
+    #[test]
+    fn a_subframe_document_failure_is_not_the_pages_error() {
+        let mut r = Receipts::new(origin_of("http://app.test/"), "T".into());
+        r.note(&json!({"method":"Network.requestWillBeSent","params":{
+            "requestId":"s1","type":"Document","frameId":"sub",
+            "request":{"url":"http://ads.test/slot"}}}));
+        r.note(&json!({"method":"Network.responseReceived","params":{
+            "requestId":"s1","type":"Document","frameId":"sub",
+            "response":{"status":500,"url":"http://ads.test/slot"}}}));
+        assert!(r.entries.is_empty(), "a widget's failure is not ours: {:?}", r.entries);
+        assert!(r.requests.is_empty(), "and it must not hold the window open");
+    }
+
+    #[test]
+    fn only_a_top_frame_commit_counts_as_activity() {
+        assert!(settle_activity(&json!({"method":"Page.frameNavigated",
+            "params":{"frame":{"id":"T"}}})));
+        assert!(!settle_activity(&json!({"method":"Page.frameNavigated",
+            "params":{"frame":{"id":"sub","parentId":"T"}}})));
     }
 
     #[test]

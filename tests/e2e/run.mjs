@@ -45,6 +45,13 @@ async function serveFrames() {
       res.end("server error");
       return;
     }
+    if (path === "/many") {
+      const buttons = Array.from({ length: 650 }, (_, i) =>
+        `<button style="width:4px;height:4px;padding:0;border:0" aria-label="b${i}"></button>`).join("");
+      res.writeHead(200, { "content-type": "text/html" });
+      res.end(`<!doctype html><meta charset="utf-8"><title>many</title><body style="margin:0;display:flex;flex-wrap:wrap;width:120px">${buttons}</body>`);
+      return;
+    }
     if (path === "/frame-top") {
       // A cross-origin frame that redirected away from the attribute's value.
       res.writeHead(200, { "content-type": "text/html" });
@@ -658,6 +665,31 @@ await withTab(`http://localhost:${fport}/download`, async (tab) => {
     try { unlinkSync(`${process.env.HOME}/Downloads/${n}`); } catch {}
   }
   rmSync(dir, { recursive: true, force: true });
+});
+
+// A page with more interactive nodes than the scanner collects by default.
+await withTab(`http://localhost:${fport}/many`, async (tab) => {
+  const def = (await s.tool("elements", { tab, limit: 120 })).v;
+  check("the default scan is honestly capped at 600",
+        def.capped === true && def.cap === 600 && def.total === 600,
+        { capped: def.capped, cap: def.cap, total: def.total, shown: def.shown });
+  const lifted = (await s.tool("elements", { tab, limit: 700 })).v;
+  check("a limit above 600 lifts the cap",
+        lifted.capped === false && lifted.cap === 700 && lifted.total === 650,
+        { capped: lifted.capped, cap: lifted.cap, total: lifted.total, shown: lifted.shown });
+});
+
+// An earlier navigation must not excuse a later action's clean failure.
+await withTab(`http://localhost:${fport}/xnav-src`, async (tab) => {
+  const els = (await s.tool("elements", { tab, limit: 20 })).v.elements || [];
+  const good = els.find(e => (e.label || "").trim() === "Good");
+  const mixed = await s.tool("input", {
+    tab, settleMs: 2000,
+    actions: [{ click: { i: good?.i } }, { click: { i: 999 } }],
+  });
+  check("a later failing action after a navigation is an error, not a note",
+        !mixed.ok && /no element with index 999/.test(String(mixed.v)),
+        String(mixed.v).slice(0, 180));
 });
 
 // A cross-origin frame that redirected away from its src, with the top page

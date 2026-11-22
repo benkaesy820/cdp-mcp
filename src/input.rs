@@ -31,20 +31,23 @@ pub(crate) fn irreversible(label: &str) -> bool {
 }
 
 /// Refuse a second click on the same final confirmation in one run, unless the
-/// caller forced it. One place, because the frame path and the page path must
-/// not drift: a frame click that skipped this would be a way around it.
-pub(crate) fn guard_irreversible(tab: &str, label: &str, i: u64, force: bool) -> Result<(), String> {
+/// caller forced it. Checking and recording are separate: a refused or failed
+/// dispatch must not consume the guard for a later, real click.
+pub(crate) fn check_irreversible(tab: &str, label: &str, i: u64, force: bool) -> Result<(), String> {
     let key = format!("{tab}|{label}|{i}");
-    let already = guard().lock().unwrap().contains(&key);
-    if already && !force {
+    if guard().lock().unwrap().contains(&key) && !force {
         return Err(format!(
             "'{label}' was already clicked in this run. \
              Verify the result with elements {{ mode: \"delta\" }} first; \
              pass input {{ force: true }} only if you mean to do it twice."
         ));
     }
-    guard().lock().unwrap().insert(key);
     Ok(())
+}
+
+/// Record a final confirmation only once its dispatch landed.
+pub(crate) fn record_irreversible(tab: &str, label: &str, i: u64) {
+    guard().lock().unwrap().insert(format!("{tab}|{label}|{i}"));
 }
 
 /// The refusal a blocked indexed click reports. One shape for the page and the
@@ -304,6 +307,15 @@ pub(crate) fn select_values(v: Option<&Value>) -> Result<Value, String> {
     }
 }
 
+/// A failure that is about the request, not about a document going away.
+fn clean_failure(e: &str) -> bool {
+    e.starts_with("no element with index")
+        || e.starts_with("wait:")
+        || e.starts_with("select failed:")
+        || e.starts_with("upload:")
+        || e.contains("\"blocked\":true")
+}
+
 /// Compare what the page selected against what was asked for, and shape the log
 /// entry. Shared by the page path and the frame path so their answers cannot
 /// drift.
@@ -336,6 +348,9 @@ pub(crate) fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], forc
     let mut log = Vec::new();
     for a in actions {
         check_cancel()?;
+        // The failing action's own navigation is what a swallow may excuse; reset
+        // so an earlier action cannot cover for a later failure.
+        conn.contexts_cleared = false;
         let obj = a.as_object().ok_or("each action must be an object")?;
         if let Some(d) = obj.get("dialog") {
             // The one action allowed while the renderer is blocked. One answer
@@ -369,6 +384,7 @@ pub(crate) fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], forc
                 // coordinates, so the event has to be sent to its session.
                 if let Some(target) = frame_target(conn, tab, scope, i, force)? {
                     let (lx, ly) = (target.0, target.1);
+                    let label = target.3.clone();
                     let clicked = if button != "left" || count > 1 || mods != 0 {
                         frame_click(conn, &target.2, lx, ly, &button, count, mods as u32)
                     } else {
@@ -379,10 +395,16 @@ pub(crate) fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], forc
                     // of an error, and mark the entry as unsettled.
                     if let Err(e) = clicked {
                         if conn.dialog.is_some() {
+                            if irreversible(&label) {
+                                record_irreversible(tab, &label, i);
+                            }
                             log.push(json!({ "clicked": { "i": i, "inFrame": true, "x": lx, "y": ly, "dialog": true } }));
                             return Ok(json!(log));
                         }
                         return Err(e);
+                    }
+                    if irreversible(&label) {
+                        record_irreversible(tab, &label, i);
                     }
                     log.push(json!({ "clicked": { "i": i, "inFrame": true, "x": lx, "y": ly } }));
                     continue;
@@ -416,10 +438,10 @@ pub(crate) fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], forc
                         ));
                     }
                 }
-                if let Some(label) = at.get("label").and_then(Value::as_str) {
-                    if irreversible(label) {
-                        guard_irreversible(tab, label, i, force)?;
-                    }
+                let guard_label = at.get("label").and_then(Value::as_str)
+                    .filter(|label| irreversible(label)).map(str::to_string);
+                if let Some(label) = &guard_label {
+                    check_irreversible(tab, label, i, force)?;
                 }
                 let x = at.get("x").and_then(Value::as_f64).unwrap_or(0.0);
                 let y = at.get("y").and_then(Value::as_f64).unwrap_or(0.0);
@@ -430,10 +452,16 @@ pub(crate) fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], forc
                 };
                 if let Err(e) = clicked {
                     if conn.dialog.is_some() {
+                        if let Some(label) = &guard_label {
+                            record_irreversible(tab, label, i);
+                        }
                         log.push(json!({ "clicked": { "i": i, "dialog": true } }));
                         return Ok(json!(log));
                     }
                     return Err(e);
+                }
+                if let Some(label) = &guard_label {
+                    record_irreversible(tab, label, i);
                 }
                 log.push(json!({ "clicked": click_log(&at) }));
             } else {
@@ -502,7 +530,7 @@ pub(crate) fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], forc
             let prefer = d.get("prefer").and_then(Value::as_str).unwrap_or("reject").to_lowercase();
             // Closer indexes come from a whole-document scan, so they are
             // clicked in that same (unscoped) scan below.
-            let scan_v = conn.eval(&scan_js(None))?;
+            let scan_v = conn.eval(&scan_js(None, 600))?;
             let overlays = scan_v.get("overlays").and_then(Value::as_array).cloned().unwrap_or_default();
             let mut cands: Vec<(String, i64)> = Vec::new();
             for o in &overlays {
@@ -643,6 +671,9 @@ pub(crate) fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], forc
         } else {
             return Err(format!("unknown action: {a}"));
         }
+        if conn.contexts_cleared {
+            conn.nav_batch = true;
+        }
     }
     Ok(json!(log))
 }
@@ -684,6 +715,7 @@ fn run_batch_inner(
     managed: Option<&std::path::Path>,
 ) -> Result<Value, String> {
     let scope = scope_for(tab_id);
+    conn.nav_batch = false;
     let mut navigated = false;
     let mut opened_tab: Option<Value> = None;
     let mut note: Option<String> = None;
@@ -712,6 +744,7 @@ fn run_batch_inner(
         let on = !url.is_empty() && conn.begin_receipts(&url, tab_id).is_ok();
         conn.contexts_cleared = false;
         let result = run_input(conn, tab_id, actions, force, scope.as_deref());
+        let nav_failed = conn.contexts_cleared;
         let outcome = if on {
             if result.is_err() {
                 // Nothing was dispatched cleanly; do not make the caller wait
@@ -723,7 +756,7 @@ fn run_batch_inner(
         } else {
             cdp::ReceiptOutcome::default()
         };
-        navigated = conn.contexts_cleared;
+        navigated = conn.nav_batch || conn.contexts_cleared;
         opened_tab = outcome.opened_tab;
         let downloads = outcome.downloads;
         let errors = outcome.entries;
@@ -735,8 +768,10 @@ fn run_batch_inner(
                 note = Some(format!("{e} — a dialog is open"));
                 json!([])
             }
-            // A click that navigated can fail on the trailing synthetic event.
-            Err(e) if navigated => {
+            // A click that navigated can fail on the trailing synthetic event,
+            // and that is an outcome. A refusal or a bad index is not: it is the
+            // caller's mistake and must not hide behind an earlier navigation.
+            Err(e) if nav_failed && !clean_failure(&e) => {
                 note = Some(e);
                 json!([])
             }
@@ -929,6 +964,29 @@ mod tests {
         assert_eq!(key_spec("space").1, "Space");
         // punctuation types itself even without a physical code
         assert_eq!(key_spec("/").3, Some("/".into()));
+    }
+
+    #[test]
+    fn request_mistakes_are_not_navigation_artifacts() {
+        assert!(clean_failure("no element with index 999 (3 found); call elements again"));
+        assert!(clean_failure("wait: text not found within 300ms: nope"));
+        assert!(clean_failure("select failed: the <select> has no option \"z\""));
+        assert!(clean_failure("{\"blocked\":true,\"reason\":\"obscured\"}"));
+        assert!(!clean_failure("Object reference chain is too long"));
+        assert!(!clean_failure("the page closed the connection"));
+    }
+
+    #[test]
+    fn checking_the_guard_without_recording_it_leaves_a_retry_possible() {
+        let tab = format!("tab-{}", std::process::id());
+        check_irreversible(&tab, "Publish", 7, false).unwrap();
+        // Not recorded, so a second check still passes (a failed dispatch must not
+        // consume the guard).
+        check_irreversible(&tab, "Publish", 7, false).unwrap();
+        record_irreversible(&tab, "Publish", 7);
+        assert!(check_irreversible(&tab, "Publish", 7, false).is_err());
+        // force still lifts it.
+        check_irreversible(&tab, "Publish", 7, true).unwrap();
     }
 
     #[test]

@@ -9,7 +9,7 @@
 use serde_json::{json, Value};
 
 use crate::cdp;
-use crate::input::{blocked_click, guard_irreversible, irreversible};
+use crate::input::{blocked_click, check_irreversible, irreversible};
 use crate::shot::{capture_guarded, parse_region};
 use crate::{b64encode, clip_str, nonempty_scope, scan_cache, scope_cache, with_conn, Cfg};
 
@@ -70,7 +70,10 @@ pub const SCAN_JS: &str = r#"(() => {
     const r = el.getBoundingClientRect();
     return fb.x || fb.y ? new DOMRect(r.x + fb.x, r.y + fb.y, r.width, r.height) : r;
   };
-  const full = () => elements.length >= 600 || (PICK && elements.length > PICK.i);
+  const CAP = __CAP__;
+  let capped = false;
+  // A pick only has to see as far as its index; a scan stops at the cap.
+  const full = () => elements.length >= (PICK ? Math.min(PICK.i + 1, 2000) : CAP);
 
   // Light DOM first, then open shadow roots (web components keep their
   // buttons there), then same-origin frames. querySelectorAll stops at both
@@ -78,14 +81,13 @@ pub const SCAN_JS: &str = r#"(() => {
   // index means the same element on every scan of the same page state.
   const collect = (node, chain, frameLabel) => {
     const fb = frameBox(chain);
-    for (const el of node.querySelectorAll(sel)) {
-      if (full()) return;
-      const r = placed(el, fb);
-      if (!shown(el, r)) continue;
-      const b = boxOf(r);
-      const key = b.x + ',' + b.y + ',' + b.w;
-      if (seen.has(key)) continue;
-      seen.add(key);
+      for (const el of node.querySelectorAll(sel)) {
+        const r = placed(el, fb);
+        if (!shown(el, r)) continue;
+        const b = boxOf(r);
+        const key = b.x + ',' + b.y + ',' + b.w;
+        if (seen.has(key)) continue;
+        seen.add(key);
       const rec = { i: elements.length, tag: el.tagName.toLowerCase(), label: labelOf(el) };
       // Effective role, derived when the element does not carry one: a plain
       // <a href> *is* a link, and filtering by role would miss every one of them.
@@ -141,6 +143,9 @@ pub const SCAN_JS: &str = r#"(() => {
       // off-screen (or outside its frame's visible area): needs scrolling
       // before a coordinate click will land
       if (r.top < fb.T - 4 || r.bottom > fb.B + 4) rec.off = true;
+      // Checked after visibility and dedupe, so `capped` means a real matching
+      // element was left out.
+      if (full()) { capped = true; return; }
       elements.push(rec);
       refs.push(el);
       chains.push(chain);
@@ -361,6 +366,7 @@ pub const SCAN_JS: &str = r#"(() => {
     ready: document.readyState,
     overlays,
     elements,
+    capped,
   };
 })()"#;
 
@@ -397,6 +403,7 @@ pub const FRAME_ELEMENTS_JS: &str = r#"(() => {
   const out = [];
   const nodes = [];
   const seen = new Set();
+  let capped = false;
   // Same order and cap as SCAN_JS. The label decides the irreversible-click
   // guard, so a frame must not name a button differently from the page.
   const labelOf = (el) => String(
@@ -543,16 +550,18 @@ pub const FRAME_ELEMENTS_JS: &str = r#"(() => {
     }
     return JSON.stringify(rec);
   }
-  return JSON.stringify({ elements: out, title: document.title.slice(0, 80), url: location.href.slice(0, 200) });
+  return JSON.stringify({ elements: out, capped, title: document.title.slice(0, 80), url: location.href.slice(0, 200) });
 })()"#;
 
 /// SCAN_JS with its scope placeholder substituted (None = whole document).
-pub(crate) fn scan_js(scope: Option<&str>) -> String {
+pub(crate) fn scan_js(scope: Option<&str>, cap: u64) -> String {
     let lit = match scope {
         Some(s) => serde_json::to_string(s).unwrap_or_else(|_| "null".into()),
         None => "null".into(),
     };
-    SCAN_JS.replace("__SCOPE__", &lit).replace("__PICK__", "null")
+    SCAN_JS.replace("__SCOPE__", &lit)
+        .replace("__PICK__", "null")
+        .replace("__CAP__", &cap.to_string())
 }
 
 /// Resolve element `i` (in `scope`) inside the page, scroll it into view if
@@ -567,7 +576,9 @@ pub(crate) fn pick(conn: &mut cdp::Conn, scope: Option<&str>, i: u64, scroll: bo
     if let Some(v) = select {
         p["select"] = json!(v);
     }
-    let js = SCAN_JS.replace("__SCOPE__", &lit).replace("__PICK__", &p.to_string());
+    let js = SCAN_JS.replace("__SCOPE__", &lit)
+        .replace("__PICK__", &p.to_string())
+        .replace("__CAP__", &i.saturating_add(1).min(2000).to_string());
     let v = conn.eval(&js)?;
     if v.get("missing").and_then(Value::as_bool) == Some(true) {
         let total = v.get("total").and_then(Value::as_u64).unwrap_or(0);
@@ -631,8 +642,8 @@ fn frame_box(conn: &mut cdp::Conn, target: &str) -> Option<(f64, f64, f64, f64)>
 /// scoped scan is the exception: a CSS selector cannot reach into a frame.
 /// Coordinates are translated into the embedding page's viewport, which is the
 /// space a click is dispatched in.
-pub(crate) fn scan_with_frames(conn: &mut cdp::Conn, scope: Option<&str>) -> Result<Value, String> {
-    let mut scan_v = conn.eval(&scan_js(scope))?;
+pub(crate) fn scan_with_frames(conn: &mut cdp::Conn, scope: Option<&str>, cap: u64) -> Result<Value, String> {
+    let mut scan_v = conn.eval(&scan_js(scope, cap))?;
     // A CSS selector can only match this document. Frame elements appended to a
     // scoped scan would be indexes the caller never asked for, in a list it
     // believes is scoped.
@@ -648,6 +659,7 @@ pub(crate) fn scan_with_frames(conn: &mut cdp::Conn, scope: Option<&str>) -> Res
     }
     let mut elements = scan_v.get("elements").and_then(Value::as_array).cloned().unwrap_or_default();
     let mut added = 0u64;
+    let mut frame_capped = false;
     for (target, session, url) in frames {
         // Read the frame's own document, then find where its box sits in the
         // parent so local coordinates can be made absolute.
@@ -658,6 +670,9 @@ pub(crate) fn scan_with_frames(conn: &mut cdp::Conn, scope: Option<&str>) -> Res
             Ok(v) => v,
             Err(_) => continue, // sandboxed, detached, or no document yet
         };
+        if body.get("capped").and_then(Value::as_bool) == Some(true) {
+            frame_capped = true;
+        }
         let kids = body.get("elements").and_then(Value::as_array).cloned().unwrap_or_default();
         if kids.is_empty() {
             continue;
@@ -721,6 +736,9 @@ pub(crate) fn scan_with_frames(conn: &mut cdp::Conn, scope: Option<&str>) -> Res
         if let Some(o) = scan_v.as_object_mut() {
             o.insert("elements".into(), Value::Array(elements));
             o.insert("framesScanned".into(), json!(added));
+            if frame_capped {
+                o.insert("capped".into(), json!(true));
+            }
         }
     }
     Ok(scan_v)
@@ -803,13 +821,14 @@ pub(crate) fn frame_pick(
 /// Resolve a frame click through `frame_pick`: the refusals come from the live
 /// state, not from coordinates that may be stale, and the irreversible guard
 /// runs on the live label.
+/// Returns the label too, so the caller records the guard only after dispatch.
 pub(crate) fn frame_target(
     conn: &mut cdp::Conn,
     tab: &str,
     scope: Option<&str>,
     i: u64,
     force: bool,
-) -> Result<Option<(f64, f64, String)>, String> {
+) -> Result<Option<(f64, f64, String, String)>, String> {
     // A scoped click indexes the scoped list, which holds no frame elements: a
     // CSS selector cannot reach into a child document.
     if scope.is_some() {
@@ -838,15 +857,14 @@ pub(crate) fn frame_target(
         });
         return Err(blocked_click("obscured", i, tag, label, obscured, true));
     }
-    if let Some(text) = label.as_str() {
-        if irreversible(text) {
-            guard_irreversible(tab, text, i, force)?;
-        }
+    let text = label.as_str().unwrap_or("").to_string();
+    if !text.is_empty() && irreversible(&text) {
+        check_irreversible(tab, &text, i, force)?;
     }
     let x = el.get("lx").and_then(Value::as_f64).unwrap_or(0.0);
     let y = el.get("ly").and_then(Value::as_f64).unwrap_or(0.0);
     let session = el.get("session").and_then(Value::as_str).unwrap_or_default().to_string();
-    Ok(Some((x, y, session)))
+    Ok(Some((x, y, session, text)))
 }
 
 /// The same three events the page path sends, dispatched inside a frame session.
@@ -900,6 +918,8 @@ pub(crate) fn elements(cfg: &Cfg, args: &Value) -> Result<Value, String> {
     let tab = args.get("tab").and_then(Value::as_str);
     let find = args.get("find").and_then(Value::as_str).map(|s| s.to_lowercase());
     let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(120) as usize;
+    // The scan collects at most `cap` elements; `limit` above 600 lifts it.
+    let cap = if limit > 600 { limit.min(2000) as u64 } else { 600 };
     let full = args.get("full").and_then(Value::as_bool).unwrap_or(false);
     let mode = args.get("mode").and_then(Value::as_str).unwrap_or("full").to_string();
     let unique = args.get("unique").and_then(Value::as_bool).unwrap_or(false);
@@ -915,7 +935,7 @@ pub(crate) fn elements(cfg: &Cfg, args: &Value) -> Result<Value, String> {
         Some(_) => return Err("within must be a CSS selector; integer within is not implemented yet".into()),
     };
     with_conn(&cfg.endpoint, tab, |conn, tab_id| {
-        let mut scan_v = scan_with_frames(conn, within.as_deref())?;
+        let mut scan_v = scan_with_frames(conn, within.as_deref(), cap)?;
         // Kept with the cache entry, so a delta knows whether its
         // baseline came from the same scope as this scan.
         if let Some(o) = scan_v.as_object_mut() {
@@ -1019,6 +1039,10 @@ pub(crate) fn elements(cfg: &Cfg, args: &Value) -> Result<Value, String> {
             "total": total,
             "shown": shown.len(),
             "truncated": shown.len() < total,
+            // The scanner stopped at its cap with matching elements left over;
+            // `limit` above 600 lifts it.
+            "capped": scan_v.get("capped").and_then(Value::as_bool).unwrap_or(false),
+            "cap": cap,
             // How many of these came from inside a cross-origin frame.
             // Absent would read as "none", which is a lie when it is
             // non-zero, so it is always present.
@@ -1160,10 +1184,13 @@ mod moved_tests {
     #[test]
     fn scan_placeholders_are_always_substituted() {
         // An unsubstituted placeholder is a ReferenceError in the page.
-        for js in [scan_js(None), scan_js(Some("main"))] {
+        for js in [scan_js(None, 600), scan_js(Some("main"), 600)] {
             assert!(!js.contains("__SCOPE__") && !js.contains("__PICK__"));
         }
-        assert!(scan_js(Some("main")).contains(r#"const SCOPE = "main";"#));
+        assert!(scan_js(Some("main"), 600).contains(r#"const SCOPE = "main";"#));
+        assert!(scan_js(None, 600).contains("const CAP = 600;"));
+        assert!(scan_js(None, 2000).contains("const CAP = 2000;"));
+        assert!(!scan_js(None, 600).contains("__CAP__"));
     }
 
 }
