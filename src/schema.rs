@@ -110,7 +110,7 @@ pub(crate) fn tool_defs() -> Value {
         },
         {
             "name": "eval",
-            "description": "Evaluate a JavaScript expression in the tab and return its value as JSON. Await promises. Omit `tab` for the first page tab.",
+            "description": "Evaluate a JavaScript expression in the tab and return its value as JSON. Await promises. Omit `tab` for the tab the last call used (the first page tab when there is none).",
             "inputSchema": {
                 "type": "object",
                 "properties": { "expression": { "type": "string" }, "tab": { "type": "string" } },
@@ -130,7 +130,7 @@ pub(crate) fn tool_defs() -> Value {
                     "mode": { "type": "string", "enum": ["full", "viewport", "delta"],
                               "description": "full = everything; viewport = only what is on screen; delta = only what changed since the previous scan (use after a click)" },
                     "shot": { "type": "string", "enum": ["none", "viewport", "full", "custom"],
-                              "description": "also return a PNG in this same result: viewport = what you see, full = whole page (height-capped), custom = region {x,y,w,h}" },
+                              "description": "also return a capture in this same result (format from shotFormat): viewport = what you see, full = whole page (height-capped), custom = region {x,y,w,h}" },
                     "region": { "type": "object", "description": "for shot=custom: {x,y,w,h} in CSS pixels",
                                 "properties": { "x": {"type":"number"}, "y": {"type":"number"}, "w": {"type":"number"}, "h": {"type":"number"} } },
                     "shotMaxWidth": { "type": "integer", "description": "downscale the attached capture to this width (default 1024)" },

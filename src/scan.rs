@@ -244,8 +244,6 @@ pub const SCAN_JS: &str = r#"(() => {
         }
         out.blocker = b;
     }
-    const a = el.closest('a[href]') || el.querySelector('a[href]');
-    if (a) out.href = a.href;
     if (PICK.select !== undefined) {
       const s = el.tagName === 'SELECT' ? el : el.closest('select');
       if (!s) { out.selectError = 'not a select'; }

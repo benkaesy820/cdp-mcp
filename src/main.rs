@@ -369,9 +369,10 @@ fn help() -> String {
     format!(
         "cdp-mcp {VERSION}\n\
          A tiny MCP server that drives your own Chromium browser over DevTools.\n\n\
-         USAGE:\n  cdp-mcp [--cdp URL] [--allow-remote]\n\n\
+         USAGE:\n  cdp-mcp [--cdp URL] [--profile NAME] [--allow-remote]\n\n\
          OPTIONS:\n\
          \x20 --cdp URL        DevTools endpoint (default {DEFAULT_ENDPOINT})\n\
+         \x20 --profile NAME   settings file to read (default \"default\")\n\
          \x20 --allow-remote   permit a non-loopback endpoint (experimental builds only; CDP has no auth)\n\
          \x20 -h, --help       print this\n\
          \x20 -V, --version    print the version\n\n\
@@ -929,7 +930,7 @@ pub(crate) fn b64decode(s: &str) -> Result<Vec<u8>, String> {
         }
         let v = table[c as usize];
         if v == 255 {
-            return Err("invalid base64 in screenshot".into());
+            return Err("invalid base64 in a binary payload".into());
         }
         buf = (buf << 6) | v as u32;
         bits += 6;
