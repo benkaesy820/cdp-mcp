@@ -758,8 +758,9 @@ await withTab(`http://localhost:${fport}/tall`, async (tab) => {
         { element: two?.element, png: p2, dpr });
 
   const miss = await s.tool("shot", { tab, i: 999, path: at });
-  check("an element shot at a missing index fails cleanly",
-        !miss.ok && /no element with index 999/.test(String(miss.v)), String(miss.v).slice(0, 140));
+  check("an element shot at a missing index fails cleanly and fast",
+        !miss.ok && /no element with index 999/.test(String(miss.v)) && miss.ms < 500,
+        { ms: miss.ms, v: String(miss.v).slice(0, 140) });
 
   const both = await s.tool("shot", { tab, i: 0, region: { x: 0, y: 0, w: 10, h: 10 }, path: at });
   check("i and region cannot be combined",

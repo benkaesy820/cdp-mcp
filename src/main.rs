@@ -1343,6 +1343,14 @@ fn capture_png(
     Ok((b64decode(b64)?, clipped, mime))
 }
 
+/// The capture box for an element, widened by padding but never past the
+/// document origin: CDP rejects a clip that starts before (0, 0).
+fn padded_box(x: f64, y: f64, w: f64, h: f64, padding: f64) -> (f64, f64, f64, f64) {
+    let px = (x - padding).max(0.0);
+    let py = (y - padding).max(0.0);
+    (px, py, (x + w + padding) - px, (y + h + padding) - py)
+}
+
 fn parse_region(v: Option<&Value>) -> Option<(f64, f64, f64, f64)> {
     let r = v?;
     Some((r.get("x")?.as_f64()?, r.get("y")?.as_f64()?, r.get("w")?.as_f64()?, r.get("h")?.as_f64()?))
@@ -3136,6 +3144,38 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                 return Err("shot: i cannot be combined with mode \"full\"".into());
             }
             with_conn(&cfg.endpoint, tab, |conn, tab_id| {
+                // Resolve an element before anything is woken or borrowed: a
+                // missing, detached or zero-size index must not leave a live
+                // screencast and focus emulation behind, or spend 800 ms waking
+                // the compositor just to fail.
+                let (effective_mode, region, element) = match index {
+                    Some(i) => {
+                        let scope = if within_given { within.clone() } else { scope_for(tab_id) };
+                        let at = pick(conn, scope.as_deref(), i, true, None)?;
+                        if at.get("connected").and_then(Value::as_bool) == Some(false) {
+                            return Err(format!("shot: element {i} is detached; call elements again"));
+                        }
+                        let rect = at
+                            .get("rect")
+                            .ok_or_else(|| format!("shot: the page did not report bounds for element {i}"))?;
+                        let (x, y, w, h) = (
+                            rect.get("x").and_then(Value::as_f64).unwrap_or(0.0),
+                            rect.get("y").and_then(Value::as_f64).unwrap_or(0.0),
+                            rect.get("w").and_then(Value::as_f64).unwrap_or(0.0),
+                            rect.get("h").and_then(Value::as_f64).unwrap_or(0.0),
+                        );
+                        if w < 1.0 || h < 1.0 {
+                            return Err(format!("shot: element {i} has no visible box to capture"));
+                        }
+                        let (px, py, pw, ph) = padded_box(x, y, w, h, padding);
+                        let element = json!({
+                            "i": i, "tag": at.get("tag"), "label": at.get("label"),
+                            "x": px.round(), "y": py.round(), "w": pw.round(), "h": ph.round(),
+                        });
+                        ("custom".to_string(), Some((px, py, pw, ph)), Some(element))
+                    }
+                    None => (mode.clone(), region, None),
+                };
                 // Someone else's tab: let it render just long enough to be
                 // captured, then hand its normal behaviour back.
                 let borrowed = !cdp::is_owned(tab_id);
@@ -3160,39 +3200,7 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                          screenshot — every other tool works without it. ({why})"
                     ));
                 }
-                let (shot, element) = match index {
-                    Some(i) => {
-                        let scope = if within_given { within.clone() } else { scope_for(tab_id) };
-                        let at = pick(conn, scope.as_deref(), i, true, None)?;
-                        if at.get("connected").and_then(Value::as_bool) == Some(false) {
-                            return Err(format!("shot: element {i} is detached; call elements again"));
-                        }
-                        let rect = at
-                            .get("rect")
-                            .ok_or_else(|| format!("shot: the page did not report bounds for element {i}"))?;
-                        let (x, y, w, h) = (
-                            rect.get("x").and_then(Value::as_f64).unwrap_or(0.0),
-                            rect.get("y").and_then(Value::as_f64).unwrap_or(0.0),
-                            rect.get("w").and_then(Value::as_f64).unwrap_or(0.0),
-                            rect.get("h").and_then(Value::as_f64).unwrap_or(0.0),
-                        );
-                        if w < 1.0 || h < 1.0 {
-                            return Err(format!("shot: element {i} has no visible box to capture"));
-                        }
-                        // Widen by padding, but never past the document's origin:
-                        // a negative clip start is rejected by CDP.
-                        let px = (x - padding).max(0.0);
-                        let py = (y - padding).max(0.0);
-                        let pw = (x + w + padding) - px;
-                        let ph = (y + h + padding) - py;
-                        let element = json!({
-                            "i": i, "tag": at.get("tag"), "label": at.get("label"),
-                            "x": px.round(), "y": py.round(), "w": pw.round(), "h": ph.round(),
-                        });
-                        (capture_png(conn, "custom", Some((px, py, pw, ph)), None, &fmt, quality), Some(element))
-                    }
-                    None => (capture_png(conn, &mode, region, None, &fmt, quality), None),
-                };
+                let shot = capture_png(conn, &effective_mode, region, None, &fmt, quality);
                 conn.stop_frames();
                 if borrowed {
                     let _ = conn.set_focus_emulation(false);
@@ -3201,7 +3209,9 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                 std::fs::write(&path, &bytes).map_err(|e| format!("cannot write {path}: {e}"))?;
                 let mut out = json!({
                     "tab": tab_id, "path": path, "bytes": bytes.len(),
-                    "mode": if index.is_some() { "element" } else { mode.as_str() },
+                    // The CDP mode is "custom" for an element; the caller is
+                    // told what it actually captured.
+                    "mode": if index.is_some() { "element" } else { effective_mode.as_str() },
                     "format": fmt, "clipped": clipped,
                 });
                 if let Some(el) = element {
@@ -3572,6 +3582,13 @@ mod tests {
             _ => None,
         };
         assert_eq!(config_dir_for(Os::Linux, &get), std::path::PathBuf::from("/home/ben/.config/cdp-mcp"));
+    }
+
+    #[test]
+    fn element_padding_widens_without_crossing_the_origin() {
+        assert_eq!(padded_box(100.0, 200.0, 160.0, 40.0, 20.0), (80.0, 180.0, 200.0, 80.0));
+        assert_eq!(padded_box(10.0, 5.0, 160.0, 40.0, 20.0), (0.0, 0.0, 190.0, 65.0));
+        assert_eq!(padded_box(0.0, 0.0, 160.0, 40.0, 0.0), (0.0, 0.0, 160.0, 40.0));
     }
 
     #[test]

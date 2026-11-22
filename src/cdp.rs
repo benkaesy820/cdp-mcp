@@ -552,7 +552,6 @@ pub fn close_tab(endpoint: &str, id: &str) -> Res<bool> {
     Ok(closed)
 }
 
-/// An open DevTools connection to one page.
 /// The emulated media overrides active on this connection.
 /// `Emulation.setEmulatedMedia` replaces the whole feature list, so the state
 /// has to be kept here for the next call to merge into instead of wiping.
@@ -562,6 +561,7 @@ pub struct MediaState {
     pub features: Vec<(String, String)>,
 }
 
+/// An open DevTools connection to one page.
 pub struct Conn {
     ws: WebSocket<TcpStream>,
     next: i64,
