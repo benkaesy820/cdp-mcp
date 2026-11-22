@@ -661,6 +661,10 @@ pub(crate) fn scan_with_frames(conn: &mut cdp::Conn, scope: Option<&str>, cap: u
     let mut added = 0u64;
     let mut frame_capped = false;
     for (target, session, url) in frames {
+        if elements.len() >= cap as usize {
+            frame_capped = true;
+            break;
+        }
         // Read the frame's own document, then find where its box sits in the
         // parent so local coordinates can be made absolute.
         // The frame returns a JSON string: one value in, one value out, and no

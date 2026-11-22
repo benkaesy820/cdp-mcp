@@ -596,6 +596,13 @@ pub fn close_tab(endpoint: &str, id: &str) -> Res<bool> {
     // answer is exact and no event stream is left behind.
     browser_call(endpoint, "Target.setDiscoverTargets", json!({ "discover": true }))?;
     let closed = match browser_call(endpoint, "Target.closeTarget", json!({ "targetId": id })) {
+        // Some Chromium versions answer `{"success": false}` for an unknown id
+        // instead of an error; that is a refusal, and waiting for a destroy
+        // event would sit out the whole deadline for nothing.
+        Ok(res) if res.get("success").and_then(Value::as_bool) == Some(false) => {
+            let _ = browser_call(endpoint, "Target.setDiscoverTargets", json!({ "discover": false }));
+            return Ok(false);
+        }
         Ok(_) => {
             let mut slot = BROWSER.lock().map_err(|_| "browser connection lock poisoned")?;
             match slot.as_mut() {
@@ -1079,7 +1086,12 @@ impl Conn {
             if self.dialog.is_some() {
                 break;
             }
-            let Ok(p) = self.wait_event("Page.screencastFrame", 1_500) else {
+            // The long budget is for "does anything render at all". Once a frame
+            // has arrived the pipeline is alive, and a static page sends no
+            // further frames: waiting 1.5 s for each of two more cost every
+            // capture on a still page that much (measured 1.58 s total).
+            let budget = if got == 0 { 1_500 } else { 250 };
+            let Ok(p) = self.wait_event("Page.screencastFrame", budget) else {
                 if self.dead {
                     return Err("connection to the page lost while waiting for a frame".into());
                 }

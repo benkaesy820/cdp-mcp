@@ -824,15 +824,21 @@ fn run_batch_inner(
     };
     // Post-action evals would sit behind a dialog; the browser-process URL works.
     let blocked_after = conn.dialog.is_some();
+    // The overlays and the URL in one evaluation: both are wanted together, and a
+    // second round trip for `location.href` bought nothing.
     let (overlays, mut url) = if announce && !blocked_after {
-        // cheap post-action check: only what appeared because we acted
-        let ov = conn.eval(scan::OVERLAYS_QUICK_JS).unwrap_or(json!([]));
-        let u = conn.eval("location.href").unwrap_or(Value::Null);
-        (ov, u)
+        match conn.eval(&format!("[{}, location.href]", scan::OVERLAYS_QUICK_JS)) {
+            Ok(v) => (
+                v.get(0).cloned().unwrap_or(json!([])),
+                v.get(1).cloned().unwrap_or(Value::Null),
+            ),
+            // The action already happened; a failed look at it is not the result.
+            Err(_) => (json!([]), Value::Null),
+        }
     } else {
         (json!([]), Value::Null)
     };
-    if navigated && !blocked_after {
+    if navigated && !blocked_after && url.is_null() {
         if let Ok(u) = conn.eval("location.href") {
             if let Some(s) = u.as_str() {
                 url = json!(s);

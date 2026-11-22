@@ -76,9 +76,16 @@ pub(crate) fn navigate(
                 _ => None,
             };
             let Some(entry) = entry else {
-                // The ends of history are an answer, not a CDP error.
+                // The ends of history are an answer, not a CDP error. The URL is
+                // in the history list already; asking the browser for it again
+                // would be one more round trip for a fact in hand.
+                let here = entries
+                    .get(idx as usize)
+                    .and_then(|e| e.get("url"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 return Ok(json!({
-                    "tab": tab, "moved": false, "url": current(conn),
+                    "tab": tab, "moved": false, "url": here.unwrap_or_else(|| current(conn)),
                     "note": "already at that end of the history",
                 }));
             };

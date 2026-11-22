@@ -205,14 +205,27 @@ fn viewport(conn: &mut Conn) -> Option<Value> {
 /// inside the protocol reply: an immediate read still sees the old size, which
 /// made `reset` look as though it had restored nothing. Wait for the change and
 /// then for it to hold still, bounded.
-fn settle_viewport(conn: &mut Conn, before: &Value) -> Result<(), String> {
+fn settle_viewport(
+    conn: &mut Conn,
+    before: &Value,
+    target: Option<&Value>,
+) -> Result<(), String> {
     let Some(mut last) = viewport(conn) else { return Ok(()) };
+    // The requested metrics already measured: the relayout is done.
+    if target == Some(&last) {
+        return Ok(());
+    }
     // Already different from the pre-call reading: the relayout happened before
     // the first look, so only stability is left to wait for.
     let mut changed = last != *before;
     for _ in 0..10 {
         crate::nap(30)?;
         let Some(now) = viewport(conn) else { return Ok(()) };
+        // The target is the answer; waiting for a second identical reading would
+        // cost another 30 ms and another round trip.
+        if target == Some(&now) {
+            return Ok(());
+        }
         if now != last {
             changed = true;
             last = now;
@@ -236,6 +249,9 @@ pub(crate) struct Emulated {
     /// Touch emulation is on. Tracked because disabling it only affects
     /// documents created afterwards: an existing page keeps `ontouchstart`.
     pub(crate) touch_on: bool,
+    /// A device-metrics override is applied. `reset` on a tab that never had one
+    /// has nothing to clear and nothing to settle.
+    pub(crate) metrics_on: bool,
 }
 
 /// Apply a call and report what is active, plus what the page itself measures.
@@ -251,6 +267,17 @@ pub(crate) fn run(
     } else {
         None
     };
+    // A metrics override whose values the page already has moves nothing, so
+    // there is no relayout to wait for: identical presets used to pay 11 reads
+    // and 300 ms of sleeps (measured 363 ms per call).
+    let target = plan.metrics.map(|m| {
+        json!([m.width, m.height, (m.scale * 100.0).round() as i64])
+    });
+    let relayout = match (&viewport_before, &target) {
+        (Some(before), Some(t)) => before != t,
+        (Some(_), None) => state.metrics_on,
+        _ => false,
+    };
     let mut applied = json!({ "tab": tab });
     // Touch events are bound when the document is created, so a change here only
     // reaches a page loaded afterwards. The caller is told rather than left to
@@ -264,13 +291,19 @@ pub(crate) fn run(
     };
 
     if plan.reset {
-        conn.call("Emulation.clearDeviceMetricsOverride", json!({}))?;
-        conn.call("Emulation.setTouchEmulationEnabled", touch_param(false))?;
-        conn.call("Emulation.setEmulatedMedia", json!({ "media": "", "features": [] }))?;
-        state.media = MediaState::default();
+        // Only send what is actually set: each skipped command is a round trip.
+        if state.metrics_on {
+            conn.call("Emulation.clearDeviceMetricsOverride", json!({}))?;
+            state.metrics_on = false;
+        }
         if state.touch_on {
+            conn.call("Emulation.setTouchEmulationEnabled", touch_param(false))?;
             touch_needs_reload = true;
         }
+        if state.media != MediaState::default() {
+            conn.call("Emulation.setEmulatedMedia", json!({ "media": "", "features": [] }))?;
+        }
+        state.media = MediaState::default();
         state.touch_on = false;
         scan_cache().lock().unwrap().remove(tab);
         applied["reset"] = json!(true);
@@ -289,6 +322,7 @@ pub(crate) fn run(
             touch_needs_reload = true;
         }
         state.touch_on = m.touch;
+        state.metrics_on = true;
         // Every coordinate and every `off` flag just moved; the scope did not.
         scan_cache().lock().unwrap().remove(tab);
         applied["viewport"] = json!({
@@ -320,8 +354,8 @@ pub(crate) fn run(
     }
 
     if let Some(b) = &viewport_before {
-        if conn.dialog.is_none() {
-            settle_viewport(conn, b)?;
+        if conn.dialog.is_none() && relayout {
+            settle_viewport(conn, b, target.as_ref())?;
         }
     }
 
