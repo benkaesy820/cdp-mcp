@@ -9,6 +9,7 @@
 import { server } from "./mcp.mjs";
 import { fileURLToPath } from "node:url";
 import { basename, dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const bin = process.argv[2] || join(here, "../../target/release/cdp-mcp");
@@ -501,7 +502,7 @@ await withTab(page("frames.html?port=" + fport), async (tabA) => {
 // (the page fetch refuses, but the page-cache fallback hands back the whole
 // resource).
 await withTab(`http://localhost:${fport}/imgs`, async (tab) => {
-  const out = join(here, "dl-e2e.bin");
+  const out = join(tmpdir(), "cdp-e2e-dl.bin");
   const pageBytes = readFileSync(join(here, "pages", "imgs.html"));
   try {
     const ok = await s.tool("download", { tab, url: "/imgs", path: out });
@@ -520,6 +521,8 @@ await withTab(`http://localhost:${fport}/imgs`, async (tab) => {
   }
 });
 
+// A flow's own tab must reach its steps: they used to run on whatever tab the
+// last call happened to touch.
 await withTab(`http://localhost:${fport}/receipts`, async (tabA) => {
   const tabB = (await s.tool("tabs", { action: "open", url: `http://localhost:${fport}/sprint2` })).v.tab;
   try {

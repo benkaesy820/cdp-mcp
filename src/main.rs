@@ -320,9 +320,6 @@ pub(crate) fn nap(ms: u64) -> Result<(), String> {
     }
 }
 
-/// The scope (`within`) of the last `elements` scan per tab. An index is only
-/// meaningful in the scan that produced it, so a click must resolve it in the
-/// same scope or it lands on a different element.
 /// Emulation state per tab. See the "emulate" arm: it is page state, not
 /// connection state, so it must not be lost when a socket dies.
 fn emu_cache() -> &'static Mutex<HashMap<String, emulate::Emulated>> {
@@ -330,6 +327,9 @@ fn emu_cache() -> &'static Mutex<HashMap<String, emulate::Emulated>> {
     EMU.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The scope (`within`) of the last `elements` scan per tab. An index is only
+/// meaningful in the scan that produced it, so a click must resolve it in the
+/// same scope or it lands on a different element.
 fn scope_cache() -> &'static Mutex<HashMap<String, Option<String>>> {
     static SCOPES: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
     SCOPES.get_or_init(|| Mutex::new(HashMap::new()))

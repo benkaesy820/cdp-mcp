@@ -335,8 +335,6 @@ fn click_upload(
                "files": plan.paths, "ok": true }))
 }
 
-
-
 pub(crate) fn paste(cfg: &Cfg, args: &Value) -> Result<Value, String> {
     let tab = args.get("tab").and_then(Value::as_str);
     let path = args.get("path").and_then(Value::as_str).map(str::to_string);
