@@ -90,6 +90,16 @@ pub(crate) fn download(cfg: &Cfg, args: &Value) -> Result<Value, String> {
             max = max_bytes
         );
         let v = conn.eval(&js)?;
+        // The limit is the caller's, so name it here instead of letting a page
+        // that reported `too large` fall through to the cache, which would only
+        // hand back the same oversized body.
+        if v.get("error").and_then(Value::as_str) == Some("too large") {
+            let size = v.get("size").and_then(Value::as_u64).unwrap_or(0);
+            return Err(format!(
+                "download refused: {size} bytes is over the {max_bytes}-byte limit; raise \
+                 maxBytes if that is intended"
+            ));
+        }
         // fetch() cannot read a cross-origin body (CORS), and page images
         // very often live on a CDN. Fall back to the resource the page
         // already loaded, which CDP will hand over regardless of origin.
@@ -116,6 +126,17 @@ pub(crate) fn download(cfg: &Cfg, args: &Value) -> Result<Value, String> {
             let b64 = v.get("b64").and_then(Value::as_str).ok_or("no data returned")?;
             b64decode(b64)?
         };
+        // The page-side fetch refuses an oversized body, but its reply only
+        // sends the fallback down the page-cache path, which hands back the
+        // whole resource. Enforce the limit on the bytes that are about to be
+        // written, whatever path produced them.
+        if bytes.len() as u64 > max_bytes {
+            return Err(format!(
+                "download refused: {} bytes is over the {max_bytes}-byte limit; raise maxBytes \
+                 if that is intended",
+                bytes.len()
+            ));
+        }
         std::fs::write(&path, &bytes).map_err(|e| format!("cannot write {path}: {e}"))?;
         Ok(json!({ "tab": tab_id, "path": path, "url": src, "bytes": bytes.len() }))
     })

@@ -15,6 +15,10 @@ use crate::{check_cancel, nap, scope_for};
 /// Irreversible actions already performed in this process.
 /// Keyed by tab + label + index: a retry loop is caught, a *different* post is
 /// not, and a same-labelled button on another tab is a different click.
+/// The longest a single action may park the tool: the same ceiling the idle
+/// tool's timeout uses. Anything larger is a caller mistake, not a wait.
+const MAX_WAIT_MS: u64 = 900_000;
+
 fn guard() -> &'static Mutex<HashSet<String>> {
     static DONE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     DONE.get_or_init(|| Mutex::new(HashSet::new()))
@@ -652,6 +656,9 @@ pub(crate) fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], forc
             log.push(json!({ "selected": entry }));
         } else if let Some(w) = obj.get("wait") {
             let ms = w.get("ms").and_then(Value::as_u64).unwrap_or(15_000);
+            if ms > MAX_WAIT_MS {
+                return Err(format!("wait ms must be at most {MAX_WAIT_MS}"));
+            }
             if w.get("idle").and_then(Value::as_bool).unwrap_or(false) {
                 let started = std::time::Instant::now();
                 let n = wait_idle(conn, ms, 300)?;
@@ -667,6 +674,9 @@ pub(crate) fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], forc
             log.push(json!({ "waitedFor": text, "ms": started.elapsed().as_millis() as u64 }));
         } else if let Some(s) = obj.get("sleep") {
             let ms = s.get("ms").and_then(Value::as_u64).unwrap_or(300);
+            if ms > MAX_WAIT_MS {
+                return Err(format!("sleep ms must be at most {MAX_WAIT_MS}"));
+            }
             nap(ms)?;
             log.push(json!({ "slept": ms }));
         } else {

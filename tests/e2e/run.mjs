@@ -496,6 +496,30 @@ await withTab(page("frames.html?port=" + fport), async (tabA) => {
   }
 });
 
+// `download` fetches inside the page, which is what makes a cookie-gated file
+// work, and the byte limit has to hold on every path that can produce the body
+// (the page fetch refuses, but the page-cache fallback hands back the whole
+// resource).
+await withTab(`http://localhost:${fport}/imgs`, async (tab) => {
+  const out = join(here, "dl-e2e.bin");
+  const pageBytes = readFileSync(join(here, "pages", "imgs.html"));
+  try {
+    const ok = await s.tool("download", { tab, url: "/imgs", path: out });
+    const got = readFileSync(out);
+    check("download saves the bytes the page fetched",
+          ok.ok && ok.v?.bytes === pageBytes.length && got.equals(pageBytes),
+          { v: ok.v, disk: got.length, want: pageBytes.length });
+    const big = await s.tool("download", { tab, url: "/imgs", path: out, maxBytes: 10 });
+    check("download refuses a body over maxBytes instead of writing it",
+          !big.ok && /over the 10-byte limit/.test(String(big.v)), big.v);
+    const long = await s.tool("input", { tab, actions: [{ sleep: { ms: 900001 } }] });
+    check("an action cannot park the tool past the wait cap",
+          !long.ok && /at most 900000/.test(String(long.v)), long.v);
+  } finally {
+    try { unlinkSync(out); } catch {}
+  }
+});
+
 await withTab(`http://localhost:${fport}/receipts`, async (tabA) => {
   const tabB = (await s.tool("tabs", { action: "open", url: `http://localhost:${fport}/sprint2` })).v.tab;
   try {
