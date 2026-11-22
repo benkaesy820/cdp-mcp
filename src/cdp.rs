@@ -50,6 +50,18 @@ pub struct ReceiptOutcome {
     pub downloads: Vec<Value>,
 }
 
+impl Receipts {
+    /// A download this settle is waiting on is still running.
+    fn download_active(&self) -> bool {
+        self.downloads.iter().any(|d| {
+            matches!(
+                d.get("status").and_then(Value::as_str),
+                Some("started") | Some("inProgress")
+            )
+        })
+    }
+}
+
 fn origin_of(url: &str) -> String {
     let url = url.trim();
     // A blob URL belongs to the origin inside it; about:/data: have none.
@@ -213,19 +225,54 @@ impl Receipts {
                     self.origin = moved;
                 }
             }
-            "Page.downloadWillBegin" => {
+            "Page.downloadWillBegin" | "Browser.downloadWillBegin" => {
                 // Never origin-filtered: a download routinely redirects to a
                 // CDN or a presigned URL on another origin.
                 let url = p.get("url").and_then(Value::as_str).unwrap_or("");
+                let guid = p.get("guid").and_then(Value::as_str).unwrap_or("");
                 if url.is_empty() || self.downloads.len() >= 5 {
+                    return;
+                }
+                // The two domains can both announce one download; the guid is the
+                // identity, not the event name.
+                if !guid.is_empty()
+                    && self
+                        .downloads
+                        .iter()
+                        .any(|d| d.get("guid").and_then(Value::as_str) == Some(guid))
+                {
                     return;
                 }
                 self.downloads.push(json!({
                     "status": "started",
                     "url": clip_event(url),
                     "filename": p.get("suggestedFilename").and_then(Value::as_str).unwrap_or(""),
-                    "guid": p.get("guid").and_then(Value::as_str).unwrap_or(""),
+                    "guid": guid,
                 }));
+            }
+            "Browser.downloadProgress" => {
+                let guid = p.get("guid").and_then(Value::as_str).unwrap_or("");
+                if guid.is_empty() {
+                    return;
+                }
+                let state = p.get("state").and_then(Value::as_str).unwrap_or("");
+                let received = p.get("receivedBytes").and_then(Value::as_u64).unwrap_or(0);
+                let total = p.get("totalBytes").and_then(Value::as_u64).unwrap_or(0);
+                if let Some(d) = self
+                    .downloads
+                    .iter_mut()
+                    .find(|d| d.get("guid").and_then(Value::as_str) == Some(guid))
+                {
+                    d["status"] = json!(state);
+                    d["bytes"] = json!(received);
+                    if total > 0 {
+                        d["totalBytes"] = json!(total);
+                    }
+                } else if state != "inProgress" && self.downloads.len() < 5 {
+                    self.downloads.push(json!({
+                        "status": state, "guid": guid, "bytes": received, "url": "", "filename": "",
+                    }));
+                }
             }
             "Target.targetCreated" => {
                 let info = p.get("targetInfo").unwrap_or(&Value::Null);
@@ -635,6 +682,9 @@ pub struct Conn {
     /// before the call returns, or a human click in that tab would stop opening
     /// their file picker.
     file_chooser_on: bool,
+    /// `Browser.setDownloadBehavior` is redirected to a folder. It must be
+    /// restored on every exit path: the human's own downloads use it too.
+    download_on: bool,
 }
 
 /// Events that mean the page is still doing something. `Page.*` is deliberately
@@ -652,6 +702,8 @@ fn settle_activity(v: &Value) -> bool {
                 // unfolding; without them the quiet window can close first.
                 || m == "Page.frameNavigated"
                 || m == "Page.downloadWillBegin"
+                || m == "Browser.downloadWillBegin"
+                || m == "Browser.downloadProgress"
         }
         None => false, // a reply is not page activity
     }
@@ -696,7 +748,7 @@ impl Conn {
                               oopifs: Vec::new(), auto_attach: false, runtime_on: false,
                               binding: None, timed_out: false, contexts_cleared: false,
                               receipts: None, page_on: false, dialog: None, dialog_seq: 0, network_on: false,
-                              destroyed: Vec::new(), file_chooser: None, file_chooser_on: false,
+                              destroyed: Vec::new(), file_chooser: None, file_chooser_on: false, download_on: false,
                                nav_committed: None, nav_same: None,
                               nav_dom_ready: false, media: MediaState::default(), touch_on: false };
         conn.set_read_timeout(ms);
@@ -1030,6 +1082,7 @@ impl Conn {
     /// that has since been answered does not leave an event stream on.
     pub fn cleanup_domains(&mut self) -> Res<()> {
         self.end_file_chooser();
+        self.end_downloads();
         if self.network_on && self.dialog.is_none() {
             self.call_within("Network.disable", json!({}), 400)?;
             self.network_on = false;
@@ -1223,6 +1276,38 @@ impl Conn {
         }
     }
 
+    /// Arm managed downloads: new ones land as `<guid>` in `dir` with no Save-As
+    /// dialog, and their progress arrives on this connection.
+    pub fn begin_downloads(&mut self, dir: &str) -> Res<()> {
+        self.call(
+            "Browser.setDownloadBehavior",
+            json!({ "behavior": "allowAndName", "downloadPath": dir, "eventsEnabled": true }),
+        )?;
+        self.download_on = true;
+        Ok(())
+    }
+
+    /// Put the human's download behavior back. A dialog or a timeout leaves the
+    /// flag set for `cleanup_domains` to retry.
+    pub fn end_downloads(&mut self) {
+        if !self.download_on {
+            return;
+        }
+        if self.dead {
+            self.download_on = false;
+            return;
+        }
+        if self.dialog.is_some() {
+            return;
+        }
+        if self
+            .call_within("Browser.setDownloadBehavior", json!({ "behavior": "default" }), 400)
+            .is_ok()
+        {
+            self.download_on = false;
+        }
+    }
+
     /// Wait for a file chooser to open. `None` is a timeout, or a dialog: the
     /// caller checks `dialog` to tell them apart.
     pub fn wait_file_chooser(&mut self, ms: u64) -> Res<Option<Value>> {
@@ -1326,7 +1411,11 @@ impl Conn {
     /// This is a socket read, not a poll: an in-flight API call keeps the
     /// window open, and a still page costs one timeout.
     pub fn settle_receipts(&mut self, quiet_ms: u64, max_ms: u64) -> ReceiptOutcome {
-        let deadline = std::time::Instant::now() + Duration::from_millis(max_ms);
+        let started = std::time::Instant::now();
+        let deadline = started + Duration::from_millis(max_ms);
+        // A running download is the action's outcome, not noise: keep the window
+        // open for it, up to 30 s from the start.
+        let download_deadline = started + Duration::from_millis(max_ms.max(30_000));
         // Quiet is measured from the last event that means the page is working.
         // Page.* events are seen (a dialog must end the wait) but do not count:
         // frame lifecycle chatter would hold every settle window to its cap.
@@ -1338,7 +1427,9 @@ impl Conn {
             if self.dialog.is_some() {
                 break;
             }
-            let cap_left = deadline.saturating_duration_since(std::time::Instant::now());
+            let active = self.receipts.as_ref().map(|r| r.download_active()).unwrap_or(false);
+            let cap = if active { download_deadline } else { deadline };
+            let cap_left = cap.saturating_duration_since(std::time::Instant::now());
             if cap_left.is_zero() {
                 break;
             }
@@ -1347,7 +1438,11 @@ impl Conn {
                 // Quiet long enough. Leave unless a same-origin request is still
                 // open; a short slice keeps that landing responsive instead of
                 // spinning on 1 ms reads.
-                let idle = self.receipts.as_ref().map(|r| r.requests.is_empty()).unwrap_or(true);
+                let idle = self
+                    .receipts
+                    .as_ref()
+                    .map(|r| r.requests.is_empty() && !r.download_active())
+                    .unwrap_or(true);
                 if idle {
                     break;
                 }
@@ -1691,6 +1786,30 @@ mod receipt_tests {
         r.note(&json!({"method":"Page.frameNavigated","params":{"frame":{
             "parentId":"p","url":"http://other.test/frame"}}}));
         assert_eq!(r.origin, "http://app.test");
+    }
+
+    #[test]
+    fn a_download_moves_from_started_to_completed() {
+        let mut r = Receipts::new("http://a/".into(), "t".into());
+        r.note(&json!({"method":"Page.downloadWillBegin","params":{
+            "url":"http://a/f","suggestedFilename":"report.txt","guid":"g1"}}));
+        assert!(r.download_active());
+        r.note(&json!({"method":"Browser.downloadProgress","params":{
+            "guid":"g1","state":"inProgress","receivedBytes":0,"totalBytes":17}}));
+        assert_eq!(r.downloads[0]["status"], "inProgress");
+        r.note(&json!({"method":"Browser.downloadProgress","params":{
+            "guid":"g1","state":"completed","receivedBytes":17,"totalBytes":17}}));
+        assert_eq!(r.downloads[0]["status"], "completed");
+        assert_eq!(r.downloads[0]["bytes"], 17);
+        assert!(!r.download_active());
+        // Both domains can announce the same download; one guid is one entry.
+        r.note(&json!({"method":"Browser.downloadWillBegin","params":{
+            "url":"http://a/f","suggestedFilename":"report.txt","guid":"g1"}}));
+        assert_eq!(r.downloads.len(), 1);
+        r.note(&json!({"method":"Browser.downloadProgress","params":{
+            "guid":"g1","state":"canceled","receivedBytes":3}}));
+        assert_eq!(r.downloads[0]["status"], "canceled");
+        assert!(!r.download_active());
     }
 
     #[test]

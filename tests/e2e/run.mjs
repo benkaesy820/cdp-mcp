@@ -20,7 +20,7 @@ await s.rpc("initialize", { protocolVersion: "2024-11-05" });
 // two ports on 127.0.0.1 are the same site, so Chromium keeps them in one
 // process and site isolation never comes into play.
 import { createServer } from "node:http";
-import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 let framePort = 0;
 async function serveFrames() {
   if (framePort) return framePort;
@@ -581,6 +581,47 @@ await withTab(`http://localhost:${fport}/download`, async (tab) => {
   for (const name of ["cdp-mcp-e2e-download.bin", ...Array.from({ length: 6 }, (_, i) => `cdp-mcp-e2e-download (${i + 1}).bin`)]) {
     try { unlinkSync(`${process.env.HOME}/Downloads/${name}`); } catch {}
   }
+});
+
+// A managed download is saved for the caller: verified on disk, and the human's
+// own download behavior is put back afterwards.
+await withTab(`http://localhost:${fport}/download`, async (tab) => {
+  const dir = `/tmp/opencode/e2e-dl-${process.pid}`;
+  rmSync(dir, { recursive: true, force: true });
+  const els = (await s.tool("elements", { tab, limit: 20 })).v.elements || [];
+  const dl = els.find(e => (e.label || "").trim() === "Download");
+  const one = await s.tool("input", { tab, actions: [{ click: { i: dl?.i } }], downloadDir: dir });
+  const d1 = one.v?.downloads?.[0];
+  const body = d1?.path ? readFileSync(d1.path, "utf8") : "";
+  check("a managed download is completed with a path on disk",
+        one.ok && d1?.status === "completed" &&
+        d1?.filename === "cdp-mcp-e2e-download.bin" &&
+        body === "cdp-mcp download fixture" &&
+        readdirSync(dir).includes("cdp-mcp-e2e-download.bin"),
+        { got: d1, v: JSON.stringify(one.v).slice(0, 240) });
+
+  const two = await s.tool("input", { tab, actions: [{ click: { i: dl?.i } }], downloadDir: dir });
+  const d2 = two.v?.downloads?.[0];
+  check("a second managed download gets its own name",
+        two.ok && d2?.status === "completed" &&
+        d2?.filename === "cdp-mcp-e2e-download-1.bin" && d1?.path !== d2?.path,
+        { d1: d1?.filename, d2: d2?.filename, v: JSON.stringify(two.v).slice(0, 200) });
+
+  // Plain settle mode must not touch the human's behavior: the file lands in the
+  // normal Downloads folder, exactly as it did before this feature.
+  const before = new Set(readdirSync(`${process.env.HOME}/Downloads`));
+  const plain = await s.tool("input", { tab, actions: [{ click: { i: dl?.i } }], settleMs: 2500 });
+  await sleep(800);
+  const after = readdirSync(`${process.env.HOME}/Downloads`);
+  const fresh = after.filter(n => !before.has(n) && /cdp-mcp-e2e-download/.test(n));
+  const p = plain.v?.downloads?.[0];
+  check("plain settle downloads are not redirected and carry no path",
+        plain.ok && p?.status === "started" && p?.path === undefined && fresh.length >= 1,
+        { got: p, fresh });
+  for (const n of after.filter(n => /cdp-mcp-e2e-download/.test(n))) {
+    try { unlinkSync(`${process.env.HOME}/Downloads/${n}`); } catch {}
+  }
+  rmSync(dir, { recursive: true, force: true });
 });
 
 // A cross-origin navigation is the action's outcome: the settle window must stay

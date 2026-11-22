@@ -617,6 +617,31 @@ pub(crate) fn run_batch(
     announce: bool,
     force: bool,
     settle_ms: u64,
+    managed: Option<&std::path::Path>,
+) -> Result<Value, String> {
+    match managed {
+        Some(dir) => {
+            // Armed right before the actions and put back on every exit path: a
+            // human's own downloads must never be hijacked into our folder.
+            conn.begin_downloads(&dir.display().to_string())?;
+            let out = run_batch_inner(
+                conn, tab_id, actions, announce, force, settle_ms.max(5_000), Some(dir),
+            );
+            conn.end_downloads();
+            out
+        }
+        None => run_batch_inner(conn, tab_id, actions, announce, force, settle_ms, None),
+    }
+}
+
+fn run_batch_inner(
+    conn: &mut cdp::Conn,
+    tab_id: &str,
+    actions: &[Value],
+    announce: bool,
+    force: bool,
+    settle_ms: u64,
+    managed: Option<&std::path::Path>,
 ) -> Result<Value, String> {
     let scope = scope_for(tab_id);
     let mut navigated = false;
@@ -725,8 +750,12 @@ pub(crate) fn run_batch(
         out["errors"] = json!(errors);
     }
     if !downloads.is_empty() {
-        // Started, not saved: the browser reports the beginning of a download,
-        // not where it landed or whether it finished.
+        // Managed mode moves a completed file out of its guid name and only then
+        // calls it completed; plain mode reports what the events said.
+        let mut downloads = downloads;
+        if let Some(dir) = managed {
+            finalize_downloads(dir, &mut downloads);
+        }
         out["downloads"] = json!(downloads);
     }
     if let Some(d) = conn.dialog.clone() {
@@ -735,9 +764,118 @@ pub(crate) fn run_batch(
     Ok(out)
 }
 
+/// A suggested filename with the directories stripped. The browser supplies this
+/// from a remote header, so `../../etc/passwd` must never reach a path join.
+fn sanitize_filename(suggested: &str, fallback: &str) -> String {
+    let name = std::path::Path::new(suggested)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::trim)
+        .filter(|n| !n.is_empty() && *n != "." && *n != "..")
+        .unwrap_or("");
+    if name.is_empty() { fallback.to_string() } else { name.to_string() }
+}
+
+/// Never overwrite: the same download twice gives `report.txt`, `report-1.txt`.
+fn unique_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let first = dir.join(name);
+    if !first.exists() {
+        return first;
+    }
+    let path = std::path::Path::new(name);
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(name);
+    let ext = path.extension().and_then(|e| e.to_str());
+    for n in 1..1000 {
+        let candidate = match ext {
+            Some(e) => format!("{stem}-{n}.{e}"),
+            None => format!("{stem}-{n}"),
+        };
+        let p = dir.join(candidate);
+        if !p.exists() {
+            return p;
+        }
+    }
+    dir.join(format!("{stem}-{}", std::process::id()))
+}
+
+/// Move each completed download out of `allowAndName`'s guid name and report a
+/// path only when the file was found and put in place.
+fn finalize_downloads(dir: &std::path::Path, downloads: &mut [Value]) {
+    for d in downloads.iter_mut() {
+        if d.get("status").and_then(Value::as_str) != Some("completed") {
+            continue;
+        }
+        let guid = d.get("guid").and_then(Value::as_str).unwrap_or("").to_string();
+        let source = dir.join(&guid);
+        if guid.is_empty() || !source.is_file() {
+            d["status"] = json!("missing");
+            continue;
+        }
+        let suggested = d.get("filename").and_then(Value::as_str).unwrap_or("");
+        let target = unique_path(dir, &sanitize_filename(suggested, &guid));
+        match std::fs::rename(&source, &target) {
+            Ok(()) => {
+                let bytes = std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
+                d["filename"] = json!(target.file_name().and_then(|n| n.to_str()).unwrap_or(""));
+                d["path"] = json!(target.display().to_string());
+                d["bytes"] = json!(bytes);
+            }
+            Err(_) => {
+                d["status"] = json!("missing");
+                d["note"] = json!("cannot move the download into place");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suggested_filenames_cannot_escape_the_folder() {
+        assert_eq!(sanitize_filename("../../etc/passwd", "g1"), "passwd");
+        assert_eq!(sanitize_filename("/abs/report.txt", "g1"), "report.txt");
+        assert_eq!(sanitize_filename("", "g1"), "g1");
+        assert_eq!(sanitize_filename("..", "g1"), "g1");
+        assert_eq!(sanitize_filename("   ", "g1"), "g1");
+    }
+
+    #[test]
+    fn a_second_download_never_overwrites_the_first() {
+        let dir = std::env::temp_dir().join(format!("cdp-dl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = unique_path(&dir, "report.txt");
+        assert_eq!(first.file_name().unwrap(), "report.txt");
+        std::fs::write(&first, b"x").unwrap();
+        let second = unique_path(&dir, "report.txt");
+        assert_eq!(second.file_name().unwrap(), "report-1.txt");
+        std::fs::write(&second, b"y").unwrap();
+        assert_eq!(unique_path(&dir, "report.txt").file_name().unwrap(), "report-2.txt");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_completed_download_is_reported_only_when_it_is_on_disk() {
+        let dir = std::env::temp_dir().join(format!("cdp-dl-fin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("g1"), b"download-body-123").unwrap();
+        let mut ds = vec![json!({
+            "guid": "g1", "status": "completed", "filename": "../report.txt" })];
+        finalize_downloads(&dir, &mut ds);
+        assert_eq!(ds[0]["status"], "completed");
+        assert_eq!(ds[0]["filename"], "report.txt");
+        assert_eq!(ds[0]["bytes"], 17);
+        assert!(std::path::Path::new(ds[0]["path"].as_str().unwrap()).is_file());
+
+        let mut gone = vec![json!({
+            "guid": "g2", "status": "completed", "filename": "b.txt" })];
+        finalize_downloads(&dir, &mut gone);
+        assert_eq!(gone[0]["status"], "missing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn keys_carry_key_code_and_text() {

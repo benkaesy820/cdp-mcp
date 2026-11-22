@@ -863,7 +863,21 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
             let actions = args.get("actions").and_then(Value::as_array).ok_or("input needs actions[]")?.clone();
             let announce = args.get("announce").and_then(Value::as_bool).unwrap_or(false);
             let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
-            let settle_ms = args.get("settleMs").and_then(Value::as_u64).unwrap_or(0).min(5_000);
+                          // Managed downloads: opt-in, so a human's own downloads are never
+              // redirected by default. `0` from the caller means "default", and with a
+              // managed folder that default is a real settle window.
+              let save = args.get("saveDownloads").and_then(Value::as_bool).unwrap_or(false);
+              let dir = match args.get("downloadDir") {
+                  None | Some(Value::Null) => None,
+                  Some(Value::String(s)) if !s.trim().is_empty() => Some(std::path::PathBuf::from(s)),
+                  Some(_) => return Err("input: downloadDir must be a path".into()),
+              };
+              let managed = dir.or_else(|| save.then(|| data_dir().join("downloads")));
+              if let Some(d) = &managed {
+                  std::fs::create_dir_all(d).map_err(|e| format!("cannot create {}: {e}", d.display()))?;
+              }
+              let settle_arg = args.get("settleMs").and_then(Value::as_u64).unwrap_or(0);
+              let settle_ms = if settle_arg == 0 && managed.is_some() { 5_000 } else { settle_arg.min(5_000) };
             // Only a batch that *starts* by answering a dialog may run against a
             // blocked page: anything else would send a click an eval that has to
             // wait out its timeout. A click that opens one is handled inside
@@ -871,11 +885,11 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
             let answers_dialog = actions.first().and_then(|a| a.get("dialog")).is_some();
             if answers_dialog {
                 with_conn_dialog(&cfg.endpoint, tab, |conn, tab_id| {
-                    input::run_batch(conn, tab_id, &actions, announce, force, settle_ms)
+                    input::run_batch(conn, tab_id, &actions, announce, force, settle_ms, managed.as_deref())
                 })
             } else {
                 with_conn(&cfg.endpoint, tab, |conn, tab_id| {
-                    input::run_batch(conn, tab_id, &actions, announce, force, settle_ms)
+                    input::run_batch(conn, tab_id, &actions, announce, force, settle_ms, managed.as_deref())
                 })
             }
         }
