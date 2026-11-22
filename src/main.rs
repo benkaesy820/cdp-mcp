@@ -751,11 +751,14 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
             // overrides live on the target, so they survive a socket that died,
             // and a merge from an empty record would wipe a feature the page
             // still has. Read, run unlocked, write back.
+            //
+            // Written back even on failure: `run` advances the record only
+            // after the browser acknowledged that step, so after an error it is
+            // exactly what was applied. Discarding it would make the next call
+            // merge into a state the page no longer has.
             let mut state = emu_cache().lock().unwrap().get(tab_id).cloned().unwrap_or_default();
             let out = emulate::run(conn, tab_id, &args, &mut state);
-            if out.is_ok() {
-                emu_cache().lock().unwrap().insert(tab_id.to_string(), state);
-            }
+            emu_cache().lock().unwrap().insert(tab_id.to_string(), state);
             out
         }),
         "pdf" => with_conn(&cfg.endpoint, tab, |conn, tab_id| pdf::run(conn, tab_id, &args)),
