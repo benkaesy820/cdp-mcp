@@ -162,7 +162,13 @@ pub(crate) fn plan(args: &Value, current: &MediaState) -> Result<Plan, String> {
         if !matches!(c, "light" | "dark" | "no-preference") {
             return Err("colorScheme must be light, dark or no-preference".into());
         }
-        set_feature(&mut media.features, "prefers-color-scheme", c);
+        if c == "no-preference" {
+            // The CSS value was removed from the spec; dropping the override is
+            // what "no preference" means, and it reverts to the browser default.
+            media.features.retain(|(n, _)| n != "prefers-color-scheme");
+        } else {
+            set_feature(&mut media.features, "prefers-color-scheme", c);
+        }
         media_changed = true;
     }
     if let Some(m) = motion {
@@ -279,8 +285,8 @@ pub(crate) fn run(conn: &mut Conn, tab: &str, args: &Value) -> Result<Value, Str
     if touch_needs_reload {
         applied["touchNeedsReload"] = json!(true);
         applied["note"] = json!(
-            "touch events are created with the document: reload the tab for 'ontouchstart' \
-             and a changed maxTouchPoints to reach the page (navigator.maxTouchPoints is \
+            "touch events are created with the document: the page's 'ontouchstart' and \
+             touch listeners only change after a reload (navigator.maxTouchPoints is \
              already updated)"
         );
     }
@@ -371,6 +377,11 @@ mod tests {
         let media = after.media.unwrap();
         assert!(!media.features.iter().any(|(n, _)| n == "prefers-color-scheme"));
         assert!(media.features.iter().any(|(n, _)| n == "prefers-reduced-motion"));
+
+        // no-preference removes the override rather than sending the deprecated
+        // CSS value.
+        let back = plan(&json!({ "colorScheme": "no-preference" }), &dark).unwrap().media.unwrap();
+        assert!(!back.features.iter().any(|(n, _)| n == "prefers-color-scheme"));
 
         let e = plan(&json!({ "colorScheme": "sepia" }), &MediaState::default()).unwrap_err();
         assert!(e.contains("colorScheme must be"));

@@ -130,7 +130,9 @@ pub(crate) fn navigate(
                 out["dialog"] = d;
                 out["note"] = json!("the document is the new one; a load-time dialog is open");
             }
-            if idle {
+            // A dialog blocks the renderer, so the idle wait would sit out its
+            // whole timeout: the dialog is already attached to this result.
+            if idle && conn.dialog.is_none() {
                 match wait_idle(conn, IDLE_MS, 300) {
                     Ok(n) => {
                         out["idle"] = json!(true);

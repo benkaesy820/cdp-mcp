@@ -65,6 +65,7 @@ async function serveFrames() {
       "/dialogs": "dialogs.html", "/unload": "unload.html", "/download": "download.html",
       "/xnav-src": "xnav-src.html", "/xnav-dst": "xnav-dst.html",
       "/emulate": "emulate.html",
+      "/alertload": "alertload.html",
     };
     const file = files[path] || "cross.html";
     res.end(readFileSync(join(here, "pages", file)));
@@ -639,6 +640,16 @@ await withTab(`http://localhost:${fport}/sprint2`, async (tab) => {
   check("goto with idle waits for loading to settle", gi.ok && gi.v?.idle === true, gi.v);
 });
 
+// A dialog that opens while parsing: the document committed, so the move stands,
+// and idle:true must not then wait out the blocked renderer.
+await withTab(`http://localhost:${fport}/sprint2`, async (tab) => {
+  const g = await s.tool("tabs", { action: "goto", url: `http://localhost:${fport}/alertload`, tab, idle: true });
+  check("a load-time dialog with idle:true returns the move and the dialog",
+        g.ok && g.v?.moved === true && g.v?.dialog?.type === "alert" && g.ms < 5000,
+        { v: g.v, ms: g.ms });
+  await s.tool("input", { tab, actions: [{ dialog: { accept: true } }] });
+});
+
 // A beforeunload guard turns a navigation into a dialog, not a timeout.
 await withTab(`http://localhost:${fport}/unload`, async (tab) => {
   const els = (await s.tool("elements", { tab, limit: 20 })).v.elements || [];
@@ -664,6 +675,10 @@ await withTab(`http://localhost:${fport}/emulate`, async (tab) => {
        print: matchMedia('print').matches })" })).v?.value);
   const before = await read();
   const near = (a, b) => Math.abs(a - b) < 0.01;
+
+  // Seed a delta baseline: without one the invalidation check below would pass
+  // even if emulate never cleared the cache.
+  await s.tool("elements", { tab, limit: 5 });
 
   const mob = (await s.tool("emulate", { tab, preset: "mobile" })).v;
   const m = await read();

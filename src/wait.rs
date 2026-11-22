@@ -893,6 +893,11 @@ fn wait_page_settled_inner(
 /// Wait until loading settles: the Performance API's resource count stops
 /// moving. Network idle without enabling the Network domain.
 pub(crate) fn wait_idle(conn: &mut cdp::Conn, ms: u64, step: u64) -> Result<i64, String> {
+    // An open dialog blocks the renderer: the eval below would wait out the full
+    // call timeout rather than fail.
+    if conn.dialog.is_some() {
+        return Err("dialog open: the page is blocked".into());
+    }
     let started = std::time::Instant::now();
     let mut last = -1i64;
     let mut stable_ms = 0u64;
