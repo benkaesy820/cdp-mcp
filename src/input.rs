@@ -345,14 +345,26 @@ fn selected_entry(i: u64, value: &Value, got: Value, in_frame: bool) -> Result<V
     Ok(entry)
 }
 
-pub(crate) fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], force: bool, scope: Option<&str>) -> Result<Value, String> {
-    let mut log = Vec::new();
+pub(crate) fn run_input(
+    conn: &mut cdp::Conn,
+    tab: &str,
+    actions: &[Value],
+    force: bool,
+    scope: Option<&str>,
+    log: &mut Vec<Value>,
+) -> Result<(), String> {
     for a in actions {
         check_cancel()?;
         // The failing action's own navigation is what a swallow may excuse; reset
         // so an earlier action cannot cover for a later failure.
         conn.contexts_cleared = false;
         let obj = a.as_object().ok_or("each action must be an object")?;
+        // A dialog blocks the renderer. Answering it is the only action that can
+        // proceed; anything else would wait out its socket timeout and change
+        // nothing, so the batch stops here with what already ran.
+        if conn.dialog.is_some() && obj.get("dialog").is_none() {
+            return Ok(());
+        }
         if let Some(d) = obj.get("dialog") {
             // The one action allowed while the renderer is blocked. One answer
             // per call: a chained alert is reported, not auto-dismissed.
@@ -365,7 +377,7 @@ pub(crate) fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], forc
             // reporting. Answering it is the caller's decision, not ours.
             let _ = conn.drain_arrived();
             if next.is_some() || conn.dialog.is_some() {
-                return Ok(json!(log));
+                return Ok(());
             }
         } else if let Some(c) = obj.get("click") {
             let button = c.get("button").and_then(Value::as_str).unwrap_or("left").to_string();
@@ -400,7 +412,7 @@ pub(crate) fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], forc
                                 record_irreversible(tab, &label, i);
                             }
                             log.push(json!({ "clicked": { "i": i, "inFrame": true, "x": lx, "y": ly, "dialog": true } }));
-                            return Ok(json!(log));
+                            return Ok(());
                         }
                         return Err(e);
                     }
@@ -457,7 +469,7 @@ pub(crate) fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], forc
                             record_irreversible(tab, label, i);
                         }
                         log.push(json!({ "clicked": { "i": i, "dialog": true } }));
-                        return Ok(json!(log));
+                        return Ok(());
                     }
                     return Err(e);
                 }
@@ -475,7 +487,7 @@ pub(crate) fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], forc
                 if let Err(e) = clicked {
                     if conn.dialog.is_some() {
                         log.push(json!({ "clicked": { "x": x, "y": y, "dialog": true } }));
-                        return Ok(json!(log));
+                        return Ok(());
                     }
                     return Err(e);
                 }
@@ -491,7 +503,7 @@ pub(crate) fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], forc
                 Err(e) => {
                     if conn.dialog.is_some() {
                         log.push(json!({ "key": k, "dialog": true }));
-                        return Ok(json!(log));
+                        return Ok(());
                     }
                     return Err(e);
                 }
@@ -682,7 +694,7 @@ pub(crate) fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], forc
             conn.nav_batch = true;
         }
     }
-    Ok(json!(log))
+    Ok(())
 }
 
 /// One `input` call: the actions, the optional settle window, and the fields
@@ -735,7 +747,9 @@ fn run_batch_inner(
     let blocked_before = conn.dialog.is_some();
     // A settle window is opt-in: enabling Network on every click would add
     // latency to the common case, and most actions are not being debugged.
-    let (log, errors, downloads) = if settle_ms > 0 {
+    let mut settle_note: Option<String> = None;
+    let mut log: Vec<Value> = Vec::new();
+    let (errors, downloads) = if settle_ms > 0 {
         // A blocked renderer cannot answer `Runtime.enable`/`Network.enable`
         // either: measured, arming receipts there dismissed the dialog before
         // the answer was sent. Leave them off; the post-action URL comes from
@@ -748,9 +762,24 @@ fn run_batch_inner(
                 .and_then(|v| v.as_str().map(str::to_string))
                 .unwrap_or_default()
         };
-        let on = !url.is_empty() && conn.begin_receipts(&url, tab_id).is_ok();
+        // The caller asked for diagnostics. If they cannot be armed, say so:
+        // an empty `errors` and no `downloads` reads as "nothing happened".
+        let on = if blocked_before {
+            false
+        } else if url.is_empty() {
+            settle_note = Some("settle diagnostics skipped: the page URL could not be read".to_string());
+            false
+        } else {
+            match conn.begin_receipts(&url, tab_id) {
+                Ok(()) => true,
+                Err(e) => {
+                    settle_note = Some(format!("settle diagnostics unavailable: {e}"));
+                    false
+                }
+            }
+        };
         conn.contexts_cleared = false;
-        let result = run_input(conn, tab_id, actions, force, scope.as_deref());
+        let result = run_input(conn, tab_id, actions, force, scope.as_deref(), &mut log);
         let nav_failed = conn.contexts_cleared;
         let outcome = if on {
             if result.is_err() {
@@ -767,34 +796,31 @@ fn run_batch_inner(
         opened_tab = outcome.opened_tab;
         let downloads = outcome.downloads;
         let errors = outcome.entries;
-        let log = match result {
-            Ok(v) => v,
+        if let Err(e) = result {
             // An action this wrapper does not itemise can still be interrupted
-            // by a dialog; that is an outcome, not a tool error.
-            Err(e) if conn.dialog.is_some() => {
+            // by a dialog; that is an outcome, not a tool error, and the log
+            // keeps what did run before it.
+            if conn.dialog.is_some() {
                 note = Some(format!("{e} — a dialog is open"));
-                json!([])
-            }
-            // A click that navigated can fail on the trailing synthetic event,
-            // and that is an outcome. A refusal or a bad index is not: it is the
-            // caller's mistake and must not hide behind an earlier navigation.
-            Err(e) if nav_failed && !clean_failure(&e) => {
+            } else if nav_failed && !clean_failure(&e) && !conn.dead {
+                // A click that navigated can fail on the trailing synthetic
+                // event. A refusal, a bad index or a lost socket is not that.
                 note = Some(e);
-                json!([])
+            } else {
+                return Err(e);
             }
-            Err(e) => return Err(e),
-        };
-        (log, errors, downloads)
+        }
+        (errors, downloads)
     } else {
-        let log = match run_input(conn, tab_id, actions, force, scope.as_deref()) {
-            Ok(v) => v,
-            Err(e) if conn.dialog.is_some() => {
+        let result = run_input(conn, tab_id, actions, force, scope.as_deref(), &mut log);
+        if let Err(e) = result {
+            if conn.dialog.is_some() {
                 note = Some(format!("{e} — a dialog is open"));
-                json!([])
+            } else {
+                return Err(e);
             }
-            Err(e) => return Err(e),
-        };
-        (log, Vec::new(), Vec::new())
+        }
+        (Vec::new(), Vec::new())
     };
     // Post-action evals would sit behind a dialog; the browser-process URL works.
     let blocked_after = conn.dialog.is_some();
@@ -824,6 +850,12 @@ fn run_batch_inner(
     }
     if let Some(t) = opened_tab {
         out["openedTab"] = t;
+    }
+    if let Some(s) = settle_note {
+        note = Some(match note {
+            Some(n) => format!("{n}; {s}"),
+            None => s,
+        });
     }
     if let Some(n) = note {
         out["note"] = json!(n);

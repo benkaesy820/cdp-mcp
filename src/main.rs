@@ -509,6 +509,10 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
             let until_text = repeat.get("untilText").and_then(Value::as_str).map(str::to_string);
             let until_gone = repeat.get("untilGone").and_then(Value::as_str).map(str::to_string);
             let between = repeat.get("delayMs").and_then(Value::as_u64).unwrap_or(700);
+            if between > MAX_WAIT_MS {
+                // `max` iterations times an unbounded delay is an hours-long call.
+                return Err(format!("flow: repeat.delayMs must be at most {MAX_WAIT_MS}"));
+            }
             let stop_on_error = args.get("stopOnError").and_then(Value::as_bool).unwrap_or(true);
 
             let mut all = Vec::new();
@@ -557,15 +561,18 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
                     // step, so the flow stops here instead of sleeping and asking
                     // a renderer that cannot answer.
                     let mut stopped: Option<Value> = None;
+                    let mut failure: Option<String> = None;
                     let mut page_has = |want: &str| -> Option<bool> {
                         match with_conn(&cfg.endpoint, tab, |conn, _| conn.eval(&has_text_js(want))) {
                             Ok(v) => Some(v.as_bool().unwrap_or(false)),
                             Err(e) => {
-                                let raw = e.strip_prefix("ERROR: ").unwrap_or(&e);
-                                if let Ok(b) = serde_json::from_str::<Value>(raw) {
-                                    if let Some(d) = b.get("dialog") {
-                                        stopped = Some(d.clone());
+                                // The refusal for a blocked page is the dialog
+                                // itself; anything else is a real failure.
+                                match serde_json::from_str::<Value>(&e) {
+                                    Ok(b) if b.get("dialog").is_some() => {
+                                        stopped = b.get("dialog").cloned();
                                     }
+                                    _ => failure = Some(e),
                                 }
                                 None
                             }
@@ -574,8 +581,17 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
                     if let Some(want) = &until_text {
                         if page_has(want) == Some(true) { hit = true; }
                     }
-                    if let Some(gone) = &until_gone {
-                        if page_has(gone) == Some(false) { hit = true; }
+                    // Asking for the text that just appeared would be a second
+                    // round trip for an answer already known.
+                    if !hit {
+                        if let Some(gone) = &until_gone {
+                            if page_has(gone) == Some(false) { hit = true; }
+                        }
+                    }
+                    if let Some(e) = failure {
+                        // A closed tab or a dead browser must end the loop, not
+                        // be retried `max` times and reported as "not met".
+                        return Err(format!("flow: the stop condition could not be checked: {e}"));
                     }
                     if let Some(d) = stopped {
                         return Ok(json!({

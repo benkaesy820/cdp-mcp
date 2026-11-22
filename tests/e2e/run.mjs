@@ -579,6 +579,17 @@ await withTab(`http://localhost:${fport}/imgs`, async (tab) => {
   }
 });
 
+// A repeat delay is a wait, and the wait ceiling applies to it: 200 iterations
+// times an unbounded delay was an hours-long call.
+{
+  const slow = await s.tool("flow", {
+    steps: [{ tool: "eval", args: { expression: "1" } }],
+    repeat: { max: 2, delayMs: 900001 },
+  });
+  check("flow refuses a repeat delay past the wait cap",
+        !slow.ok && /delayMs/.test(String(slow.v)), slow.v);
+}
+
 // A flow's own tab must reach its steps: they used to run on whatever tab the
 // last call happened to touch.
 await withTab(`http://localhost:${fport}/receipts`, async (tabA) => {
@@ -648,6 +659,18 @@ await withTab(`http://localhost:${fport}/dialogs`, async (tab, ev) => {
   check("a dialog opened between calls is seen before the next command",
         !late.ok && /dialog/.test(JSON.stringify(late.v)) && late.ms < 4000,
         { ok: late.ok, ms: late.ms, v: JSON.stringify(late.v).slice(0, 140) });
+  await s.tool("input", { tab, actions: [{ dialog: { accept: false } }] });
+
+  // A dialog that opens between two actions used to throw away the log of what
+  // had already run, and the next action then dispatched into a blocked page.
+  const mid = await s.tool("input", { tab, actions: [
+    { click: { i: at("Later")?.i } },
+    { wait: { idle: true, ms: 2000 } },
+    { insert: "x" },
+  ] });
+  check("a dialog mid-batch keeps the actions that ran and stops there",
+        mid.ok && (mid.v?.log || []).some(e => e.clicked) && /dialog/.test(String(mid.v?.note || "")) && mid.ms < 6000,
+        { ok: mid.ok, ms: mid.ms, log: mid.v?.log, note: mid.v?.note });
   await s.tool("input", { tab, actions: [{ dialog: { accept: false } }] });
 
   // idle must report the dialog instead of sitting out its timeout.
