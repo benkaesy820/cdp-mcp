@@ -474,7 +474,7 @@ pub const FRAME_ELEMENTS_JS: &str = r#"(() => {
   if (PICK) {
     const el = nodes[PICK.i];
     if (!el || !el.isConnected) return JSON.stringify({ missing: true, total: nodes.length });
-    if (PICK.scroll) el.scrollIntoView({ block: 'center', inline: 'center' });
+    if (PICK.scroll) el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
     const r = el.getBoundingClientRect();
     const rec = {
       i: PICK.i, tag: el.tagName.toLowerCase(), label: labelOf(el),
@@ -487,8 +487,33 @@ pub const FRAME_ELEMENTS_JS: &str = r#"(() => {
     try { if (!dis && el.matches && el.matches(':disabled')) dis = true; } catch (e) {}
     if (dis) rec.disabled = true;
     rec.outside = rec.lx < 0 || rec.ly < 0 || rec.lx > innerWidth || rec.ly > innerHeight;
-    const hit = document.elementFromPoint(rec.lx, rec.ly);
-    rec.hit = !!hit && (hit === el || el.contains(hit) || (hit.closest && hit.closest(sel) === el));
+    // The same hit test the page path uses: elementFromPoint alone stops at a
+    // shadow boundary, so a button inside one would be refused as obscured.
+    const deepAt = (px, py) => {
+      let t = document.elementFromPoint(px, py), ox = 0, oy = 0;
+      for (let k = 0; t && k < 32; k++) {
+        if (t.shadowRoot) {
+          const n = t.shadowRoot.elementFromPoint(px - ox, py - oy);
+          if (n && n !== t) { t = n; continue; }
+        }
+        if (t.tagName === 'IFRAME' || t.tagName === 'FRAME') {
+          let d = null;
+          try { d = t.contentDocument; } catch (e) {}
+          if (d) {
+            const fr = t.getBoundingClientRect();
+            ox += fr.left + t.clientLeft; oy += fr.top + t.clientTop;
+            const n = d.elementFromPoint(px - ox, py - oy);
+            if (n) { t = n; continue; }
+          }
+        }
+        break;
+      }
+      return t;
+    };
+    const up = (n) => n.parentNode || n.host || (n.nodeType === 9 && n.defaultView ? n.defaultView.frameElement : null);
+    const holds = (a, b) => { for (let n = b; n; n = up(n)) if (n === a) return true; return false; };
+    const hit = deepAt(rec.lx, rec.ly);
+    rec.hit = !!hit && holds(el, hit);
     if (!rec.hit) {
       rec.blocker = hit ? String(hit.tagName || '').toLowerCase() : 'nothing';
       rec.blockerLabel = hit ? labelOf(hit).slice(0, 60) : '';
@@ -672,9 +697,9 @@ pub(crate) fn scan_with_frames(conn: &mut cdp::Conn, scope: Option<&str>) -> Res
                 o.insert("session".into(), json!(session));
                 // The target id survives a reconnect; the session id does not.
                 o.insert("target".into(), json!(target));
-              // Frame-local index: re-resolving by position is stable where a
-              // cached coordinate is not.
-              o.insert("fi".into(), json!(fi as u64));
+                // Frame-local index: re-resolving by position is stable where a
+                // cached coordinate is not.
+                o.insert("fi".into(), json!(fi as u64));
                 // Local centre, which is what a click inside the frame needs.
                 o.insert("lx".into(), json!(lx as i64));
                 o.insert("ly".into(), json!(ly as i64));
@@ -799,7 +824,7 @@ pub(crate) fn frame_target(
         return Err(blocked_click("disabled", i, tag, label, Value::Null, true));
     }
     if !force && el.get("zero").and_then(Value::as_bool) == Some(true) {
-        return Err(blocked_click("zero", i, tag, label, Value::Null, true));
+        return Err(blocked_click("zero_size", i, tag, label, Value::Null, true));
     }
     // The frame's own viewport: what is below its fold needs a scroll inside the
     // frame, and a dispatch at these coordinates would land outside it.
@@ -811,7 +836,7 @@ pub(crate) fn frame_target(
             "tag": el.get("blocker").cloned().unwrap_or(Value::Null),
             "label": el.get("blockerLabel").cloned().unwrap_or(Value::Null),
         });
-        return Err(blocked_click("covered", i, tag, label, obscured, true));
+        return Err(blocked_click("obscured", i, tag, label, obscured, true));
     }
     if let Some(text) = label.as_str() {
         if irreversible(text) {
@@ -824,6 +849,7 @@ pub(crate) fn frame_target(
     Ok(Some((x, y, session)))
 }
 
+/// The same three events the page path sends, dispatched inside a frame session.
 pub(crate) fn frame_click(
     conn: &mut cdp::Conn,
     session: &str,
@@ -1080,6 +1106,9 @@ pub(crate) fn text(cfg: &Cfg, args: &Value) -> Result<Value, String> {
                     continue;
                 }
                 text.push_str(&format!("\n\n[frame {host}]\n{inner}"));
+                if text.chars().count() >= limit {
+                    break;
+                }
             }
         }
         let text: String = text.chars().take(limit).collect();

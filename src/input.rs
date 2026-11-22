@@ -544,8 +544,9 @@ pub(crate) fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], forc
             }
         } else if let Some(h) = obj.get("hover") {
             let frame = match h.get("i").and_then(Value::as_u64) {
-                Some(i) => scan::frame_pick(conn, tab, i, true, None)?,
-                None => None,
+                // A scoped list holds no frame elements, exactly as for clicks.
+                Some(i) if scope.is_none() => scan::frame_pick(conn, tab, i, true, None)?,
+                _ => None,
             };
             if let Some(f) = frame {
                 let x = f.get("lx").and_then(Value::as_f64).unwrap_or(0.0);
@@ -600,7 +601,12 @@ pub(crate) fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], forc
             let value = select_values(v.get("value"))?;
             // A frame element is a different document: resolve it there, live, and
             // validate against the answer that document gave.
-            let entry = if let Some(f) = scan::frame_pick(conn, tab, i, false, Some(&value))? {
+            let frame = if scope.is_none() {
+                scan::frame_pick(conn, tab, i, false, Some(&value))?
+            } else {
+                None
+            };
+            let entry = if let Some(f) = frame {
                 if let Some(e) = f.get("selectError").and_then(Value::as_str) {
                     return Err(format!("select failed: {e}"));
                 }

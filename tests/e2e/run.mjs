@@ -684,9 +684,16 @@ await withTab(`http://localhost:${fport}/frame-top`, async (tab, ev) => {
   check("a frame click lands after the top page scrolled",
         click.ok && msgs.includes("clicked"), { click: click.v, msgs });
 
+  // Move the pointer off the button first: a second mouseMoved to the same point
+  // fires no new mouseover.
+  await s.tool("input", { tab, actions: [{ hover: { i: at("Late button") } }] });
+  await ev("window.__msgs = []");
   const hov = await s.tool("input", { tab, actions: [{ hover: { i: at("Inner button") } }] });
+  await sleep(300);
+  const hoverMsgs = JSON.parse(await ev("JSON.stringify(window.__msgs)"));
   check("hover reaches an element inside a cross-origin frame",
-        hov.ok && hov.v.log?.[0]?.hovered?.inFrame === true, hov.v.log);
+        hov.ok && hov.v.log?.[0]?.hovered?.inFrame === true && hoverMsgs.includes("hovered"),
+        { log: hov.v.log, msgs: hoverMsgs });
 
   const sel1 = await s.tool("input", { tab, actions: [{ select: { i: at("Inner plan"), value: "b" } }] });
   check("select reaches a single select inside a frame",
@@ -710,7 +717,7 @@ await withTab(`http://localhost:${fport}/frame-top`, async (tab, ev) => {
   await sleep(150);
   const covered = await s.tool("input", { tab, actions: [{ click: { i: at("Inner button") } }] });
   check("a frame click is refused when something covers it",
-        !covered.ok && /"reason":"covered"/.test(String(covered.v)) &&
+        !covered.ok && /"reason":"obscured"/.test(String(covered.v)) &&
         /"inFrame":true/.test(String(covered.v)), String(covered.v).slice(0, 220));
 
   const withFrames = (await s.tool("text", { tab, frames: true, limit: 4000 })).v;
