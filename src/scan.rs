@@ -994,6 +994,12 @@ pub(crate) fn elements(cfg: &Cfg, args: &Value) -> Result<Value, String> {
                 .map(public_element).collect();
             let removed: Vec<Value> = prev_els.iter().filter(|e| !new_set.contains(&fingerprint(e)))
                 .map(public_element).collect();
+            // A route swap can replace the whole page: the counts stay exact, but
+            // the lists obey the same `limit` as a normal scan.
+            let added_count = added.len();
+            let removed_count = removed.len();
+            let added: Vec<Value> = added.into_iter().take(limit).collect();
+            let removed: Vec<Value> = removed.into_iter().take(limit).collect();
             let prev_ov = previous.get("overlays").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0) as i64;
             let now_ov = scan_v.get("overlays").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0) as i64;
             return Ok(json!({
@@ -1006,10 +1012,10 @@ pub(crate) fn elements(cfg: &Cfg, args: &Value) -> Result<Value, String> {
                 "scopeMissing": scan_v.get("scopeMissing").and_then(Value::as_bool).unwrap_or(false),
                 "baseline": !previous.is_null(),
                 "added": added,
-                "addedCount": added.len(),
+                "addedCount": added_count,
                 "removed": removed,
-                "removedCount": removed.len(),
-                "unchanged": all.len().saturating_sub(added.len()),
+                "removedCount": removed_count,
+                "unchanged": all.len().saturating_sub(added_count),
                 "overlays": scan_v.get("overlays").cloned().unwrap_or(json!([])),
                 "overlayDelta": now_ov - prev_ov,
                 "media": scan_v.get("media").cloned().unwrap_or(json!([])),
@@ -1124,7 +1130,7 @@ pub(crate) fn text(cfg: &Cfg, args: &Value) -> Result<Value, String> {
                try {{ r = document.querySelector({sel}); }} catch (e) {{ return {{ err: String(e) }}; }} \
                if (!r) return {{ missing: true }}; \
                const t = (r.innerText || '').replace(/\\n{{3,}}/g, '\\n\\n').trim(); \
-               return {{ text: t.slice(0, {lim}) }}; \
+               return {{ text: t.slice(0, {lim}), truncated: t.length > {lim} }}; \
              }})()",
             sel = serde_json::to_string(&within).unwrap_or_else(|_| "\"body\"".into()),
             lim = limit
@@ -1137,6 +1143,11 @@ pub(crate) fn text(cfg: &Cfg, args: &Value) -> Result<Value, String> {
         // beats handing back the whole page as if it were the scope.
         let scope_missing = v.get("missing").and_then(Value::as_bool) == Some(true);
         let mut text = v.get("text").and_then(Value::as_str).unwrap_or("").to_string();
+        // Measured in the page: JS counts UTF-16 code units and the cut is by
+        // those, so asking Rust to compare `chars` against `limit` was wrong for
+        // an exact-length paragraph and for anything with an emoji in it.
+        let doc_truncated = v.get("truncated").and_then(Value::as_bool).unwrap_or(false);
+        let mut more_frames = false;
         // Cross-origin frames are separate documents; their words are only
         // reachable through their own session. Off unless asked: it costs a frame
         // list and one evaluation per visible frame.
@@ -1159,17 +1170,19 @@ pub(crate) fn text(cfg: &Cfg, args: &Value) -> Result<Value, String> {
                 }
                 text.push_str(&format!("\n\n[frame {host}]\n{inner}"));
                 if text.chars().count() >= limit {
+                    more_frames = true;
                     break;
                 }
             }
         }
+        let full = text.chars().count();
         let text: String = text.chars().take(limit).collect();
         Ok(json!({
             "tab": tab_id,
             "within": within,
             "scopeMissing": scope_missing,
             "chars": text.chars().count(),
-            "truncated": text.chars().count() >= limit,
+            "truncated": doc_truncated || more_frames || full > limit,
             "frames": frames,
             "text": text,
         }))

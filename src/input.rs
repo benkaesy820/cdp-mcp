@@ -765,6 +765,10 @@ fn run_batch_inner(
         // The caller asked for diagnostics. If they cannot be armed, say so:
         // an empty `errors` and no `downloads` reads as "nothing happened".
         let on = if blocked_before {
+            // The dialog has to be answered before Network can be enabled, so
+            // the window is skipped. A managed download still lands (the
+            // behavior is armed), but it cannot be renamed or reported here.
+            settle_note = Some("settle diagnostics skipped: the page was blocked by a dialog when the call started".to_string());
             false
         } else if url.is_empty() {
             settle_note = Some("settle diagnostics skipped: the page URL could not be read".to_string());

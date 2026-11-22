@@ -725,10 +725,22 @@ pub struct Conn {
 /// Events that mean the page is still doing something. `Page.*` is deliberately
 /// absent: frame lifecycle chatter would hold a settle window open to its cap,
 /// and the wait is about network quiet.
+///
+/// Every `Network.` event is not activity either: a page with a websocket or a
+/// media stream emits frames and body chunks continuously, which used to pin
+/// every `settleMs` window to its cap. A request starting or ending is the
+/// signal; the same-origin requests themselves keep the window open through
+/// `Receipts::requests`, not through this flag.
 fn settle_activity(v: &Value) -> bool {
     match v.get("method").and_then(Value::as_str) {
         Some(m) => {
-            m.starts_with("Network.")
+            matches!(
+                m,
+                "Network.requestWillBeSent"
+                    | "Network.responseReceived"
+                    | "Network.loadingFinished"
+                    | "Network.loadingFailed"
+            )
                 || m == "Target.targetCreated"
                 || m == "Target.targetInfoChanged"
                 || m == "Runtime.exceptionThrown"
@@ -1837,6 +1849,17 @@ impl Conn {
 #[cfg(test)]
 mod receipt_tests {
     use super::*;
+
+    #[test]
+    fn websocket_frames_and_body_chunks_are_not_activity() {
+        let ev = |m: &str| json!({ "method": m });
+        assert!(settle_activity(&ev("Network.requestWillBeSent")));
+        assert!(settle_activity(&ev("Network.loadingFinished")));
+        assert!(!settle_activity(&ev("Network.webSocketFrameReceived")));
+        assert!(!settle_activity(&ev("Network.dataReceived")));
+        assert!(!settle_activity(&ev("Page.frameStartedLoading")));
+        assert!(settle_activity(&json!({ "method": "Page.frameNavigated", "params": { "frame": {} } })));
+    }
 
     #[test]
     fn origins_normalise_ports_case_and_blob() {

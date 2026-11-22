@@ -419,10 +419,12 @@ impl Settled {
         }
         if self.chars > 0 {
             o["textChars"] = json!(self.chars);
-            if let Some(first) = self.first_chars {
-                if first > 0 && self.chars != first {
-                    o["textDelta"] = json!(self.chars - first);
-                }
+        }
+        // A page that started empty and then filled in is exactly the delta a
+        // caller wants; `first > 0` used to hide it.
+        if let Some(first) = self.first_chars {
+            if first != self.chars {
+                o["textDelta"] = json!(self.chars - first);
             }
         }
         if self.dialogs > 0 {
@@ -922,5 +924,32 @@ pub(crate) fn wait_idle(conn: &mut cdp::Conn, ms: u64, step: u64) -> Result<i64,
             return Ok(last);
         }
         nap(step)?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_page_that_fills_in_reports_its_delta() {
+        let mut s = Settled::default();
+        s.absorb(&json!({ "chars": 0 }));
+        s.absorb(&json!({ "chars": 42 }));
+        let now = std::time::Instant::now();
+        let r = s.report("text", &now, &now);
+        assert_eq!(r["textChars"], 42);
+        assert_eq!(r["textDelta"], 42);
+    }
+
+    #[test]
+    fn a_page_that_clears_reports_a_negative_delta() {
+        let mut s = Settled::default();
+        s.absorb(&json!({ "chars": 10 }));
+        s.absorb(&json!({ "chars": 0 }));
+        let now = std::time::Instant::now();
+        let r = s.report("change", &now, &now);
+        assert_eq!(r["textDelta"], -10);
+        assert!(r.get("textChars").is_none(), "an empty page has no char count");
     }
 }

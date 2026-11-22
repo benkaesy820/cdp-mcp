@@ -77,11 +77,16 @@ pub(crate) fn download(cfg: &Cfg, args: &Value) -> Result<Value, String> {
                     // images); 'omit' is what a public CDN needs, because
                     // a credentialed cross-origin request demands a much
                     // stricter CORS grant than ACAO:*.
+                    // 'omit' is the fallback for a CORS refusal, which throws.
+                    // A 401/403/404 that answered is the answer: retrying it
+                    // without credentials replaced the real status with whatever
+                    // the second request got.
                     let r = null;
-                    for (const cred of ['include', 'omit']) {{
-                        try {{ r = await fetch(abs, {{ credentials: cred }}); }}
+                    try {{ r = await fetch(abs, {{ credentials: 'include' }}); }}
+                    catch (e) {{ r = null; }}
+                    if (!r) {{
+                        try {{ r = await fetch(abs, {{ credentials: 'omit' }}); }}
                         catch (e) {{ r = null; }}
-                        if (r && r.ok) break;
                     }}
                     if (!r) return {{ error: 'network', url: abs }};
                     if (!r.ok) return {{ error: 'http ' + r.status, url: abs }};
