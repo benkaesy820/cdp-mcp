@@ -346,6 +346,17 @@ pub(crate) fn paste(cfg: &Cfg, args: &Value) -> Result<Value, String> {
     if text.as_deref() == Some("") {
         return Err("paste text is empty".into());
     }
+    // The system-clipboard method was removed. A caller following an older
+    // instruction must fail here, not get a page paste reported as if it had
+    // used the method it asked for.
+    for gone in ["method", "restore"] {
+        if args.get(gone).is_some() {
+            return Err(format!(
+                "paste has no `{gone}` any more: it always pastes through the page and never \
+                 touches the system clipboard"
+            ));
+        }
+    }
     let mime = match path.as_deref() {
         Some(p) => {
             let ext = std::path::Path::new(p).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
