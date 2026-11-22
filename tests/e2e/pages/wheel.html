@@ -1,0 +1,16 @@
+<!doctype html><meta charset="utf-8"><title>wheel</title>
+<body style="margin:0;font:14px system-ui;padding:10px">
+<div id="pane" tabindex="0" aria-label="Inner pane"
+     style="height:200px;width:300px;overflow:auto;border:1px solid #999">
+  <div style="height:1200px">inner pane</div>
+</div>
+<canvas id="cv" tabindex="0" aria-label="Canvas" width="300" height="200"
+        style="display:block;margin-top:20px;background:#eee"></canvas>
+<script>
+  window.__wheel = [];
+  document.getElementById('cv').addEventListener('wheel', (e) => {
+    window.__wheel.push({ dx: e.deltaX, dy: e.deltaY, trusted: e.isTrusted });
+    e.preventDefault();
+  });
+</script>
+</body>

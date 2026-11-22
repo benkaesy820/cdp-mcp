@@ -67,6 +67,7 @@ async function serveFrames() {
       "/emulate": "emulate.html",
       "/alertload": "alertload.html",
       "/tall": "tall.html",
+      "/wheel": "wheel.html", "/select": "select.html",
     };
     const file = files[path] || "cross.html";
     res.end(readFileSync(join(here, "pages", file)));
@@ -99,10 +100,11 @@ await withTab(page("basic.html"), async (tab, ev) => {
   await sleep(300);
   check("click by index scrolls an off-screen element into view", (await ev("c.far||0")) === 1, await ev("c"));
 
-  // `scroll-behavior: smooth` made scroll report moved:false.
+  // A JS scrollBy used to report moved:false here; a real wheel must not.
   await ev("scrollTo({top:0,behavior:'instant'})");
   const sc = await s.tool("input", { tab, actions: [{ scroll: { dy: 500 } }] });
-  check("scroll moves under scroll-behavior: smooth", sc.v.log?.[0]?.scrolled?.moved === true, sc.v);
+  check("a wheel scrolls the page even after a programmatic scroll",
+        sc.v.log?.[0]?.scrolled?.moved === true && sc.v.log?.[0]?.scrolled?.delivered === true, sc.v);
 
   // A failed step used to make with_conn re-run the whole action list.
   await ev("scrollTo({top:0,behavior:'instant'}); c.near=0");
@@ -789,6 +791,80 @@ await withTab(`http://localhost:${fport}/tall`, async (tab) => {
 
   const bad = await s.tool("pdf", { tab, format: "legal" });
   check("pdf rejects an unknown paper size", !bad.ok && /letter or a4/.test(String(bad.v)), String(bad.v).slice(0, 120));
+});
+
+// ---- real wheel scrolling and multi-select -------------------------------
+await withTab(`http://localhost:${fport}/tall`, async (tab) => {
+  const down = (await s.tool("input", { tab, actions: [{ scroll: { dy: 400 } }] })).v?.log?.[0]?.scrolled;
+  check("a wheel scrolls the document down",
+        down?.moved === true && down?.delivered === true && down?.from === 0 &&
+        down?.to >= 300 && down?.wheel?.dy === 400,
+        down);
+  const up = (await s.tool("input", { tab, actions: [{ scroll: { dy: -400 } }] })).v?.log?.[0]?.scrolled;
+  check("a negative wheel scrolls it back up",
+        up?.moved === true && up?.to < up?.from, up);
+  const zero = await s.tool("input", { tab, actions: [{ scroll: { dx: 0, dy: 0 } }] });
+  check("a wheel with no delta is refused", !zero.ok && /non-zero/.test(String(zero.v)),
+        String(zero.v).slice(0, 120));
+});
+
+await withTab(`http://localhost:${fport}/wheel`, async (tab) => {
+  const els = (await s.tool("elements", { tab, limit: 99 })).v.elements || [];
+  const pane = els.find(e => (e.label || "").includes("Inner pane"));
+  const canvas = els.find(e => (e.label || "").includes("Canvas"));
+
+  const inner = (await s.tool("input", { tab, actions: [{ scroll: { i: pane?.i, dy: 300 } }] })).v?.log?.[0]?.scrolled;
+  check("a wheel over an inner pane scrolls the pane, not the page",
+        inner?.moved === true && inner?.container === true && inner?.to > 0,
+        inner);
+  const paneTop = (await s.tool("eval", { tab, expression: "document.getElementById('pane').scrollTop" })).v?.value;
+  check("the pane really moved", paneTop === 300, paneTop);
+
+  const cw = (await s.tool("input", {
+    tab, actions: [{ scroll: { x: canvas?.x, y: canvas?.y, dy: -120 } }],
+  })).v?.log?.[0]?.scrolled;
+  const seen = JSON.parse((await s.tool("eval", { tab, expression: "JSON.stringify(window.__wheel || [])" })).v?.value || "[]");
+  check("a canvas gets a real trusted wheel even though nothing scrolls",
+        cw?.moved === false && cw?.delivered === true && cw?.wheel?.dy === -120 &&
+        seen.some(w => w.dy === -120 && w.trusted === true),
+        { scrolled: cw, seen });
+});
+
+await withTab(`http://localhost:${fport}/select`, async (tab) => {
+  const els = (await s.tool("elements", { tab, limit: 99 })).v.elements || [];
+  const at = l => els.find(e => (e.label || "").trim() === l);
+
+  const sel = await s.tool("input", { tab, actions: [{ select: { i: at("Tags")?.i, value: ["a", "c"] } }] });
+  const got = sel.v?.log?.[0]?.selected?.value;
+  check("a multiple select takes several values",
+        sel.ok && JSON.stringify(got) === JSON.stringify(["a", "c"]), { got, v: sel.v?.log?.[0] });
+
+  const page = JSON.parse((await s.tool("eval", { tab, expression:
+    "JSON.stringify({ sel: [...document.getElementById('multi').selectedOptions].map(o => o.value), changes: window.__changes })" })).v?.value);
+  check("the page agrees, and change fired once",
+        JSON.stringify(page.sel) === JSON.stringify(["a", "c"]) && page.changes === 1, page);
+
+  const scanned = (await s.tool("elements", { tab, limit: 99 })).v.elements || [];
+  const tags = scanned.find(e => (e.label || "").trim() === "Tags");
+  check("the scan reports every selected option of a multiple select",
+        Array.isArray(tags?.selected) && tags.selected.join(",") === "Alpha,Gamma", tags?.selected);
+
+  const missing = await s.tool("input", { tab, actions: [{ select: { i: at("Tags")?.i, value: ["a", "z"] } }] });
+  check("a missing option is named, not ignored",
+        !missing.ok && /no option z/.test(String(missing.v)), String(missing.v).slice(0, 140));
+
+  const single = await s.tool("input", { tab, actions: [{ select: { i: at("Plan")?.i, value: ["free", "pro"] } }] });
+  check("two values on a single select are refused",
+        !single.ok && /takes one value/.test(String(single.v)), String(single.v).slice(0, 140));
+
+  const one = await s.tool("input", { tab, actions: [{ select: { i: at("Plan")?.i, value: "pro" } }] });
+  check("a single select still takes one value", one.ok && one.v?.log?.[0]?.selected?.value === "pro",
+        one.v?.log?.[0]);
+
+  const list = await s.tool("input", { tab, actions: [{ select: { i: at("Plan")?.i, value: ["free"] } }] });
+  check("one value in an array is fine on a single select",
+        list.ok && JSON.stringify(list.v?.log?.[0]?.selected?.value) === '["free"]',
+        list.v?.log?.[0]);
 });
 
 await withTab(page("chatty.html"), async (tab, ev) => {

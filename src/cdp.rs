@@ -961,12 +961,20 @@ impl Conn {
     /// production throughout, which is the workaround Playwright's maintainers
     /// documented for headed Chrome; one 64 px frame a second costs nothing.
     /// Pair with `stop_frames`.
-    pub fn start_frames(&mut self) -> Res<()> {
+    /// Ask the compositor to start producing frames, without waiting for one.
+    /// Enough on its own for input (a wheel needs the pipeline alive); a
+    /// capture wants `start_frames` instead.
+    pub fn request_frames(&mut self) -> Res<()> {
         self.call(
             "Page.startScreencast",
             json!({ "format": "jpeg", "quality": 10, "maxWidth": 64, "maxHeight": 64,
                     "everyNthFrame": 1, "maxFramesInFlight": 4 }),
         )?;
+        Ok(())
+    }
+
+    pub fn start_frames(&mut self) -> Res<()> {
+        self.request_frames()?;
         // Three frames, not one: the first frame after a window stops being
         // visible proves the pipeline wakes up, and the capture that follows
         // still waited 12 s for a *compositor* frame. Waiting for the stream to

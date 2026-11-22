@@ -1,0 +1,13 @@
+<!doctype html><meta charset="utf-8"><title>select</title>
+<body style="font:14px system-ui;padding:20px">
+<select id="multi" multiple aria-label="Tags" style="height:120px">
+  <option value="a">Alpha</option><option value="b">Beta</option><option value="c">Gamma</option>
+</select>
+<select id="single" aria-label="Plan">
+  <option value="free">Free</option><option value="pro">Pro</option>
+</select>
+<script>
+  window.__changes = 0;
+  document.getElementById('multi').addEventListener('change', () => { window.__changes++; });
+</script>
+</body>

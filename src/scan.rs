@@ -110,8 +110,14 @@ pub const SCAN_JS: &str = r#"(() => {
       } else if (tagName === 'TEXTAREA') {
           if (el.value) rec.value = String(el.value).slice(0, 60);
       } else if (tagName === 'SELECT') {
-          const opt = el.options[el.selectedIndex];
-          if (opt) rec.selected = String(opt.text || '').trim().slice(0, 60);
+          if (el.multiple) {
+              // `selectedIndex` reports one entry; a multiple select can have
+              // several, and hiding the rest is how a selection reads as lost.
+              rec.selected = [...el.selectedOptions].map((o) => String(o.text || '').trim().slice(0, 60));
+          } else {
+              const opt = el.options[el.selectedIndex];
+              if (opt) rec.selected = String(opt.text || '').trim().slice(0, 60);
+          }
       } else if (el.isContentEditable || el.getAttribute('role') === 'textbox') {
           const v = (el.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 60);
           if (v) rec.value = v;
@@ -230,6 +236,20 @@ pub const SCAN_JS: &str = r#"(() => {
     if (PICK.select !== undefined) {
       const s = el.tagName === 'SELECT' ? el : el.closest('select');
       if (!s) { out.selectError = 'not a select'; }
+      else if (Array.isArray(PICK.select)) {
+        const wanted = PICK.select.map(String);
+        const missing = wanted.filter((v) => ![...s.options].some((o) => o.value === v));
+        if (missing.length) out.selectError = 'no option ' + missing.join(', ');
+        else if (!s.multiple && wanted.length > 1)
+          out.selectError = 'this <select> takes one value; it is not multiple';
+        else {
+          const set = new Set(wanted);
+          for (const o of s.options) o.selected = set.has(o.value);
+          s.dispatchEvent(new Event('input', { bubbles: true }));
+          s.dispatchEvent(new Event('change', { bubbles: true }));
+          out.selected = [...s.options].filter((o) => o.selected).map((o) => o.value);
+        }
+      }
       else {
         s.value = PICK.select;
         s.dispatchEvent(new Event('input', { bubbles: true }));
@@ -415,8 +435,14 @@ pub const FRAME_ELEMENTS_JS: &str = r#"(() => {
       } else if (tagName === 'TEXTAREA') {
           if (el.value) rec.value = String(el.value).slice(0, 60);
       } else if (tagName === 'SELECT') {
-          const opt = el.options[el.selectedIndex];
-          if (opt) rec.selected = String(opt.text || '').trim().slice(0, 60);
+          if (el.multiple) {
+              // `selectedIndex` reports one entry; a multiple select can have
+              // several, and hiding the rest is how a selection reads as lost.
+              rec.selected = [...el.selectedOptions].map((o) => String(o.text || '').trim().slice(0, 60));
+          } else {
+              const opt = el.options[el.selectedIndex];
+              if (opt) rec.selected = String(opt.text || '').trim().slice(0, 60);
+          }
       } else if (el.isContentEditable || el.getAttribute('role') === 'textbox') {
           const v = (el.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 60);
           if (v) rec.value = v;

@@ -17,6 +17,7 @@ mod emulate;
 mod nav;
 mod pdf;
 mod scan;
+mod scroll;
 mod wait;
 
 use clip::*;
@@ -417,7 +418,7 @@ fn scan_js(scope: Option<&str>) -> String {
 /// Resolve element `i` (in `scope`) inside the page, scroll it into view if
 /// asked, and report where a click on it lands. One evaluation: this used to
 /// be four full scans per click.
-fn pick(conn: &mut cdp::Conn, scope: Option<&str>, i: u64, scroll: bool, select: Option<&str>) -> Result<Value, String> {
+fn pick(conn: &mut cdp::Conn, scope: Option<&str>, i: u64, scroll: bool, select: Option<&Value>) -> Result<Value, String> {
     let lit = match scope {
         Some(s) => serde_json::to_string(s).unwrap_or_else(|_| "null".into()),
         None => "null".into(),
@@ -976,7 +977,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "input",
-            "description": "Send real user input, in order. Actions: {click:{i|x,y[,button:right|middle,count:2,modifiers:[Shift]]}} (an index is scrolled into view and resolved in the same `within` scope as the last elements call, or in the action's own `within` when it carries one), {hover:{i}}, {drag:{from:{i},to:{i},steps:12}}, {tap:{i}} (touch), {swipe:{from,to}} (touch), {select:{i,value}} (<select>), {insert:\"text\"}, {key:\"Enter\"|\"Control+a\"|\"Control+Shift+z\"|\"a\"|\"Escape\"|\"Tab\"|\"ArrowDown\"|\"F5\"}, {scroll:{dy:400}} (scrolls the page, or the scrollable panel in the middle of the screen; reports whether it moved), {dismiss:{prefer:\"reject\"}} (closes cookie walls and modals, refusing cookies when offered), {wait:{idle:true,ms:15000}} (waits for loading to settle), {wait:{text:\"...\",ms:15000}}, {sleep:{ms:300}}. Real events, so React/Draft editors accept them. An indexed click is refused when the element is detached, zero-size, disabled or covered, with `{blocked, reason, obscuredBy}`; `force` bypasses that check, and the log entry then carries `covered` with what was on top. With `settleMs`, the result also reports `navigated`, `url`, `openedTab`, `downloads` (started, with filename and guid) and same-origin errors plus a failed destination document. A JavaScript dialog blocks the page: the call that hit it returns `dialog:{type,message}`, every other tool then fails fast with that dialog, and `{dialog:{accept:true,text:\"...\"}}` answers it — one per call, so a chained alert after a confirm is reported for a second answer.",
+            "description": "Send real user input, in order. Actions: {click:{i|x,y[,button:right|middle,count:2,modifiers:[Shift]]}} (an index is scrolled into view and resolved in the same `within` scope as the last elements call, or in the action's own `within` when it carries one), {hover:{i}}, {drag:{from:{i},to:{i},steps:12}}, {tap:{i}} (touch), {swipe:{from,to}} (touch), {select:{i,value}} (<select>; value is a string, or an array for a multiple select), {insert:\"text\"}, {key:\"Enter\"|\"Control+a\"|\"Control+Shift+z\"|\"a\"|\"Escape\"|\"Tab\"|\"ArrowDown\"|\"F5\"}, {scroll:{dy[,dx][,i|x,y]}} (a real wheel event at that element, that point, or the middle of the viewport: scrolls the page or the pane under it, and a canvas receives the wheel too; the log reports from/to/moved, `delivered` for whether the wheel reached the page, `container` and the wheel point), {dismiss:{prefer:\"reject\"}} (closes cookie walls and modals, refusing cookies when offered), {wait:{idle:true,ms:15000}} (waits for loading to settle), {wait:{text:\"...\",ms:15000}}, {sleep:{ms:300}}. Real events, so React/Draft editors accept them. An indexed click is refused when the element is detached, zero-size, disabled or covered, with `{blocked, reason, obscuredBy}`; `force` bypasses that check, and the log entry then carries `covered` with what was on top. With `settleMs`, the result also reports `navigated`, `url`, `openedTab`, `downloads` (started, with filename and guid) and same-origin errors plus a failed destination document. A JavaScript dialog blocks the page: the call that hit it returns `dialog:{type,message}`, every other tool then fails fast with that dialog, and `{dialog:{accept:true,text:\"...\"}}` answers it — one per call, so a chained alert after a confirm is reported for a second answer.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1466,29 +1467,40 @@ const PASTE_SNAP_JS: &str = r#"(() => {
 /// Scroll by `dy`, in one evaluation. The document first; when it does not
 /// move (an app whose content scrolls inside a container), the scrollable
 /// container under the middle of the viewport, like a wheel would.
-const SCROLL_JS: &str = r#"((dy) => {
-  const page = document.scrollingElement || document.documentElement;
-  const before = scrollY;
-  // 'instant' overrides `scroll-behavior: smooth`, which would report no move
-  window.scrollBy({ top: dy, left: 0, behavior: 'instant' });
-  if (Math.abs(scrollY - before) > 1) {
-    return { from: Math.round(before), to: Math.round(scrollY), moved: true,
-             atBottom: Math.ceil(scrollY + innerHeight) >= page.scrollHeight - 2 };
-  }
-  let el = document.elementFromPoint(innerWidth / 2, innerHeight / 2);
-  for (; el && el !== document.body && el !== document.documentElement; el = el.parentElement) {
-    const oy = getComputedStyle(el).overflowY;
-    if ((oy === 'auto' || oy === 'scroll' || oy === 'overlay') && el.scrollHeight > el.clientHeight + 1) break;
-  }
-  if (!el || el === document.body || el === document.documentElement) {
-    return { from: Math.round(before), to: Math.round(scrollY), moved: false,
-             atBottom: Math.ceil(scrollY + innerHeight) >= page.scrollHeight - 2 };
-  }
-  const b = el.scrollTop;
-  el.scrollBy({ top: dy, left: 0, behavior: 'instant' });
-  return { from: Math.round(b), to: Math.round(el.scrollTop), moved: Math.abs(el.scrollTop - b) > 1,
-           atBottom: Math.ceil(el.scrollTop + el.clientHeight) >= el.scrollHeight - 2, container: true };
-})"#;
+/// A multiple selection matches when the sets are equal. The page reports its
+/// options in its own order, and a repeated request value is the same request.
+fn selection_matches(want: &[String], got: &Value) -> bool {
+    let mut want: Vec<&str> = want.iter().map(String::as_str).collect();
+    let mut have: Vec<&str> = got
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    want.sort_unstable();
+    want.dedup();
+    have.sort_unstable();
+    have.dedup();
+    want == have
+}
+
+/// `select.value` as the action takes it: one string, or a non-empty array of
+/// strings for a multiple select.
+fn select_values(v: Option<&Value>) -> Result<Value, String> {
+    match v {
+        Some(Value::String(s)) => Ok(Value::String(s.clone())),
+        Some(Value::Array(a)) if !a.is_empty() => {
+            let mut out = Vec::with_capacity(a.len());
+            for x in a {
+                out.push(Value::String(
+                    x.as_str().ok_or("select values must be strings")?.to_string(),
+                ));
+            }
+            Ok(Value::Array(out))
+        }
+        Some(Value::Array(_)) => Err("select needs at least one value".into()),
+        Some(_) => Err("select value must be a string or an array of strings".into()),
+        None => Err("select needs value".into()),
+    }
+}
 
 fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], force: bool, scope: Option<&str>) -> Result<Value, String> {
     let mut log = Vec::new();
@@ -1631,11 +1643,31 @@ fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], force: bool, sc
                 log.push(json!({ "key": k }));
             }
         } else if let Some(s) = obj.get("scroll") {
-            let dy = s.get("dy").and_then(Value::as_f64).unwrap_or(400.0);
-            let r = conn.eval(&format!("{SCROLL_JS}({dy})"))?;
-            // "moved: false" means neither the document nor the container
-            // under the middle of the viewport could scroll that way.
-            log.push(json!({ "scrolled": r }));
+            let (dx, dy) = scroll::deltas(
+                s.get("dx").and_then(Value::as_f64),
+                s.get("dy").and_then(Value::as_f64),
+            )?;
+            // A real wheel goes where the pointer is: an element, a point, or the
+            // middle of the viewport for a plain page scroll.
+            let (x, y) = if let Some(i) = s.get("i").and_then(Value::as_u64) {
+                let at = pick(conn, scope, i, true, None)?;
+                (
+                    at.get("x").and_then(Value::as_f64).unwrap_or(0.0),
+                    at.get("y").and_then(Value::as_f64).unwrap_or(0.0),
+                )
+            } else if let (Some(x), Some(y)) = (
+                s.get("x").and_then(Value::as_f64),
+                s.get("y").and_then(Value::as_f64),
+            ) {
+                (x, y)
+            } else {
+                let v = conn.eval("[innerWidth / 2, innerHeight / 2]")?;
+                (
+                    v.get(0).and_then(Value::as_f64).unwrap_or(0.0),
+                    v.get(1).and_then(Value::as_f64).unwrap_or(0.0),
+                )
+            };
+            log.push(json!({ "scrolled": scroll::send(conn, x, y, dx, dy)? }));
         } else if let Some(d) = obj.get("dismiss") {
             let prefer = d.get("prefer").and_then(Value::as_str).unwrap_or("reject").to_lowercase();
             // Closer indexes come from a whole-document scan, so they are
@@ -1722,16 +1754,31 @@ fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], force: bool, sc
             // <select> by index: setting .value directly works where a click menu
             // would need a second overlay navigation.
             let i = v.get("i").and_then(Value::as_u64).ok_or("select needs i")?;
-            let value = v.get("value").and_then(Value::as_str).ok_or("select needs value")?;
-            let at = pick(conn, scope, i, false, Some(value))?;
+            let value = select_values(v.get("value"))?;
+            let at = pick(conn, scope, i, false, Some(&value))?;
             if let Some(e) = at.get("selectError").and_then(Value::as_str) {
                 return Err(format!("select failed: {e}"));
             }
             let got = at.get("selected").cloned().unwrap_or(Value::Null);
-            if got.as_str() != Some(value) {
-                return Err(format!("select failed: the <select> has no option {value:?} (it is {got})"));
+            match &value {
+                Value::Array(want) => {
+                    let want: Vec<String> =
+                        want.iter().filter_map(Value::as_str).map(str::to_string).collect();
+                    if !selection_matches(&want, &got) {
+                        return Err(format!("select failed: asked for {want:?}, the page has {got}"));
+                    }
+                    log.push(json!({ "selected": { "i": i, "value": got } }));
+                }
+                Value::String(want) => {
+                    if got.as_str() != Some(want.as_str()) {
+                        return Err(format!(
+                            "select failed: the <select> has no option {want:?} (it is {got})"
+                        ));
+                    }
+                    log.push(json!({ "selected": { "i": i, "value": got } }));
+                }
+                _ => {}
             }
-            log.push(json!({ "selected": { "i": i, "value": got } }));
         } else if let Some(w) = obj.get("wait") {
             let ms = w.get("ms").and_then(Value::as_u64).unwrap_or(15_000);
             if w.get("idle").and_then(Value::as_bool).unwrap_or(false) {
@@ -3582,6 +3629,27 @@ mod tests {
             _ => None,
         };
         assert_eq!(config_dir_for(Os::Linux, &get), std::path::PathBuf::from("/home/ben/.config/cdp-mcp"));
+    }
+
+    #[test]
+    fn a_multiple_selection_compares_as_a_set() {
+        let got = json!(["c", "a"]);
+        assert!(selection_matches(&["a".into(), "c".into()], &got));
+        assert!(selection_matches(&["c".into(), "a".into(), "c".into()], &got));
+        assert!(!selection_matches(&["a".into(), "b".into()], &got));
+        assert!(!selection_matches(&[], &got));
+        // A page that reports a string where an array was asked for is not a match.
+        assert!(!selection_matches(&["a".into()], &json!("a")));
+    }
+
+    #[test]
+    fn select_values_accepts_one_or_many() {
+        assert_eq!(select_values(Some(&json!("pro"))).unwrap(), json!("pro"));
+        assert_eq!(select_values(Some(&json!(["a", "c"]))).unwrap(), json!(["a", "c"]));
+        assert!(select_values(Some(&json!([]))).unwrap_err().contains("at least one"));
+        assert!(select_values(Some(&json!(5))).unwrap_err().contains("string or an array"));
+        assert!(select_values(Some(&json!([1]))).unwrap_err().contains("must be strings"));
+        assert!(select_values(None).unwrap_err().contains("needs value"));
     }
 
     #[test]
