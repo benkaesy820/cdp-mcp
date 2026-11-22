@@ -119,7 +119,7 @@ pub(crate) fn tool_defs() -> Value {
         },
         {
             "name": "elements",
-            "description": "Scan the page: `overlays` lists dialogs/modals/cookie walls with their dismiss buttons, and `elements` lists visible interactive nodes with a clickable index `i` and centre point; `capped` says the scanner stopped at its element cap (600 by default; pass `limit` above 600 to lift it, up to 2000) with matching elements left. Filter with `find` and cap with `limit` to keep the payload small. Indexes are absolute in the unfiltered list and are re-resolved at click time, so they cannot silently go stale. A cross-origin frame element is listed with its `frame` and acted on inside that frame's own session: click re-resolves it live (scrolling the frame if needed), and hover and select route into the frame too; `link` and `paste` resolve indexes in the main document. Form controls include current `value` (passwords masked), `checked`, `selected` and `disabled`; `within` scopes the scan to a selector in the main document (cross-origin frame elements are left out), the result echoes `scope`, and a selector that matches nothing returns no elements with `scopeMissing: true` instead of the whole page, and `overlays` stay page-wide and are still reported.",
+            "description": "Scan the page: `overlays` lists dialogs/modals/cookie walls with their dismiss buttons, and `elements` lists visible interactive nodes with a clickable index `i` and centre point; `capped` says the scanner stopped at its element cap (600 by default; pass `limit` above 600 to lift it, up to 2000) with matching elements left. Filter with `find` and cap with `limit` to keep the payload small. Indexes are absolute in the unfiltered list and are re-resolved at click time, so they cannot silently go stale. A cross-origin frame element is listed with its `frame` and acted on inside that frame's own session: click re-resolves it live (scrolling the frame if needed), and hover and select route into the frame too; `paste` resolves indexes in the main document. Form controls include current `value` (passwords masked), `checked`, `selected` and `disabled`; `within` scopes the scan to a selector in the main document (cross-origin frame elements are left out), the result echoes `scope`, and a selector that matches nothing returns no elements with `scopeMissing: true` instead of the whole page, and `overlays` stay page-wide and are still reported.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -204,11 +204,6 @@ pub(crate) fn tool_defs() -> Value {
             }
         },
         {
-            "name": "images",
-            "description": "List the images on the page with their source URL and natural size. Download one with download{i}.",
-            "inputSchema": { "type": "object", "properties": { "tab": { "type": "string" } } }
-        },
-        {
             "name": "clip",
             "description": "An agent-owned clipboard that never touches the system one. set/copy {text}, get {id?}, list {limit}, clear, and toSystem (the explicit opt-in when a real Ctrl+V is the only way). Because it is a file, a copy here cannot clobber what the human last copied.",
             "inputSchema": {
@@ -224,44 +219,14 @@ pub(crate) fn tool_defs() -> Value {
             }
         },
         {
-            "name": "link",
-            "description": "Links: {action:\"open\"} opens a link (or the current page) in a new tab, {action:\"copy\"} stores its URL in the agent clipboard. Target with {i} from elements (any element inside an <a href>), or {url}; omit both for the current page.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": { "type": "string", "enum": ["open", "copy"] },
-                    "i": { "type": "integer" },
-                    "url": { "type": "string" },
-                    "foreground": { "type": "boolean", "description": "bring the new tab to the front. Default false: focus stays where the human left it." },
-                    "tab": { "type": "string" }
-                },
-                "required": ["action"]
-            }
-        },
-        {
-            "name": "image",
-            "description": "Work with an image on the page: {action:\"open\"} opens it in a new tab, {action:\"link\"} copies its URL to the clipboard, {action:\"copy\"} puts the pixels on the clipboard so a real Ctrl+V can paste them into Gemini/Docs/chat. Target with {i} from `images` or {url}.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": { "type": "string", "enum": ["open", "link", "copy"] },
-                    "i": { "type": "integer", "description": "index from images" },
-                    "url": { "type": "string" },
-                    "foreground": { "type": "boolean", "description": "bring the new tab to the front. Default false: focus stays where the human left it." },
-                    "tab": { "type": "string" }
-                },
-                "required": ["action"]
-            }
-        },
-        {
             "name": "download",
-            "description": "Download a resource to a local path, fetched inside the page so cookies and referer are correct (authenticated images work). Choose the target with url, or with i = an index from images.",
+            "description": "Download a resource to a local path, fetched inside the page so cookies and referer are correct (authenticated images work). Choose the target with url, or with i = the position in the page's list of <img> that have a source (lazy placeholders without one are skipped).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
                     "url": { "type": "string", "description": "absolute or relative URL to fetch" },
-                    "i": { "type": "integer", "description": "index from images (alternative to url)" },
+                    "i": { "type": "integer", "description": "position in the page's sourced <img> list (alternative to url)" },
                     "maxBytes": { "type": "integer", "description": "refuse larger files (default 10 MiB)" },
                     "tab": { "type": "string" }
                 },

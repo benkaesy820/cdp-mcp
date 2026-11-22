@@ -798,7 +798,6 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
                 })
             }
         }
-        "images" => files::images(cfg, args),
         "clip" => {
             // An agent-owned clipboard. The system clipboard is the human's: touching it
             // races with whatever they last copied. This store never leaves a file,
@@ -852,8 +851,6 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
                 other => Err(format!("unknown clip action: {other}")),
             }
         }
-        "link" => files::link(cfg, args),
-        "image" => files::image(cfg, args),
         "download" => files::download(cfg, args),
         "upload" => files::upload(cfg, args),
         "paste" => files::paste(cfg, args),
