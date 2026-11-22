@@ -697,6 +697,10 @@ pub struct Conn {
     /// `Browser.setDownloadBehavior` is redirected to a folder. It must be
     /// restored on every exit path: the human's own downloads use it too.
     download_on: bool,
+    /// Focus emulation was turned off but the browser could not confirm it (a
+    /// dialog or a timeout). Only then does teardown retry, so an owned tab keeps
+    /// the emulation `with_conn_retry` turned on deliberately.
+    focus_restore: bool,
     /// An action in the current input batch navigated (an execution context was
     /// cleared). Reset by `run_batch`, so a later failure is not blamed on an
     /// earlier navigation.
@@ -768,7 +772,8 @@ impl Conn {
                               binding: None, timed_out: false, contexts_cleared: false,
                               receipts: None, page_on: false, dialog: None, dialog_seq: 0, network_on: false,
                               destroyed: Vec::new(), file_chooser: None, file_chooser_on: false, download_on: false,
-                                nav_batch: false,
+                              focus_restore: false,
+                              nav_batch: false,
                                nav_committed: None, nav_same: None,
                               nav_dom_ready: false, media: MediaState::default(), touch_on: false };
         conn.set_read_timeout(ms);
@@ -1103,7 +1108,9 @@ impl Conn {
     pub fn cleanup_domains(&mut self) -> Res<()> {
         self.end_file_chooser();
         self.end_downloads();
-        let _ = self.set_focus_emulation(false);
+        if self.focus_restore {
+            let _ = self.set_focus_emulation(false);
+        }
         if self.network_on && self.dialog.is_none() {
             self.call_within("Network.disable", json!({}), 400)?;
             self.network_on = false;
@@ -1574,28 +1581,40 @@ impl Conn {
     /// and a naive CDP client cannot.
     pub fn set_focus_emulation(&mut self, on: bool) -> Res<()> {
         if self.focus_on == on {
+            if on {
+                self.focus_restore = false;
+            }
             return Ok(());
         }
         if !on {
             // Teardown after a capture on a human's tab: a dialog or a dead
-            // socket must not turn that into a 30 s wait.
+            // socket must not turn that into a 30 s wait. Only a failed teardown
+            // sets the retry flag; an owned tab's emulation is intentional.
             if self.dead {
                 self.focus_on = false;
+                self.focus_restore = false;
                 return Ok(());
             }
             if self.dialog.is_some() {
+                self.focus_restore = true;
                 return Ok(());
             }
-            if self
-                .call_within("Emulation.setFocusEmulationEnabled", json!({ "enabled": false }), 400)
-                .is_ok()
-            {
-                self.focus_on = false;
+            match self.call_within(
+                "Emulation.setFocusEmulationEnabled",
+                json!({ "enabled": false }),
+                400,
+            ) {
+                Ok(_) => {
+                    self.focus_on = false;
+                    self.focus_restore = false;
+                }
+                Err(_) => self.focus_restore = true,
             }
             return Ok(());
         }
         self.call("Emulation.setFocusEmulationEnabled", json!({ "enabled": true }))?;
         self.focus_on = true;
+        self.focus_restore = false;
         Ok(())
     }
 

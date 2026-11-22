@@ -149,7 +149,7 @@ pub const SCAN_JS: &str = r#"(() => {
     elements.push(rec);
     refs.push(el);
     chains.push(chain);
-  }
+    }
     for (const host of node.querySelectorAll('*')) {
       if (PICK ? full() : capped) return;
       if (host.shadowRoot) collect(host.shadowRoot, chain, frameLabel);
@@ -472,7 +472,7 @@ pub const FRAME_ELEMENTS_JS: &str = r#"(() => {
           rec.checked = el.getAttribute('aria-checked') === 'true';
       }
       nodes.push(el);
-    out.push(rec);
+      out.push(rec);
     }
     for (const host of root.querySelectorAll('*')) {
       if (capped) return;

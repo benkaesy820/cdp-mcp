@@ -863,7 +863,7 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
             let actions = args.get("actions").and_then(Value::as_array).ok_or("input needs actions[]")?.clone();
             let announce = args.get("announce").and_then(Value::as_bool).unwrap_or(false);
             let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
-                                        // Managed downloads: opt-in, so a human's own downloads are never
+              // Managed downloads: opt-in, so a human's own downloads are never
               // redirected by default. `0` from the caller means "default", and with a
               // managed folder that default is a real settle window.
               let save = args.get("saveDownloads").and_then(Value::as_bool).unwrap_or(false);
@@ -875,10 +875,10 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
               let mut managed = dir.or_else(|| save.then(|| data_dir().join("downloads")));
               if let Some(d) = managed.as_mut() {
                   std::fs::create_dir_all(&*d)
-                      .map_err(|e| format!("cannot create {}: {e}", d.display()))?;
+                    .map_err(|e| format!("cannot create {}: {e}", d.display()))?;
                   // Chromium resolves the folder on its own side; a relative one would diverge.
                   *d = std::fs::canonicalize(&*d)
-                      .map_err(|e| format!("cannot resolve {}: {e}", d.display()))?;
+                    .map_err(|e| format!("cannot resolve {}: {e}", d.display()))?;
               }
               let settle_arg = args.get("settleMs").and_then(Value::as_u64).unwrap_or(0);
               let settle_ms = if settle_arg == 0 && managed.is_some() { 5_000 } else { settle_arg.min(5_000) };
