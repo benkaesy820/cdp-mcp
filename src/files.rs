@@ -272,10 +272,12 @@ fn uploaded(paths: &[String]) -> Value {
 fn dom_upload(conn: &mut cdp::Conn, tab_id: &str, plan: &Upload) -> Result<Value, String> {
     let doc = conn.call("DOM.getDocument", json!({ "depth": 0, "pierce": true }))?;
     let root = doc.pointer("/root/nodeId").and_then(Value::as_u64).ok_or("no document")?;
-    let found = conn.call("DOM.querySelectorAll", json!({ "nodeId": root, "selector": plan.selector }));
+    // A bad selector, a dialog or a dead socket is not "no element matched":
+    // dropping the error reported every one of them as an empty page.
+    let found = conn.call("DOM.querySelectorAll", json!({ "nodeId": root, "selector": plan.selector }))?;
     let node = found
-        .ok()
-        .and_then(|v| v.get("nodeIds").and_then(Value::as_array).cloned())
+        .get("nodeIds")
+        .and_then(Value::as_array)
         .and_then(|ids| ids.get(plan.dom_index).and_then(Value::as_u64))
         .unwrap_or(0);
     if node == 0 {

@@ -705,6 +705,13 @@ pub struct Conn {
     /// `Browser.setDownloadBehavior` is redirected to a folder. It must be
     /// restored on every exit path: the human's own downloads use it too.
     download_on: bool,
+    /// `Page.startScreencast` is running and has to be stopped, or it keeps
+    /// pushing frames after the capture that needed them.
+    screencast_on: bool,
+    /// A top-frame document commit was seen. The scan and scope caches are
+    /// indexes into the document that just went away, so the next call clears
+    /// them before doing anything.
+    pub doc_navigated: bool,
     /// Focus emulation was turned off but the browser could not confirm it (a
     /// dialog or a timeout). Only then does teardown retry, so an owned tab keeps
     /// the emulation `with_conn_retry` turned on deliberately.
@@ -781,6 +788,7 @@ impl Conn {
                               binding: None, timed_out: false, contexts_cleared: false,
                               receipts: None, page_on: false, dialog: None, dialog_seq: 0, network_on: false,
                               destroyed: Vec::new(), file_chooser: None, file_chooser_on: false, download_on: false,
+                              screencast_on: false, doc_navigated: false,
                               focus_restore: false,
                               nav_batch: false,
                                nav_committed: None, nav_same: None,
@@ -959,6 +967,8 @@ impl Conn {
             Some("Page.frameNavigated") => {
                 let frame = &v["params"]["frame"];
                 if !frame.get("parentId").map(|p| !p.is_null()).unwrap_or(false) {
+                    // A new document: every cached index and scope is stale.
+                    self.doc_navigated = true;
                     let url = frame.get("url").and_then(Value::as_str).unwrap_or("").to_string();
                     let ty = v.pointer("/params/type").and_then(Value::as_str).unwrap_or("Navigation");
                     if self.nav_committed.is_none() {
@@ -1059,6 +1069,7 @@ impl Conn {
             json!({ "format": "jpeg", "quality": 10, "maxWidth": 64, "maxHeight": 64,
                     "everyNthFrame": 1, "maxFramesInFlight": 4 }),
         )?;
+        self.screencast_on = true;
         Ok(())
     }
 
@@ -1116,10 +1127,22 @@ impl Conn {
 
     /// Stop the screencast only when the connection can still answer. An open
     /// dialog or a dead socket would otherwise sit out the full 30 s timeout on a
-    /// teardown path that runs after every capture and every wheel.
+    /// teardown path that runs after every capture and every wheel. A dialog
+    /// leaves the flag set, so `cleanup_domains` stops the stream later: a
+    /// running screencast keeps pushing frames into a socket nobody reads.
     pub fn stop_frames(&mut self) {
-        if !self.dead && self.dialog.is_none() {
-            let _ = self.call_within("Page.stopScreencast", json!({}), 400);
+        if !self.screencast_on {
+            return;
+        }
+        if self.dead {
+            self.screencast_on = false;
+            return;
+        }
+        if self.dialog.is_some() {
+            return;
+        }
+        if self.call_within("Page.stopScreencast", json!({}), 400).is_ok() {
+            self.screencast_on = false;
         }
     }
 
@@ -1143,6 +1166,7 @@ impl Conn {
     pub fn cleanup_domains(&mut self) -> Res<()> {
         self.end_file_chooser();
         self.end_downloads();
+        self.stop_frames();
         if self.focus_restore {
             let _ = self.set_focus_emulation(false);
         }
@@ -1350,17 +1374,22 @@ impl Conn {
         Ok(())
     }
 
-    /// Put the human's download behavior back. A dialog or a timeout leaves the
-    /// flag set for `cleanup_domains` to retry.
+    /// Put the human's download behavior back. A timeout leaves the flag set for
+    /// `cleanup_domains` to retry.
+    ///
+    /// A dialog does not block this: `Browser.setDownloadBehavior` is answered by
+    /// the browser process, not the renderer (measured: 7 ms with an alert up),
+    /// and skipping it left the human's downloads redirected into our folder in
+    /// every tab until some later call happened to run on the blocked tab.
     pub fn end_downloads(&mut self) {
         if !self.download_on {
             return;
         }
         if self.dead {
+            // The behavior lives in the browser process but is scoped to this
+            // session (measured: it dies with the socket), so there is nothing
+            // left to restore.
             self.download_on = false;
-            return;
-        }
-        if self.dialog.is_some() {
             return;
         }
         if self

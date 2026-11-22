@@ -222,6 +222,13 @@ pub(crate) fn with_conn_retry<R>(
         conn.drain_arrived()?;
         conn.enable_page()?;
         conn.cleanup_domains()?;
+        // A document arrived since the last call: every cached scan index and
+        // the `within` scope that produced it point into the page that left.
+        // `tabs goto` cleared these; a click that navigated did not.
+        if std::mem::take(&mut conn.doc_navigated) {
+            scan_cache().lock().unwrap().remove(tab_id);
+            scope_cache().lock().unwrap().remove(tab_id);
+        }
         if !allow_dialog {
             if let Some(d) = conn.dialog.clone() {
                 return Err(dialog_block(&d));
@@ -516,9 +523,12 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
             }
             let stop_on_error = args.get("stopOnError").and_then(Value::as_bool).unwrap_or(true);
 
-            let mut all = Vec::new();
+            // Only the tail is ever returned; keeping every iteration held up to
+            // 200 full tool results (600-element scans included) in RAM.
+            let mut trail: Vec<Value> = Vec::new();
             let started = std::time::Instant::now();
             let mut hit = false;
+            let mut done = 0u64;
             for iteration in 1..=max_iter {
                 check_cancel()?;
                 let mut iteration_log = Vec::new();
@@ -533,27 +543,33 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
                             // run against a blocked page, and the caller has to
                             // decide whether to accept it.
                             if let Some(d) = dialog {
-                                all.push(json!({ "iteration": iteration, "log": iteration_log }));
+                                trail.push(json!({ "iteration": iteration, "log": iteration_log }));
+                                if trail.len() > 3 { trail.remove(0); }
                                 return Ok(json!({
                                     "iterations": iteration,
                                     "elapsedMs": started.elapsed().as_millis() as u64,
                                     "stoppedOnDialog": true,
                                     "dialog": d,
-                                    "trail": all,
+                                    "trail": trail,
                                 }));
                             }
                         }
                         Err(e) => {
                             iteration_log.push(json!({ "tool": name, "ok": false, "error": e }));
                             if stop_on_error {
-                                all.push(json!({ "iteration": iteration, "log": iteration_log }));
+                                trail.push(json!({ "iteration": iteration, "log": iteration_log }));
+                                if trail.len() > 3 { trail.remove(0); }
                                 return Ok(json!({ "iterations": iteration, "elapsedMs": started.elapsed().as_millis() as u64,
-                                                  "stoppedOnError": true, "trail": all }));
+                                                  "stoppedOnError": true, "trail": trail }));
                             }
                         }
                     }
                 }
-                all.push(json!({ "iteration": iteration, "log": iteration_log }));
+                done = iteration;
+                trail.push(json!({ "iteration": iteration, "log": iteration_log }));
+                if trail.len() > 3 {
+                    trail.remove(0);
+                }
 
                 // Did we reach the state we were waiting for?
                 if until_text.is_some() || until_gone.is_some() {
@@ -600,7 +616,7 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
                             "elapsedMs": started.elapsed().as_millis() as u64,
                             "stoppedOnDialog": true,
                             "dialog": d,
-                            "trail": all,
+                            "trail": trail,
                         }));
                     }
                     if hit { break; }
@@ -609,14 +625,11 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
                     nap(between)?;
                 }
             }
-            let iterations = all.len();
-            // Only the tail matters for the caller; the middle is noise.
-            let keep = all.split_off(iterations.saturating_sub(3));
             Ok(json!({
-                "iterations": iterations,
+                "iterations": done,
                 "conditionMet": if until_text.is_some() || until_gone.is_some() { json!(hit) } else { Value::Null },
                 "elapsedMs": started.elapsed().as_millis() as u64,
-                "trail": keep,
+                "trail": trail,
             }))
         }
         "idle" => {
@@ -949,6 +962,10 @@ pub(crate) fn b64decode(s: &str) -> Result<Vec<u8>, String> {
 struct Inflight {
     current: Option<String>,
     cancelled: HashSet<String>,
+    /// The client closed stdin. Anything still queued is for a reader that is
+    /// gone, so it must not start: a queued ten-minute wait would run to the end
+    /// for nobody.
+    eof: bool,
 }
 
 /// One JSON-RPC message per line. Both threads write, so the line is written
@@ -1046,8 +1063,11 @@ fn main() {
                 }
             }
             // The client is gone: stop whatever is running instead of finishing
-            // a long flow for nobody.
+            // a long flow for nobody, and refuse anything still queued.
             CANCELLED.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Ok(mut f) = inflight.lock() {
+                f.eof = true;
+            }
         });
     }
 
@@ -1074,6 +1094,9 @@ fn main() {
                 let rid = id.to_string();
                 {
                     let mut f = inflight.lock().unwrap();
+                    if f.eof {
+                        break; // the client is gone; queued work is for nobody
+                    }
                     if f.cancelled.remove(&rid) {
                         continue; // cancelled before it started: never run it
                     }
