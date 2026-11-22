@@ -382,7 +382,7 @@ pub(crate) fn paste(cfg: &Cfg, args: &Value) -> Result<Value, String> {
         // clipboard is not an option: on Wayland only the focused app may read
         // it, and the browser is deliberately kept unfocused so the human keeps
         // their keyboard (measured: Ctrl+V into the unfocused browser pasted
-        // nothing, focused it pasted). So this method needs no clipboard at all.
+        // nothing, focused it pasted). So this path needs no clipboard at all.
         let name = path.as_deref()
             .and_then(|p| std::path::Path::new(p).file_name())
             .and_then(|n| n.to_str())

@@ -78,7 +78,7 @@ fn config_root_for(os: Os, get: &dyn Fn(&str) -> Option<String>) -> std::path::P
     }
 }
 
-/// Where screenshots and managed downloads live.
+/// Where screenshots, pdfs and managed downloads live.
 fn data_root_for(os: Os, get: &dyn Fn(&str) -> Option<String>) -> std::path::PathBuf {
     match os {
         Os::Linux => env_nonempty(get, "XDG_DATA_HOME")
@@ -307,6 +307,11 @@ pub(crate) fn check_cancel() -> Result<(), String> {
     }
 }
 
+/// The longest a single call may park the tool. Every waiting entry point
+/// (`idle`'s timeout, an input action's `wait`/`sleep`) refuses more, so a
+/// missing argument cannot turn into an hours-long call.
+pub(crate) const MAX_WAIT_MS: u64 = 900_000;
+
 /// Sleep that a cancellation cuts short.
 pub(crate) fn nap(ms: u64) -> Result<(), String> {
     let until = std::time::Instant::now() + std::time::Duration::from_millis(ms);
@@ -478,9 +483,8 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
     match name {
         "flow" => {
             // A sequence that runs *inside* the server: N browser steps for one
-            // model turn. This is the token lever — not the transport. `batch`
-            // does the same in one request; `flow` adds a repeat-until loop,
-            // which is what heavy work actually needs (click "more" until the
+            // model turn. This is the token lever — not the transport — and the
+            // repeat-until loop is what heavy work needs (click "more" until the
             // item appears, without a turn per click).
             let steps = args.get("steps").and_then(Value::as_array).cloned().unwrap_or_default();
             if steps.is_empty() {
@@ -590,6 +594,9 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
             // describing it as idle (`maxIdleMs`). A page that keeps ticking
             // must not turn a 10-minute wait into an instant one.
             let timeout = args.get("timeoutMs").and_then(Value::as_u64).unwrap_or(600_000);
+            if timeout > MAX_WAIT_MS {
+                return Err(format!("idle: timeoutMs must be at most {MAX_WAIT_MS}"));
+            }
             let max_idle = args.get("maxIdleMs").and_then(Value::as_u64).unwrap_or(timeout);
             let until_text = args.get("untilText").and_then(Value::as_str).map(str::to_string);
             // Waiting for a thing to exist is the common case a text search
@@ -1076,7 +1083,8 @@ mod tests {
     }
 
     #[test]
-    fn base64_round_trips() {        for n in 0..10 {
+    fn base64_round_trips() {
+        for n in 0..10 {
             let bytes: Vec<u8> = (0..n * 7 + 1).map(|b| (b * 37) as u8).collect();
             assert_eq!(b64decode(&b64encode(&bytes)).unwrap(), bytes);
         }

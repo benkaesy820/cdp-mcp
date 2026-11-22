@@ -611,9 +611,9 @@ pub fn close_tab(endpoint: &str, id: &str) -> Res<bool> {
     Ok(closed)
 }
 
-/// The emulated media overrides active on this connection.
-/// `Emulation.setEmulatedMedia` replaces the whole feature list, so the state
-/// has to be kept here for the next call to merge into instead of wiping.
+/// The media overrides active on one tab. `Emulation.setEmulatedMedia` replaces
+/// the whole feature list, so `emulate::Emulated` keeps it to merge into instead
+/// of wiping what the caller set earlier.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MediaState {
     pub media: String,

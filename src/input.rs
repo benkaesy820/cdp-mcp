@@ -10,15 +10,11 @@ use crate::scan;
 use crate::scan::{frame_click, frame_target, pick, scan_js};
 use crate::scroll;
 use crate::wait::{wait_for_text, wait_idle};
-use crate::{check_cancel, nap, scope_for};
+use crate::{check_cancel, nap, scope_for, MAX_WAIT_MS};
 
 /// Irreversible actions already performed in this process.
 /// Keyed by tab + label + index: a retry loop is caught, a *different* post is
 /// not, and a same-labelled button on another tab is a different click.
-/// The longest a single action may park the tool: the same ceiling the idle
-/// tool's timeout uses. Anything larger is a caller mistake, not a wait.
-const MAX_WAIT_MS: u64 = 900_000;
-
 fn guard() -> &'static Mutex<HashSet<String>> {
     static DONE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     DONE.get_or_init(|| Mutex::new(HashSet::new()))

@@ -166,7 +166,7 @@ pub(crate) fn tool_defs() -> Value {
                     "force": { "type": "boolean", "description": "allow repeating a final confirmation (Post/Publish/Delete/…) that was already clicked in this run, and bypass the click obstruction check. Verify with delta first." },
                     "downloadDir": { "type": "string", "description": "save downloads started by these actions into this folder; the browser's own downloads are put back before the call returns" },
                     "saveDownloads": { "type": "boolean", "description": "save downloads under <data>/downloads (default false); implies a 5 s settle window, and a download still running holds that window open up to 30 s" },
-                    "settleMs": { "type": "integer", "description": "after the actions, read CDP events for up to this many ms and return same-origin HTTP 4xx/5xx, uncaught exceptions and console errors in `errors` (default 0 = off). Adds the settle time to the call; a managed download still running extends it to 30 s." }
+                    "settleMs": { "type": "integer", "description": "after the actions, read CDP events for up to this many ms (capped at 5000) and return same-origin HTTP 4xx/5xx, uncaught exceptions and console errors in `errors` (default 0 = off). Adds the settle time to the call; a managed download still running extends it to 30 s." }
                 },
                 "required": ["actions"]
             }
