@@ -742,8 +742,9 @@ await withTab(`http://localhost:${fport}/tall`, async (tab) => {
   const png = p => { const b = readFileSync(p); return { w: b.readUInt32BE(16), h: b.readUInt32BE(20) }; };
 
   const at = `/tmp/opencode/e2e-element-${process.pid}.png`;
-  const one = (await s.tool("shot", { tab, i: btn?.i, path: at })).v;
-  const p1 = png(at);
+  const oneCall = await s.tool("shot", { tab, i: btn?.i, path: at });
+  const one = oneCall.v;
+  const p1 = oneCall.ok ? png(at) : { w: 0, h: 0 };
   check("an element shot captures the element's box, not the viewport",
         one?.mode === "element" && one?.element?.w === 160 && one?.element?.h === 40 &&
         Math.abs(p1.w - Math.round(160 * dpr)) <= 1 && Math.abs(p1.h - Math.round(40 * dpr)) <= 1,
@@ -752,8 +753,9 @@ await withTab(`http://localhost:${fport}/tall`, async (tab) => {
         /Below the fold/.test(one?.element?.label || "") && one?.element?.i === btn?.i, one?.element);
 
   const padded = `/tmp/opencode/e2e-padded-${process.pid}.png`;
-  const two = (await s.tool("shot", { tab, i: btn?.i, padding: 20, path: padded })).v;
-  const p2 = png(padded);
+  const twoCall = await s.tool("shot", { tab, i: btn?.i, padding: 20, path: padded });
+  const two = twoCall.v;
+  const p2 = twoCall.ok ? png(padded) : { w: 0, h: 0 };
   check("padding widens the element's box",
         two?.element?.w === 200 && two?.element?.h === 80 &&
         Math.abs(p2.w - Math.round(200 * dpr)) <= 1 && Math.abs(p2.h - Math.round(80 * dpr)) <= 1,
@@ -789,7 +791,7 @@ await withTab(`http://localhost:${fport}/tall`, async (tab) => {
         { v: a4, head: head2 });
   try { unlinkSync(explicit); } catch {}
 
-  const withShot = await s.tool("elements", { tab, limit: 5, shot: "viewport", maxWidth: 400 });
+  const withShot = await s.tool("elements", { tab, limit: 5, shot: "viewport", shotMaxWidth: 400 });
   const shotBlocks = withShot.blocks || [];
   check("elements {shot} attaches a capture of the viewport",
         withShot.ok &&

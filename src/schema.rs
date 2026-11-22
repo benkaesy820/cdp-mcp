@@ -335,9 +335,6 @@ pub(crate) fn tool_defs() -> Value {
     ])
 }
 
-/// What CDP needs to know about one key: DOM `key`, physical `code`, Windows
-/// virtual key code, and the text it types (None for keys that type nothing).
-
 #[cfg(test)]
 mod tests {
     use super::*;

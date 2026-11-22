@@ -12,6 +12,9 @@ use crate::scroll;
 use crate::wait::{wait_for_text, wait_idle};
 use crate::{check_cancel, nap, scope_for};
 
+/// Irreversible actions already performed in this process.
+/// Keyed by tab + label + index: a retry loop is caught, a *different* post is
+/// not, and a same-labelled button on another tab is a different click.
 fn guard() -> &'static Mutex<HashSet<String>> {
     static DONE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     DONE.get_or_init(|| Mutex::new(HashSet::new()))
@@ -19,7 +22,6 @@ fn guard() -> &'static Mutex<HashSet<String>> {
 
 /// Final confirmations only. A bare "Share" opens a dialog and is not included;
 /// "Share now" is, because that is the click that publishes.
-
 pub(crate) fn irreversible(label: &str) -> bool {
     let l = label.trim().to_lowercase();
     ["post", "publish", "share now", "send", "delete", "remove", "pay", "buy",
@@ -31,7 +33,6 @@ pub(crate) fn irreversible(label: &str) -> bool {
 /// Refuse a second click on the same final confirmation in one run, unless the
 /// caller forced it. One place, because the frame path and the page path must
 /// not drift: a frame click that skipped this would be a way around it.
-
 pub(crate) fn guard_irreversible(tab: &str, label: &str, i: u64, force: bool) -> Result<(), String> {
     let key = format!("{tab}|{label}|{i}");
     let already = guard().lock().unwrap().contains(&key);
@@ -46,9 +47,8 @@ pub(crate) fn guard_irreversible(tab: &str, label: &str, i: u64, force: bool) ->
     Ok(())
 }
 
-/// An empty or whitespace-only selector is no selector: it must not read as a
-/// scope that matched everything, and it must not be passed to querySelector.
-
+/// The refusal a blocked indexed click reports. One shape for the page and the
+/// frame path, so a reason and its target cannot drift apart.
 pub(crate) fn blocked_click(
     reason: &str,
     i: u64,
@@ -65,6 +65,8 @@ pub(crate) fn blocked_click(
         .to_string()
 }
 
+/// What CDP needs to know about one key: DOM `key`, physical `code`, Windows
+/// virtual key code, and the text it types (None for keys that type nothing).
 pub(crate) fn key_spec(name: &str) -> (String, String, i64, Option<String>) {
     let named = |key: &str, code: &str, vk: i64, text: Option<&str>| {
         (key.to_string(), code.to_string(), vk, text.map(str::to_string))
@@ -109,7 +111,6 @@ pub(crate) fn key_spec(name: &str) -> (String, String, i64, Option<String>) {
 
 /// Press and release one key, with modifiers given as "Control+Shift+z".
 /// Returns the modifier mask that was applied.
-
 pub(crate) fn press(conn: &mut cdp::Conn, combo: &str) -> Result<i64, String> {
     // "+" alone, or a trailing "++", means the plus key itself.
     let (mods, base) = if combo == "+" {
@@ -157,7 +158,6 @@ pub(crate) fn press(conn: &mut cdp::Conn, combo: &str) -> Result<i64, String> {
     Ok(mask)
 }
 
-
 pub(crate) fn click_at(conn: &mut cdp::Conn, x: f64, y: f64) -> Result<(), String> {
     // The three events are pipelined: the browser still sees them in order, but
     // there is one round trip instead of three.
@@ -171,9 +171,7 @@ pub(crate) fn click_at(conn: &mut cdp::Conn, x: f64, y: f64) -> Result<(), Strin
     Ok(())
 }
 
-
 /// A click with a non-left button, a click count or modifiers.
-
 pub(crate) fn click_precise(conn: &mut cdp::Conn, x: f64, y: f64, button: &str, count: u64, mods: i64) -> Result<(), String> {
     let held = match button { "right" => 2, "middle" => 4, _ => 1 };
     conn.call_many(&[
@@ -188,7 +186,6 @@ pub(crate) fn click_precise(conn: &mut cdp::Conn, x: f64, y: f64, button: &str, 
 
 /// Click element `i`: resolved, scrolled into view and measured in one
 /// evaluation, then clicked. Returns what `pick` saw.
-
 pub(crate) fn click_index(conn: &mut cdp::Conn, scope: Option<&str>, i: u64) -> Result<Value, String> {
     let at = pick(conn, scope, i, true, None)?;
     let x = at.get("x").and_then(Value::as_f64).unwrap_or(0.0);
@@ -199,7 +196,6 @@ pub(crate) fn click_index(conn: &mut cdp::Conn, scope: Option<&str>, i: u64) -> 
 
 /// The log entry for a click by index: where it went, and a warning when
 /// something else was on top of the target.
-
 pub(crate) fn click_log(at: &Value) -> Value {
     let mut c = json!({ "i": at.get("i"), "x": at.get("x"), "y": at.get("y") });
     if at.get("scrolled").and_then(Value::as_bool) == Some(true) {
@@ -212,9 +208,8 @@ pub(crate) fn click_log(at: &Value) -> Value {
 }
 
 
-/* -------------------------------- capture -------------------------------- */
-
-
+/// Resolve `{i}` or `{x,y}` to a screen point. An index is scrolled into
+/// view first, so the point is on screen where input can reach it.
 pub(crate) fn point_of(conn: &mut cdp::Conn, scope: Option<&str>, v: &Value) -> Result<(f64, f64), String> {
     if let Some(i) = v.get("i").and_then(Value::as_u64) {
         let at = pick(conn, scope, i, true, None)?;
@@ -229,7 +224,6 @@ pub(crate) fn point_of(conn: &mut cdp::Conn, scope: Option<&str>, v: &Value) -> 
 }
 
 /// Modifier bitmask for CDP: Alt=1, Ctrl=2, Meta=4, Shift=8.
-
 pub(crate) fn mod_mask(v: Option<&Value>) -> i64 {
     let mut m = 0;
     if let Some(arr) = v.and_then(Value::as_array) {
@@ -248,7 +242,6 @@ pub(crate) fn mod_mask(v: Option<&Value>) -> i64 {
 
 /// A pointer move in small steps: pages that track drag gestures (canvas, lists,
 /// sliders) ignore a single jump from A to B.
-
 pub(crate) fn drag_path(conn: &mut cdp::Conn, from: (f64, f64), to: (f64, f64), steps: u32) -> Result<(), String> {
     let steps = steps.clamp(2, 40);
     // One round trip per move, deliberately. Pipelining the whole path into a
@@ -276,9 +269,9 @@ pub(crate) fn drag_path(conn: &mut cdp::Conn, from: (f64, f64), to: (f64, f64), 
     Ok(())
 }
 
-/// JS: does the page's text contain `want`? Evaluated in the page, so only a
-/// boolean crosses the socket instead of the whole body text.
-
+/// Scroll by `dy`, in one evaluation. The document first; when it does not
+/// move (an app whose content scrolls inside a container), the scrollable
+/// container under the middle of the viewport, like a wheel would.
 /// A multiple selection matches when the sets are equal. The page reports its
 /// options in its own order, and a repeated request value is the same request.
 pub(crate) fn selection_matches(want: &[String], got: &Value) -> bool {
@@ -296,7 +289,6 @@ pub(crate) fn selection_matches(want: &[String], got: &Value) -> bool {
 
 /// `select.value` as the action takes it: one string, or a non-empty array of
 /// strings for a multiple select.
-
 pub(crate) fn select_values(v: Option<&Value>) -> Result<Value, String> {
     match v {
         Some(Value::String(s)) => Ok(Value::String(s.clone())),
@@ -314,7 +306,6 @@ pub(crate) fn select_values(v: Option<&Value>) -> Result<Value, String> {
         None => Err("select needs value".into()),
     }
 }
-
 
 pub(crate) fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], force: bool, scope: Option<&str>) -> Result<Value, String> {
     let mut log = Vec::new();
@@ -622,7 +613,6 @@ pub(crate) fn run_input(conn: &mut cdp::Conn, tab: &str, actions: &[Value], forc
 /// One `input` call: the actions, the optional settle window, and the fields
 /// that say what the page did. Split out so the dialog-aware connection guard
 /// can be chosen without duplicating the body.
-
 pub(crate) fn run_batch(
     conn: &mut cdp::Conn,
     tab_id: &str,
@@ -747,9 +737,6 @@ pub(crate) fn run_batch(
     }
     Ok(out)
 }
-
-/// A step inherits the caller's tab unless it names one: `flow {tab}` used to
-/// leave its steps on whatever tab the last call happened to touch.
 
 #[cfg(test)]
 mod tests {

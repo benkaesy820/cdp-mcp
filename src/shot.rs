@@ -6,6 +6,7 @@ use crate::cdp::{self, Conn};
 use crate::scan::pick;
 use crate::{b64decode, nonempty_scope, scope_for, with_conn, Cfg};
 
+/// The MIME the bytes really are. `shot` used to report a WebP capture as JPEG.
 pub(crate) fn mime_for(format: &str) -> &'static str {
     match format {
         "png" => "image/png",
@@ -14,9 +15,8 @@ pub(crate) fn mime_for(format: &str) -> &'static str {
     }
 }
 
-/// Last scan per tab, so `mode:"delta"` can say what changed instead of
-/// re-sending the whole page after every click. Keyed by tab id.
-
+/// mode: "viewport" (what you see), "full" (whole document, height-capped) or
+/// "custom" (a region in CSS pixels).
 pub(crate) fn capture_png(
     conn: &mut cdp::Conn,
     mode: &str,
@@ -71,7 +71,25 @@ pub(crate) fn capture_png(
         }
     }
 
-    let r = conn.call("Page.captureScreenshot", params)?;
+    // A capture of a window that is not being rendered waits for a frame that
+    // never comes. Bound it: ten seconds is already far past a working capture
+    // (measured 98 ms on screen, 19 s off it), and the caller gets the same
+    // "no frame" explanation the screencast guard gives instead of a socket
+    // timeout.
+    let r = match conn.call_within("Page.captureScreenshot", params, 10_000) {
+        Ok(v) => v,
+        Err(e) => {
+            if conn.timed_out {
+                conn.timed_out = false;
+                return Err(format!(
+                    "no frame: the browser window is not on the workspace you are viewing, \
+                     so it is not being rendered. Switch to it and retry, or skip the \
+                     screenshot — every other tool works without it. ({e})"
+                ));
+            }
+            return Err(e);
+        }
+    };
     let b64 = r.get("data").and_then(Value::as_str).ok_or("screenshot returned no data")?;
     let mime = mime_for(format).to_string();
     Ok((b64decode(b64)?, clipped, mime))
@@ -119,21 +137,19 @@ pub(crate) fn capture_guarded(
 
 /// The capture box for an element, widened by padding but never past the
 /// document origin: CDP rejects a clip that starts before (0, 0).
-
 pub(crate) fn padded_box(x: f64, y: f64, w: f64, h: f64, padding: f64) -> (f64, f64, f64, f64) {
     let px = (x - padding).max(0.0);
     let py = (y - padding).max(0.0);
     (px, py, (x + w + padding) - px, (y + h + padding) - py)
 }
 
-
 pub(crate) fn parse_region(v: Option<&Value>) -> Option<(f64, f64, f64, f64)> {
     let r = v?;
     Some((r.get("x")?.as_f64()?, r.get("y")?.as_f64()?, r.get("w")?.as_f64()?, r.get("h")?.as_f64()?))
 }
 
-/// Resolve `{i}` or `{x,y}` to a screen point. An index is scrolled into
-/// view first, so the point is on screen where input can reach it.
+/// Screenshot the tab: the viewport, the whole document, a region, or one element
+/// by index. A capture borrows the tab through `capture_guarded`.
 
 pub(crate) fn run(cfg: &Cfg, args: &Value) -> Result<Value, String> {
     let tab = args.get("tab").and_then(Value::as_str);

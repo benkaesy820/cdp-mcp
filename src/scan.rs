@@ -471,6 +471,7 @@ pub const FRAME_ELEMENTS_JS: &str = r#"(() => {
   return JSON.stringify({ elements: out, title: document.title.slice(0, 80), url: location.href.slice(0, 200) });
 })()"#;
 
+/// SCAN_JS with its scope placeholder substituted (None = whole document).
 pub(crate) fn scan_js(scope: Option<&str>) -> String {
     let lit = match scope {
         Some(s) => serde_json::to_string(s).unwrap_or_else(|_| "null".into()),
@@ -482,7 +483,6 @@ pub(crate) fn scan_js(scope: Option<&str>) -> String {
 /// Resolve element `i` (in `scope`) inside the page, scroll it into view if
 /// asked, and report where a click on it lands. One evaluation: this used to
 /// be four full scans per click.
-
 pub(crate) fn pick(conn: &mut cdp::Conn, scope: Option<&str>, i: u64, scroll: bool, select: Option<&Value>) -> Result<Value, String> {
     let lit = match scope {
         Some(s) => serde_json::to_string(s).unwrap_or_else(|_| "null".into()),
@@ -516,7 +516,6 @@ pub(crate) fn pick(conn: &mut cdp::Conn, scope: Option<&str>, i: u64, scroll: bo
 /// scoped scan is the exception: a CSS selector cannot reach into a frame.
 /// Coordinates are translated into the embedding page's viewport, which is the
 /// space a click is dispatched in.
-
 pub(crate) fn scan_with_frames(conn: &mut cdp::Conn, scope: Option<&str>) -> Result<Value, String> {
     let mut scan_v = conn.eval(&scan_js(scope))?;
     // A CSS selector can only match this document. Frame elements appended to a
@@ -633,7 +632,6 @@ pub(crate) fn scan_with_frames(conn: &mut cdp::Conn, scope: Option<&str>) -> Res
 /// The target id proves the frame is the same one, not that the document inside
 /// it still shows the same element: a same-site navigation keeps both the target
 /// and the old coordinates, so the click can land on whatever moved there.
-
 pub(crate) fn frame_target(
     conn: &mut cdp::Conn,
     tab: &str,
@@ -716,7 +714,6 @@ pub(crate) fn frame_target(
 }
 
 /// Send one mouse event to a frame's own session, at frame-local coordinates.
-
 pub(crate) fn frame_click(
     conn: &mut cdp::Conn,
     session: &str,
@@ -749,11 +746,9 @@ pub(crate) fn frame_click(
 /// elements. What tells them apart is how much DOM exists: a page still being
 /// built has nodes but no interactive ones yet, while a truly empty document has
 /// almost nothing at all.
-
 pub(crate) fn suspect_render(total: u64, nodes: u64) -> bool {
     total < 3 && nodes < 400
 }
-
 
 pub(crate) fn fingerprint(e: &Value) -> String {
     format!(

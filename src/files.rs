@@ -8,6 +8,8 @@ use crate::input::click_index;
 use crate::scan::pick;
 use crate::{b64decode, b64encode, current_os, nap, scope_for, with_conn, Cfg, Os};
 
+/// Did the editor take the paste after all? Compared against the snapshot the
+/// page stored when a handler cancelled the event and nothing had changed yet.
 const PASTE_LANDED_JS: &str = r#"(() => {
     let el = document.activeElement || document.body;
     while (el && el.shadowRoot && el.shadowRoot.activeElement) el = el.shadowRoot.activeElement;
@@ -26,7 +28,6 @@ const PASTE_LANDED_JS: &str = r#"(() => {
 
 /// Snapshot the focused editor before an insert, so the next
 /// `PASTE_LANDED_JS` can tell whether the text actually landed.
-
 const PASTE_SNAP_JS: &str = r#"(() => {
     let el = document.activeElement || document.body;
     while (el && el.shadowRoot && el.shadowRoot.activeElement) el = el.shadowRoot.activeElement;

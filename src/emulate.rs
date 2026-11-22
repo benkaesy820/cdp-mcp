@@ -204,21 +204,24 @@ fn viewport(conn: &mut Conn) -> Option<Value> {
 /// inside the protocol reply: an immediate read still sees the old size, which
 /// made `reset` look as though it had restored nothing. Wait for the change and
 /// then for it to hold still, bounded.
-fn settle_viewport(conn: &mut Conn, before: &Value) {
-    let Some(mut last) = viewport(conn) else { return };
-    let mut changed = false;
+fn settle_viewport(conn: &mut Conn, before: &Value) -> Result<(), String> {
+    let Some(mut last) = viewport(conn) else { return Ok(()) };
+    // Already different from the pre-call reading: the relayout happened before
+    // the first look, so only stability is left to wait for.
+    let mut changed = last != *before;
     for _ in 0..10 {
-        let _ = crate::nap(30);
-        let Some(now) = viewport(conn) else { return };
+        crate::nap(30)?;
+        let Some(now) = viewport(conn) else { return Ok(()) };
         if now != last {
             changed = true;
             last = now;
             continue;
         }
-        if changed || now == *before {
+        if changed {
             break;
         }
     }
+    Ok(())
 }
 
 /// Apply a call and report what is active, plus what the page itself measures.
@@ -299,7 +302,7 @@ pub(crate) fn run(conn: &mut Conn, tab: &str, args: &Value) -> Result<Value, Str
 
     if let Some(b) = &viewport_before {
         if conn.dialog.is_none() {
-            settle_viewport(conn, b);
+            settle_viewport(conn, b)?;
         }
     }
 

@@ -34,9 +34,8 @@ use std::io::{self, BufRead, Write};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Irreversible actions already performed in this process.
-/// Keyed by tab + label + index: a retry loop is caught, a *different* post is
-/// not, and a same-labelled button on another tab is a different click.
+/// An empty or whitespace-only selector is no selector: it must not read as a
+/// scope that matched everything, and it must not be passed to querySelector.
 pub(crate) fn nonempty_scope(s: &str) -> Option<String> {
     let t = s.trim();
     if t.is_empty() { None } else { Some(t.to_string()) }
@@ -45,6 +44,7 @@ pub(crate) fn nonempty_scope(s: &str) -> Option<String> {
 /// Which platform's conventions to follow. A value, not a `cfg`, so the
 /// resolution below can be tested for every platform on any machine.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+
 enum Os { Linux, Mac, Windows }
 
 fn current_os() -> Os {
@@ -113,7 +113,8 @@ pub(crate) fn data_dir() -> std::path::PathBuf {
     data_dir_for(current_os(), &|k| std::env::var(k).ok())
 }
 
-/// The MIME the bytes really are. `shot` used to report a WebP capture as JPEG.
+/// Last scan per tab, so `mode:"delta"` can say what changed instead of
+/// re-sending the whole page after every click. Keyed by tab id.
 pub(crate) fn scan_cache() -> &'static Mutex<HashMap<String, Value>> {
     static CACHE: OnceLock<Mutex<HashMap<String, Value>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -143,6 +144,7 @@ fn last_tab() -> &'static Mutex<Option<String>> {
 /// failure is the page's answer, and is returned as it is.
 /// How a dead socket may be retried.
 #[derive(PartialEq)]
+
 enum Retry {
     /// Re-run only if nothing reached the page. A half-finished click or key
     /// sequence must never be repeated.
@@ -348,9 +350,7 @@ pub(crate) fn clip_str(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
-/// SCAN_JS with its scope placeholder substituted (None = whole document).
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:9222";
-
 
 fn help() -> String {
     format!(
@@ -369,6 +369,7 @@ fn help() -> String {
 /// Per-agent settings. Deliberately a small JSON file, not a database: a
 /// handful of keys, readable and editable by hand, no crate and no migration.
 #[derive(Clone)]
+
 pub(crate) struct Profile {
     pub(crate) name: String,
     path: std::path::PathBuf,
@@ -419,6 +420,7 @@ impl Profile {
 }
 
 #[derive(Clone)]
+
 pub(crate) struct Cfg {
     pub(crate) endpoint: String,
     pub(crate) profile: Profile,
@@ -459,8 +461,8 @@ pub(crate) fn b64encode(bytes: &[u8]) -> String {
     out
 }
 
-/// mode: "viewport" (what you see), "full" (whole document, height-capped) or
-/// "custom" (a region in CSS pixels).
+/// JS: does the page's text contain `want`? Evaluated in the page, so only a
+/// boolean crosses the socket instead of the whole body text.
 pub(crate) fn has_text_js(want: &str) -> String {
     // `innerText` only: `textContent` includes inline <script> source, so a wait
     // for a word the page's own code mentions matched before it was ever shown.
@@ -471,8 +473,8 @@ pub(crate) fn has_text_js(want: &str) -> String {
     )
 }
 
-/// Did the editor take the paste after all? Compared against the snapshot the
-/// page stored when a handler cancelled the event and nothing had changed yet.
+/// A step inherits the caller's tab unless it names one: `flow {tab}` used to
+/// leave its steps on whatever tab the last call happened to touch.
 pub(crate) fn inherit_tab(mut a: Value, tab: Option<&str>) -> Value {
     if let (Some(t), Some(o)) = (tab, a.as_object_mut()) {
         if !o.contains_key("tab") {
@@ -1024,6 +1026,7 @@ pub(crate) fn b64decode(s: &str) -> Result<Vec<u8>, String> {
 
 /// Which request is running, and which were cancelled before they started.
 #[derive(Default)]
+
 struct Inflight {
     current: Option<String>,
     cancelled: HashSet<String>,
