@@ -214,34 +214,48 @@ pub(crate) fn with_conn_retry<R>(
         }
     };
 
+    // One preparation for a connection, reused or fresh. Whatever already
+    // arrived is read first: a dialog opened between calls must be seen before
+    // this call decides anything, and an idle-dead socket fails here, where the
+    // retry below handles it.
+    let mut attempt = |conn: &mut cdp::Conn, tab_id: &str| -> Result<R, String> {
+        conn.drain_arrived()?;
+        conn.enable_page()?;
+        conn.cleanup_domains()?;
+        if !allow_dialog {
+            if let Some(d) = conn.dialog.clone() {
+                return Err(dialog_block(&d));
+            }
+        }
+        if cdp::is_owned(tab_id) {
+            // A tab we opened lives in the background so the human keeps their
+            // keyboard; it still has to render for screenshots and touch. Free
+            // after the first call: the flag lives in the Conn. Set after the
+            // dialog check, because a blocked renderer would sit on it.
+            let _ = conn.set_focus_emulation(true);
+        }
+        f(conn, tab_id)
+    };
+
     if let Some(k) = cached_key {
         pinned = Some(k.clone());
         let mut cache = conn_cache().lock().unwrap();
         if let Some(conn) = cache.get_mut(&k) {
-            if cdp::is_owned(&k) {
-                // A tab we opened lives in the background so the human keeps
-                // their keyboard; it still has to render for screenshots and
-                // touch. Free after the first call: the flag is in the Conn.
-                let _ = conn.set_focus_emulation(true);
-            }
             let before = conn.replies;
-            // Whatever already arrived is read first: a dialog opened between
-            // calls must be seen before this call decides anything, and an
-            // idle-dead socket fails here, where the retry below handles it.
-            let mut attempt = |conn: &mut cdp::Conn| -> Result<R, String> {
-                conn.drain_arrived()?;
-                conn.enable_page()?;
-                conn.cleanup_domains()?;
-                if !allow_dialog {
-                    if let Some(d) = conn.dialog.clone() {
-                        return Err(dialog_block(&d));
-                    }
-                }
-                f(conn, &k)
-            };
-            match attempt(conn) {
+            match attempt(conn, &k) {
                 Ok(v) => {
-                    *last_tab().lock().unwrap() = Some(k);
+                    // A handler can answer honestly — a beforeunload that closed
+                    // the tab, a note about a lost socket — and still leave a
+                    // corpse cached, which every later call would pay for.
+                    if conn.dead {
+                        cache.remove(&k);
+                        let mut last = last_tab().lock().unwrap();
+                        if last.as_deref() == Some(k.as_str()) {
+                            *last = None;
+                        }
+                    } else {
+                        *last_tab().lock().unwrap() = Some(k);
+                    }
                     return Ok(v);
                 }
                 Err(e) if !conn.dead => return Err(e),
@@ -271,23 +285,14 @@ pub(crate) fn with_conn_retry<R>(
         }
     };
     let mut conn = cdp::Conn::open(&ws_url)?;
-    if cdp::is_owned(&id) {
-        let _ = conn.set_focus_emulation(true);
-    }
-    let mut attempt = |conn: &mut cdp::Conn| -> Result<R, String> {
-        conn.drain_arrived()?;
-        conn.enable_page()?;
-        conn.cleanup_domains()?;
-        if !allow_dialog {
-            if let Some(d) = conn.dialog.clone() {
-                return Err(dialog_block(&d));
-            }
+    let out = attempt(&mut conn, &id);
+    if conn.dead {
+        let mut last = last_tab().lock().unwrap();
+        if last.as_deref() == Some(id.as_str()) {
+            *last = None;
         }
-        f(conn, &id)
-    };
-    let out = attempt(&mut conn);
-    *last_tab().lock().unwrap() = Some(id.clone());
-    if !conn.dead {
+    } else {
+        *last_tab().lock().unwrap() = Some(id.clone());
         conn_cache().lock().unwrap().insert(id, conn);
     }
     out
@@ -682,9 +687,14 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
                 let fg = args.get("foreground").and_then(Value::as_bool).unwrap_or(false);
                 let id = cdp::new_tab(&cfg.endpoint, url, fg)?;
                 // A fresh tab is about:blank and a blank document already reports
-                // readyState "complete", so require the URL to have left it.
+                // readyState "complete", so a real navigation is waited for by
+                // requiring the URL to have left it — unless about:blank is what
+                // was asked for, where the blank document is the answer.
+                let blank_wanted = url == "about:blank";
                 let mut ready = String::from("unknown");
-                let _ = with_conn(&cfg.endpoint, Some(&id), |conn, _| {
+                let mut dialog = Value::Null;
+                let mut note: Option<String> = None;
+                let waited = with_conn(&cfg.endpoint, Some(&id), |conn, _| {
                     let started = std::time::Instant::now();
                     while started.elapsed().as_millis() < 16_000 {
                         // An evaluation during navigation can fail (the old
@@ -692,27 +702,71 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
                         if let Ok(v) = conn.eval("[document.readyState, location.href]") {
                             ready = v.get(0).and_then(Value::as_str).unwrap_or("unknown").to_string();
                             let href = v.get(1).and_then(Value::as_str).unwrap_or_default();
-                            if !href.is_empty() && href != "about:blank" && (ready == "complete" || ready == "interactive") {
+                            if (ready == "complete" || ready == "interactive")
+                                && (blank_wanted || (!href.is_empty() && href != "about:blank"))
+                            {
                                 break;
                             }
-                        } else if conn.dead || conn.dialog.is_some() {
+                        } else if conn.dead {
+                            break;
+                        }
+                        if conn.dialog.is_some() {
                             break;
                         }
                         nap(20)?; // a fresh tab is about:blank for a few ms
                     }
+                    // A dialog opened during the load blocks the renderer: the
+                    // caller has to be told, and it is the reason there is no url.
+                    dialog = conn.dialog.clone().unwrap_or(Value::Null);
                     Ok(())
                 });
+                if waited.is_err() {
+                    // A client stop is not an outcome to report as success. Any
+                    // other failure leaves the tab open with an unknown document,
+                    // which the note says.
+                    check_cancel()?;
+                    if let Err(e) = waited {
+                        note = Some(format!("the tab opened, but its document could not be read: {e}"));
+                    }
+                }
                 // SPAs reach "interactive" before they paint, so a caller that
                 // needs content should ask to settle: wait until the resource
                 // count stops moving instead of trusting readyState alone.
-                if args.get("idle").and_then(Value::as_bool).unwrap_or(false) {
-                    let _ = with_conn(&cfg.endpoint, Some(&id), |conn, _| wait_idle(conn, 20_000, 300));
-                }
+                let idle = if args.get("idle").and_then(Value::as_bool).unwrap_or(false) {
+                    match with_conn(&cfg.endpoint, Some(&id), |conn, _| wait_idle(conn, 20_000, 300)) {
+                        Ok(n) => Some(n),
+                        Err(e) => {
+                            check_cancel()?;
+                            note.get_or_insert(format!("the idle wait ended early: {e}"));
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
                 let final_url = with_conn(&cfg.endpoint, Some(&id), |conn, _| conn.eval("location.href"))
                     .ok()
                     .and_then(|v| v.as_str().map(str::to_string))
                     .unwrap_or_default();
-                Ok(json!({ "tab": id, "url": final_url, "readyState": ready }))
+                if dialog.is_null() && final_url.starts_with("chrome-error://") {
+                    // The browser committed its own error page: the open failed,
+                    // and reporting a tab and a url would hide that.
+                    return Err(format!(
+                        "the tab opened but the navigation failed: the browser showed its own error page ({final_url})"
+                    ));
+                }
+                let mut out = json!({ "tab": id, "url": final_url, "readyState": ready });
+                if let Some(n) = idle {
+                    out["idle"] = json!(true);
+                    out["resources"] = json!(n);
+                }
+                if !dialog.is_null() {
+                    out["dialog"] = dialog;
+                    out["note"] = json!("the tab opened; a load-time dialog is blocking the page, so its url and ready state are not known yet");
+                } else if let Some(n) = note {
+                    out["note"] = json!(n);
+                }
+                Ok(out)
             }
             "close" => {
                 let id = args.get("tab").and_then(Value::as_str).ok_or("close needs tab")?.to_string();

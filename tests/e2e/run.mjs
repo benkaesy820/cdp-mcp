@@ -469,6 +469,40 @@ await withTab(page("frames.html?port=" + fport), async (tab, ev) => {
 // Two tabs are cached at once. A frame click must resolve against the tab it
 // names: reading whichever cache entry came first aimed the event at another
 // page's session, so one of two otherwise identical clicks failed.
+// An about:blank tab is complete the moment it exists. Requiring the URL to have
+// left about:blank made this a 16-second poll of 20 ms evaluations.
+{
+  const t0 = performance.now();
+  const blank = await s.tool("tabs", { action: "open", url: "about:blank" });
+  const blankMs = performance.now() - t0;
+  check("opening about:blank returns at once",
+        blank.ok && blank.v?.readyState === "complete" && blankMs < 1500,
+        { ms: Math.round(blankMs), v: blank.v });
+  if (blank.v?.tab) await s.tool("tabs", { action: "close", tab: blank.v.tab });
+}
+
+// A dialog during parsing blocks the renderer: the caller must be told, instead
+// of getting an empty url and readyState "unknown" with no reason.
+{
+  const dlg = await s.tool("tabs", { action: "open", url: page("alertload.html") });
+  check("a load-time dialog is reported with the opened tab",
+        dlg.ok && dlg.v?.dialog?.type === "alert" && /dialog/.test(String(dlg.v?.note || "")), dlg.v);
+  if (dlg.v?.tab) {
+    await s.tool("input", { tab: dlg.v.tab, actions: [{ dialog: { accept: true } }] });
+    await s.tool("tabs", { action: "close", tab: dlg.v.tab });
+  }
+}
+
+// A port nobody listens on commits the browser's own error page. That is a
+// failed open, and saying "opened" would hide it.
+{
+  const bad = await s.tool("tabs", { action: "open", url: "http://127.0.0.1:9/" });
+  check("an open that commits the browser's error page fails",
+        !bad.ok && /own error page/.test(String(bad.v)), bad.v);
+  const left = ((await s.tool("tabs", { action: "list" })).v || []).filter(t => /127\.0\.0\.1:9/.test(t.url || ""));
+  for (const t of left) await s.tool("tabs", { action: "close", tab: t.tab });
+}
+
 await withTab(page("frames.html?port=" + fport), async (tabA) => {
   const tabB = (await s.tool("tabs", { action: "open", url: page("frames.html?port=" + fport) })).v.tab;
   try {

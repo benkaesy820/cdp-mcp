@@ -721,6 +721,7 @@ fn settle_activity(v: &Value) -> bool {
                     && v.pointer("/params/frame/parentId").map(Value::is_null).unwrap_or(true))
                 || m == "Page.downloadWillBegin"
                 || m == "Browser.downloadWillBegin"
+                || m == "Page.downloadProgress"
                 || m == "Browser.downloadProgress"
         }
         None => false, // a reply is not page activity
@@ -1065,11 +1066,29 @@ impl Conn {
         // visible proves the pipeline wakes up, and the capture that follows
         // still waited 12 s for a *compositor* frame. Waiting for the stream to
         // settle makes the capture cheap on the first try.
+        let mut got = 0;
         for _ in 0..3 {
-            let Ok(p) = self.wait_event("Page.screencastFrame", 1_500) else { break };
-            if let Some(sid) = p.get("sessionId").and_then(Value::as_i64) {
-                let _ = self.call("Page.screencastFrameAck", json!({ "sessionId": sid }));
+            // A dialog blocks the renderer, so no frame can arrive and each
+            // wait would sit out its own slice.
+            if self.dialog.is_some() {
+                break;
             }
+            let Ok(p) = self.wait_event("Page.screencastFrame", 1_500) else {
+                if self.dead {
+                    return Err("connection to the page lost while waiting for a frame".into());
+                }
+                break;
+            };
+            got += 1;
+            if let Some(sid) = p.get("sessionId").and_then(Value::as_i64) {
+                // A courtesy ack: a slow socket must not stretch a wake-up.
+                let _ = self.call_within("Page.screencastFrameAck", json!({ "sessionId": sid }), 400);
+            }
+        }
+        // "The stream started" is not "a frame arrived": the caller's fast-fail
+        // for a window nobody is rendering depends on this being an error.
+        if got == 0 {
+            return Err("no compositor frame arrived: the window is not being rendered".into());
         }
         Ok(())
     }
