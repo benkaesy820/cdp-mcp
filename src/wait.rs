@@ -32,7 +32,10 @@ pub(crate) fn wait_for_text(conn: &mut cdp::Conn, want: &str, ms: u64) -> Result
                     if (queued) return; queued = true;
                     setTimeout(() => {{ queued = false; if (has()) fin(true); }}, 40);
                 }});
-                obs.observe(document.documentElement, {{ subtree: true, childList: true, characterData: true }});
+                // `attributes` too: revealing text by removing `hidden` or
+                // changing a class mutates no node, so without it the wait only
+                // noticed at the end of the slice.
+                obs.observe(document.documentElement, {{ subtree: true, childList: true, characterData: true, attributes: true }});
                 const t = setTimeout(() => fin(has()), {slice});
             }})"#,
             w = Value::String(want.to_string()),

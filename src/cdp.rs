@@ -708,6 +708,9 @@ pub struct Conn {
     /// `Page.startScreencast` is running and has to be stopped, or it keeps
     /// pushing frames after the capture that needed them.
     screencast_on: bool,
+    /// `Target.setDiscoverTargets` is on for a settle window. Left set when the
+    /// window could not turn it off, so `cleanup_domains` can retry.
+    discover_on: bool,
     /// A top-frame document commit was seen. The scan and scope caches are
     /// indexes into the document that just went away, so the next call clears
     /// them before doing anything.
@@ -800,7 +803,7 @@ impl Conn {
                               binding: None, timed_out: false, contexts_cleared: false,
                               receipts: None, page_on: false, dialog: None, dialog_seq: 0, network_on: false,
                               destroyed: Vec::new(), file_chooser: None, file_chooser_on: false, download_on: false,
-                              screencast_on: false, doc_navigated: false,
+                              screencast_on: false, discover_on: false, doc_navigated: false,
                               focus_restore: false,
                               nav_batch: false,
                                nav_committed: None, nav_same: None,
@@ -1179,6 +1182,11 @@ impl Conn {
         self.end_file_chooser();
         self.end_downloads();
         self.stop_frames();
+        if self.discover_on && !self.dead && self.dialog.is_none() {
+            if self.call_within("Target.setDiscoverTargets", json!({ "discover": false }), 400).is_ok() {
+                self.discover_on = false;
+            }
+        }
         if self.focus_restore {
             let _ = self.set_focus_emulation(false);
         }
@@ -1282,11 +1290,14 @@ impl Conn {
         self.call("Network.enable", json!({}))?;
         self.network_on = true;
         if let Err(e) = self.call("Target.setDiscoverTargets", json!({ "discover": true })) {
-            if self.call("Network.disable", json!({})).is_ok() {
+            // Bounded: this is a rollback inside a call that failed, not a place
+            // to spend the 30 s timeout.
+            if self.call_within("Network.disable", json!({}), 400).is_ok() {
                 self.network_on = false;
             }
             return Err(e);
         }
+        self.discover_on = true;
         self.receipts = Some(Receipts::new(origin_of(page_url), opener.to_string()));
         Ok(())
     }
@@ -1582,8 +1593,11 @@ impl Conn {
         self.set_read_timeout(restore);
         if !self.dead {
             // Bounded: if a dialog is up the renderer is blocked, and a teardown
-            // command must not turn a settled action into a 30 s wait.
-            let _ = self.call_within("Target.setDiscoverTargets", json!({ "discover": false }), 400);
+            // command must not turn a settled action into a 30 s wait. A failure
+            // leaves the flag set for `cleanup_domains`.
+            if self.call_within("Target.setDiscoverTargets", json!({ "discover": false }), 400).is_ok() {
+                self.discover_on = false;
+            }
             // A blocked renderer would sit on this command; the next call turns
             // Network off once the dialog is answered.
             if self.dialog.is_none() && self.call_within("Network.disable", json!({}), 400).is_ok() {

@@ -951,6 +951,11 @@ pub(crate) fn elements(cfg: &Cfg, args: &Value) -> Result<Value, String> {
     let unique = args.get("unique").and_then(Value::as_bool).unwrap_or(false);
     let role_filter = args.get("role").and_then(Value::as_str).map(|s| s.to_lowercase());
     let shot_mode = args.get("shot").and_then(Value::as_str).unwrap_or("none").to_string();
+    if mode == "delta" && shot_mode != "none" {
+        // The delta branch returns before the capture tail; it used to drop the
+        // request silently.
+        return Err("elements: mode \"delta\" cannot attach a capture; use mode viewport or full".into());
+    }
     let shot_fmt = args.get("shotFormat").and_then(Value::as_str).unwrap_or("jpeg").to_string();
     let max_w = args.get("shotMaxWidth").and_then(Value::as_f64).unwrap_or(1024.0);
     let region = parse_region(args.get("region"))?;
