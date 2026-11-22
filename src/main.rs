@@ -12,7 +12,6 @@
 //!     has to be an explicit opt-in.
 
 mod cdp;
-mod clip;
 mod emulate;
 mod files;
 mod input;
@@ -24,7 +23,6 @@ mod scroll;
 mod shot;
 mod wait;
 
-use clip::*;
 use wait::*;
 
 use serde_json::{json, Value};
@@ -80,7 +78,7 @@ fn config_root_for(os: Os, get: &dyn Fn(&str) -> Option<String>) -> std::path::P
     }
 }
 
-/// Where reports, clipboard history and screenshots live.
+/// Where screenshots and managed downloads live.
 fn data_root_for(os: Os, get: &dyn Fn(&str) -> Option<String>) -> std::path::PathBuf {
     match os {
         Os::Linux => env_nonempty(get, "XDG_DATA_HOME")
@@ -796,59 +794,6 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
                 with_conn(&cfg.endpoint, tab, |conn, tab_id| {
                     input::run_batch(conn, tab_id, &actions, announce, force, settle_ms, managed.as_deref())
                 })
-            }
-        }
-        "clip" => {
-            // An agent-owned clipboard. The system clipboard is the human's: touching it
-            // races with whatever they last copied. This store never leaves a file,
-            // so a copy here cannot clobber theirs, and `toSystem` is the explicit
-            // opt-in when a real Ctrl+V is the only way to paste somewhere.
-            let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
-            let prof = cfg.profile_now();
-            let path = data_dir().join(format!("clip-{}.jsonl", prof.name));
-            let load = || -> Vec<Value> {
-                std::fs::read_to_string(&path)
-                    .map(|b| b.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).collect())
-                    .unwrap_or_default()
-            };
-            match action {
-                "set" | "copy" => {
-                    let text = args.get("text").and_then(Value::as_str).ok_or("clip set needs text")?;
-                    let (id, count) = clip_append(&prof.name, text, args.get("label").and_then(Value::as_str))?;
-                    Ok(json!({ "stored": text, "id": id, "count": count }))
-                }
-                "get" => {
-                    let all = load();
-                    let item = match args.get("id").and_then(Value::as_u64) {
-                        Some(want) => all.iter().rev().find(|v| v.get("id").and_then(Value::as_u64) == Some(want)).cloned(),
-                        None => all.last().cloned(),
-                    };
-                    Ok(json!({ "item": item }))
-                }
-                "list" => {
-                    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
-                    let all = load();
-                    let start = all.len().saturating_sub(limit);
-                    Ok(json!({ "total": all.len(), "recent": &all[start..] }))
-                }
-                "clear" => {
-                    let _ = std::fs::write(&path, "");
-                    Ok(json!({ "cleared": true }))
-                }
-                "toSystem" => {
-                    // The one opt-in path: put a stored item on the real clipboard.
-                    let text = match args.get("text").and_then(Value::as_str).map(str::to_string) {
-                        Some(t) => t,
-                        None => {
-                            let all = load();
-                            all.last().and_then(|v| v.get("text")).and_then(Value::as_str)
-                                .ok_or("clipboard store is empty")?.to_string()
-                        }
-                    };
-                    clip_write("text/plain;charset=utf-8", text.as_bytes())?;
-                    Ok(json!({ "onSystemClipboard": true, "chars": text.len() }))
-                }
-                other => Err(format!("unknown clip action: {other}")),
             }
         }
         "download" => files::download(cfg, args),

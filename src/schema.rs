@@ -190,32 +190,15 @@ pub(crate) fn tool_defs() -> Value {
         },
         {
             "name": "paste",
-            "description": "Paste text or a file (image, video, PDF) into the focused element. Optionally click element `i` first to focus it. Default method \"page\" hands the data to the page as a paste event (a file nobody takes as a paste is offered as a drop; text nobody intercepts is inserted as typed input) and never touches the system clipboard. method \"system\" uses the real clipboard and Ctrl+V, which only works while the browser window has keyboard focus; the backend is Wayland wl-clipboard, X11 xclip, or macOS pbcopy/pbpaste, and an image on macOS is refused rather than silently dropped.",
+            "description": "Paste text or a file (image, video, PDF) into the focused element, or into the element `i` after clicking it. The data is handed to the page as a paste event: a file nobody takes as a paste is offered as a drop, and text nobody intercepts is inserted as typed text. It never touches the system clipboard, so it works while the browser is unfocused. The reply says how it landed (`via`) or why it did not.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "local file to paste" },
                     "text": { "type": "string", "description": "text to paste (instead of a file)" },
                     "i": { "type": "integer", "description": "click this element index first to focus it" },
-                    "method": { "type": "string", "enum": ["page", "system"], "description": "default page; system = real clipboard + Ctrl+V (browser must be focused)" },
-                    "restore": { "type": "boolean", "description": "method system only: put the previous clipboard back afterwards (default true)" },
                     "tab": { "type": "string" }
                 }
-            }
-        },
-        {
-            "name": "clip",
-            "description": "An agent-owned clipboard that never touches the system one. set/copy {text}, get {id?}, list {limit}, clear, and toSystem (the explicit opt-in when a real Ctrl+V is the only way). Because it is a file, a copy here cannot clobber what the human last copied.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": { "type": "string", "enum": ["set", "copy", "get", "list", "clear", "toSystem"] },
-                    "text": { "type": "string" },
-                    "label": { "type": "string" },
-                    "id": { "type": "integer" },
-                    "limit": { "type": "integer" }
-                },
-                "required": ["action"]
             }
         },
         {

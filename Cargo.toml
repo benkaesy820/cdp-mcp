@@ -22,6 +22,6 @@ panic = "abort"
 opt-level = "z"
 
 [features]
-# Off by default. Enables the two options a careful deployment should not need:
-# non-loopback CDP endpoints and the system clipboard paste. See README, Security.
+# Off by default. Enables the one option a careful deployment should not need:
+# a non-loopback CDP endpoint. See README, Security.
 experimental = []
