@@ -1199,19 +1199,28 @@ impl Conn {
     /// the page the request cannot be sent, so the flag stays set and
     /// `cleanup_domains` tries again once the page answers.
     pub fn end_file_chooser(&mut self) {
-        if !self.file_chooser_on || self.dead {
+        if !self.file_chooser_on {
+            return;
+        }
+        if self.dead {
             self.file_chooser_on = false;
             return;
         }
         if self.dialog.is_some() {
             return;
         }
-        let _ = self.call_within(
-            "Page.setInterceptFileChooserDialog",
-            json!({ "enabled": false }),
-            400,
-        );
-        self.file_chooser_on = false;
+        // Only clear the flag once the browser said so: a dialog or a timeout
+        // leaves it set, and `cleanup_domains` tries again on the next teardown.
+        if self
+            .call_within(
+                "Page.setInterceptFileChooserDialog",
+                json!({ "enabled": false }),
+                400,
+            )
+            .is_ok()
+        {
+            self.file_chooser_on = false;
+        }
     }
 
     /// Wait for a file chooser to open. `None` is a timeout, or a dialog: the

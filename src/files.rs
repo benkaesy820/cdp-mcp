@@ -291,22 +291,36 @@ fn plan(args: &Value) -> Result<Upload, String> {
         (None, Some(_)) => return Err("paths must be an array of strings".into()),
         (None, None) => return Err("upload needs path or paths".into()),
     };
-    let index = args.get("i").and_then(Value::as_u64);
-    if index.is_some() && (args.get("selector").is_some() || args.get("index").is_some()) {
+    // Present and non-null: an explicit `null` means absent, while a string or a
+    // negative number is a mistake that must not silently fall through to the
+    // selector path.
+    let index = match args.get("i") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(v.as_u64().ok_or("upload: i must be a whole number")?),
+    };
+    let has_selector = matches!(args.get("selector"), Some(v) if !v.is_null());
+    let has_index = matches!(args.get("index"), Some(v) if !v.is_null());
+    if index.is_some() && (has_selector || has_index) {
         return Err(
             "upload: i clicks a chooser open, so it cannot be combined with selector or index"
                 .into(),
         );
     }
+    let selector = match args.get("selector") {
+        None | Some(Value::Null) => "input[type=file]".to_string(),
+        Some(Value::String(s)) if !s.trim().is_empty() => s.clone(),
+        Some(Value::String(_)) => return Err("upload: selector must not be empty".into()),
+        Some(_) => return Err("upload: selector must be a string".into()),
+    };
+    let dom_index = match args.get("index") {
+        None | Some(Value::Null) => 0usize,
+        Some(v) => v.as_u64().ok_or("upload: index must be a whole number")? as usize,
+    };
     Ok(Upload {
         paths,
         index,
-        selector: args
-            .get("selector")
-            .and_then(Value::as_str)
-            .unwrap_or("input[type=file]")
-            .to_string(),
-        dom_index: args.get("index").and_then(Value::as_u64).unwrap_or(0) as usize,
+        selector,
+        dom_index,
         timeout_ms: args
             .get("timeoutMs")
             .and_then(Value::as_u64)
@@ -318,14 +332,23 @@ fn plan(args: &Value) -> Result<Upload, String> {
 pub(crate) fn upload(cfg: &Cfg, args: &Value) -> Result<Value, String> {
     let plan = plan(args)?;
     // A missing file is the caller's mistake; discovering it after the chooser is
-    // open and interception is armed on their tab is not acceptable.
+    // open and interception is armed on their tab is not acceptable. Chromium
+    // resolves a path on its own side, so a relative one is made absolute here.
+    let mut paths = Vec::with_capacity(plan.paths.len());
     for p in &plan.paths {
         match std::fs::metadata(p) {
             Ok(m) if m.is_file() => {}
             Ok(_) => return Err(format!("not a file: {p}")),
             Err(_) => return Err(format!("no such file: {p}")),
         }
+        paths.push(
+            std::fs::canonicalize(p)
+                .map_err(|e| format!("cannot resolve {p}: {e}"))?
+                .display()
+                .to_string(),
+        );
     }
+    let plan = Upload { paths, ..plan };
     let tab = args.get("tab").and_then(Value::as_str);
     match plan.index {
         None => with_conn(&cfg.endpoint, tab, |conn, tab_id| dom_upload(conn, tab_id, &plan)),
@@ -391,6 +414,9 @@ fn click_upload(
     if at.get("connected").and_then(Value::as_bool) == Some(false) {
         return Err(format!("upload: element {i} is detached; call elements again"));
     }
+    if at.get("zero").and_then(Value::as_bool) == Some(true) {
+        return Err(format!("upload: element {i} has no visible box to click"));
+    }
     let x = at.get("x").and_then(Value::as_f64).unwrap_or(0.0);
     let y = at.get("y").and_then(Value::as_f64).unwrap_or(0.0);
     if let Err(e) = click_at(conn, x, y) {
@@ -427,46 +453,6 @@ fn click_upload(
                "files": plan.paths, "ok": true }))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn one_path_or_many_is_a_list() {
-        let one = plan(&json!({ "path": "/tmp/a" })).unwrap();
-        assert_eq!(one.paths, vec!["/tmp/a"]);
-        assert_eq!(
-            (one.index, one.selector.as_str(), one.dom_index, one.timeout_ms),
-            (None, "input[type=file]", 0, 5000)
-        );
-
-        let two = plan(&json!({ "paths": ["/tmp/a", "/tmp/b"] })).unwrap();
-        assert_eq!(two.paths, vec!["/tmp/a", "/tmp/b"]);
-    }
-
-    #[test]
-    fn conflicting_or_empty_arguments_are_named() {
-        let err = |v: Value| plan(&v).unwrap_err();
-        assert!(err(json!({ "path": "/tmp/a", "paths": ["/tmp/b"] })).contains("not both"));
-        assert!(err(json!({})).contains("needs path or paths"));
-        assert!(err(json!({ "paths": [] })).contains("at least one"));
-        assert!(err(json!({ "paths": [1] })).contains("must be strings"));
-        assert!(err(json!({ "path": "/tmp/a", "i": 3, "selector": "#x" }))
-            .contains("cannot be combined"));
-        assert!(err(json!({ "path": "/tmp/a", "i": 3, "index": 1 }))
-            .contains("cannot be combined"));
-    }
-
-    #[test]
-    fn the_wait_is_bounded() {
-        assert_eq!(plan(&json!({ "path": "/tmp/a", "timeoutMs": 100 })).unwrap().timeout_ms, 500);
-        assert_eq!(
-            plan(&json!({ "path": "/tmp/a", "timeoutMs": 99999 })).unwrap().timeout_ms,
-            15000
-        );
-        assert_eq!(plan(&json!({ "path": "/tmp/a", "i": 2, "within": "main" })).unwrap().index, Some(2));
-    }
-}
 
 
 pub(crate) fn paste(cfg: &Cfg, args: &Value) -> Result<Value, String> {
@@ -735,3 +721,52 @@ pub(crate) fn paste(cfg: &Cfg, args: &Value) -> Result<Value, String> {
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_path_or_many_is_a_list() {
+        let one = plan(&json!({ "path": "/tmp/a" })).unwrap();
+        assert_eq!(one.paths, vec!["/tmp/a"]);
+        assert_eq!(
+            (one.index, one.selector.as_str(), one.dom_index, one.timeout_ms),
+            (None, "input[type=file]", 0, 5000)
+        );
+
+        let two = plan(&json!({ "paths": ["/tmp/a", "/tmp/b"] })).unwrap();
+        assert_eq!(two.paths, vec!["/tmp/a", "/tmp/b"]);
+    }
+
+    #[test]
+    fn conflicting_or_empty_arguments_are_named() {
+        let err = |v: Value| plan(&v).unwrap_err();
+        assert!(err(json!({ "path": "/tmp/a", "paths": ["/tmp/b"] })).contains("not both"));
+        assert!(err(json!({})).contains("needs path or paths"));
+        assert!(err(json!({ "paths": [] })).contains("at least one"));
+        assert!(err(json!({ "paths": [1] })).contains("must be strings"));
+        assert!(err(json!({ "path": "/tmp/a", "i": 3, "selector": "#x" }))
+            .contains("cannot be combined"));
+        assert!(err(json!({ "path": "/tmp/a", "i": 3, "index": 1 }))
+            .contains("cannot be combined"));
+        // A present-but-wrong i must not silently become the selector path.
+        assert!(err(json!({ "path": "/tmp/a", "i": "2" })).contains("whole number"));
+        assert!(err(json!({ "path": "/tmp/a", "i": -1 })).contains("whole number"));
+        assert!(err(json!({ "path": "/tmp/a", "i": 2, "selector": 5 })).contains("cannot be combined"));
+        assert!(err(json!({ "path": "/tmp/a", "selector": 5 })).contains("must be a string"));
+        assert!(err(json!({ "path": "/tmp/a", "selector": "  " })).contains("must not be empty"));
+        // Explicit nulls read as absent, as they do everywhere else.
+        assert_eq!(plan(&json!({ "path": "/tmp/a", "i": null, "selector": null })).unwrap().index, None);
+        assert_eq!(plan(&json!({ "path": "/tmp/a", "i": 2, "selector": null })).unwrap().index, Some(2));
+    }
+
+    #[test]
+    fn the_wait_is_bounded() {
+        assert_eq!(plan(&json!({ "path": "/tmp/a", "timeoutMs": 100 })).unwrap().timeout_ms, 500);
+        assert_eq!(
+            plan(&json!({ "path": "/tmp/a", "timeoutMs": 99999 })).unwrap().timeout_ms,
+            15000
+        );
+        assert_eq!(plan(&json!({ "path": "/tmp/a", "i": 2, "within": "main" })).unwrap().index, Some(2));
+    }
+}

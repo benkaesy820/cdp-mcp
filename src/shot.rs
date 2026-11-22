@@ -150,7 +150,6 @@ pub(crate) fn parse_region(v: Option<&Value>) -> Option<(f64, f64, f64, f64)> {
 
 /// Screenshot the tab: the viewport, the whole document, a region, or one element
 /// by index. A capture borrows the tab through `capture_guarded`.
-
 pub(crate) fn run(cfg: &Cfg, args: &Value) -> Result<Value, String> {
     let tab = args.get("tab").and_then(Value::as_str);
     let prof = cfg.profile_now();

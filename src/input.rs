@@ -269,9 +269,6 @@ pub(crate) fn drag_path(conn: &mut cdp::Conn, from: (f64, f64), to: (f64, f64), 
     Ok(())
 }
 
-/// Scroll by `dy`, in one evaluation. The document first; when it does not
-/// move (an app whose content scrolls inside a container), the scrollable
-/// container under the middle of the viewport, like a wheel would.
 /// A multiple selection matches when the sets are equal. The page reports its
 /// options in its own order, and a repeated request value is the same request.
 pub(crate) fn selection_matches(want: &[String], got: &Value) -> bool {

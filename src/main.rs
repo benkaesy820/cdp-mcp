@@ -44,7 +44,6 @@ pub(crate) fn nonempty_scope(s: &str) -> Option<String> {
 /// Which platform's conventions to follow. A value, not a `cfg`, so the
 /// resolution below can be tested for every platform on any machine.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-
 enum Os { Linux, Mac, Windows }
 
 fn current_os() -> Os {
@@ -144,7 +143,6 @@ fn last_tab() -> &'static Mutex<Option<String>> {
 /// failure is the page's answer, and is returned as it is.
 /// How a dead socket may be retried.
 #[derive(PartialEq)]
-
 enum Retry {
     /// Re-run only if nothing reached the page. A half-finished click or key
     /// sequence must never be repeated.
@@ -369,7 +367,6 @@ fn help() -> String {
 /// Per-agent settings. Deliberately a small JSON file, not a database: a
 /// handful of keys, readable and editable by hand, no crate and no migration.
 #[derive(Clone)]
-
 pub(crate) struct Profile {
     pub(crate) name: String,
     path: std::path::PathBuf,
@@ -420,7 +417,6 @@ impl Profile {
 }
 
 #[derive(Clone)]
-
 pub(crate) struct Cfg {
     pub(crate) endpoint: String,
     pub(crate) profile: Profile,
@@ -1026,7 +1022,6 @@ pub(crate) fn b64decode(s: &str) -> Result<Vec<u8>, String> {
 
 /// Which request is running, and which were cancelled before they started.
 #[derive(Default)]
-
 struct Inflight {
     current: Option<String>,
     cancelled: HashSet<String>,
