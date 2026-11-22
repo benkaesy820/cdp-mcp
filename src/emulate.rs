@@ -249,9 +249,6 @@ pub(crate) struct Emulated {
     /// Touch emulation is on. Tracked because disabling it only affects
     /// documents created afterwards: an existing page keeps `ontouchstart`.
     pub(crate) touch_on: bool,
-    /// A device-metrics override is applied. `reset` on a tab that never had one
-    /// has nothing to clear and nothing to settle.
-    pub(crate) metrics_on: bool,
 }
 
 /// Apply a call and report what is active, plus what the page itself measures.
@@ -273,9 +270,12 @@ pub(crate) fn run(
     let target = plan.metrics.map(|m| {
         json!([m.width, m.height, (m.scale * 100.0).round() as i64])
     });
+    // A reset always settles: the override it clears may have been set by an
+    // earlier cdp-mcp process (Chromium keeps it after the socket that set it
+    // closes), so "our record says nothing is applied" is not evidence.
     let relayout = match (&viewport_before, &target) {
+        (Some(_), None) => true,
         (Some(before), Some(t)) => before != t,
-        (Some(_), None) => state.metrics_on,
         _ => false,
     };
     let mut applied = json!({ "tab": tab });
@@ -291,19 +291,16 @@ pub(crate) fn run(
     };
 
     if plan.reset {
-        // Only send what is actually set: each skipped command is a round trip.
-        if state.metrics_on {
-            conn.call("Emulation.clearDeviceMetricsOverride", json!({}))?;
-            state.metrics_on = false;
-        }
+        // Unconditional, like every other reset: this is the call that makes the
+        // tab clean, and the record cannot see an override left by a previous
+        // server process.
+        conn.call("Emulation.clearDeviceMetricsOverride", json!({}))?;
+        conn.call("Emulation.setTouchEmulationEnabled", touch_param(false))?;
+        conn.call("Emulation.setEmulatedMedia", json!({ "media": "", "features": [] }))?;
+        state.media = MediaState::default();
         if state.touch_on {
-            conn.call("Emulation.setTouchEmulationEnabled", touch_param(false))?;
             touch_needs_reload = true;
         }
-        if state.media != MediaState::default() {
-            conn.call("Emulation.setEmulatedMedia", json!({ "media": "", "features": [] }))?;
-        }
-        state.media = MediaState::default();
         state.touch_on = false;
         scan_cache().lock().unwrap().remove(tab);
         applied["reset"] = json!(true);
@@ -322,7 +319,6 @@ pub(crate) fn run(
             touch_needs_reload = true;
         }
         state.touch_on = m.touch;
-        state.metrics_on = true;
         // Every coordinate and every `off` flag just moved; the scope did not.
         scan_cache().lock().unwrap().remove(tab);
         applied["viewport"] = json!({
