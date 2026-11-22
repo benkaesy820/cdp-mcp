@@ -950,7 +950,19 @@ impl Conn {
         out
     }
 
-    /// Start a tiny screencast so the compositor keeps producing frames.
+    /// Start a tiny screencast so the compositor keeps producing frames,
+    /// without waiting for one. Enough on its own for input (a wheel needs the
+    /// pipeline alive); a capture wants `start_frames` instead.
+    pub fn request_frames(&mut self) -> Res<()> {
+        self.call(
+            "Page.startScreencast",
+            json!({ "format": "jpeg", "quality": 10, "maxWidth": 64, "maxHeight": 64,
+                    "everyNthFrame": 1, "maxFramesInFlight": 4 }),
+        )?;
+        Ok(())
+    }
+
+    /// Start a tiny screencast and wait for its first frames.
     ///
     /// A window that is not on the visible workspace, or a tab nobody is looking
     /// at, produces no frames at all, and `Page.captureScreenshot` waits for one
@@ -961,18 +973,6 @@ impl Conn {
     /// production throughout, which is the workaround Playwright's maintainers
     /// documented for headed Chrome; one 64 px frame a second costs nothing.
     /// Pair with `stop_frames`.
-    /// Ask the compositor to start producing frames, without waiting for one.
-    /// Enough on its own for input (a wheel needs the pipeline alive); a
-    /// capture wants `start_frames` instead.
-    pub fn request_frames(&mut self) -> Res<()> {
-        self.call(
-            "Page.startScreencast",
-            json!({ "format": "jpeg", "quality": 10, "maxWidth": 64, "maxHeight": 64,
-                    "everyNthFrame": 1, "maxFramesInFlight": 4 }),
-        )?;
-        Ok(())
-    }
-
     pub fn start_frames(&mut self) -> Res<()> {
         self.request_frames()?;
         // Three frames, not one: the first frame after a window stops being

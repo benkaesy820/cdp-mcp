@@ -803,6 +803,13 @@ await withTab(`http://localhost:${fport}/tall`, async (tab) => {
   const up = (await s.tool("input", { tab, actions: [{ scroll: { dy: -400 } }] })).v?.log?.[0]?.scrolled;
   check("a negative wheel scrolls it back up",
         up?.moved === true && up?.to < up?.from, up);
+  // At the end of the page a wheel down cannot move: the answer must still say
+  // the page is at its bottom, or a scroll-until-bottom loop never terminates.
+  await s.tool("eval", { tab, expression: "scrollTo({top: document.documentElement.scrollHeight, behavior: 'instant'})" });
+  const stuck = (await s.tool("input", { tab, actions: [{ scroll: { dy: 400 } }] })).v?.log?.[0]?.scrolled;
+  check("a wheel at the bottom reports atBottom even when it cannot move",
+        stuck?.moved === false && stuck?.atBottom === true && stuck?.axis === "y", stuck);
+
   const zero = await s.tool("input", { tab, actions: [{ scroll: { dx: 0, dy: 0 } }] });
   check("a wheel with no delta is refused", !zero.ok && /non-zero/.test(String(zero.v)),
         String(zero.v).slice(0, 120));

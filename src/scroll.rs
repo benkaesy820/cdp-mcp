@@ -5,9 +5,16 @@
 // suspends requestAnimationFrame and runs timers at about 1 Hz, so an in-page
 // promise both answers late and hides whether the wheel arrived at all.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use serde_json::{json, Value};
 
 use crate::cdp::Conn;
+
+/// Unique per call: the page keys its delivery listener on it. A counter, not a
+/// clock, because `SystemTime::now().as_nanos()` is past 2^53 and the low digits
+/// that make it unique are exactly the ones JavaScript drops.
+static WHEEL_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// One probe for a wheel: it counts the wheel events that actually reach the
 /// page, and reports the scroll position of the page and of the pane under the
@@ -70,16 +77,75 @@ fn num(v: &Value, k: &str) -> f64 {
     v.get(k).and_then(Value::as_f64).unwrap_or(0.0)
 }
 
-/// Which scroller moved: the page, the pane under the pointer, or neither.
-/// A canvas answers "neither" while still having received the wheel.
-fn moved(before: &Value, after: &Value) -> (bool, bool) {
-    let page = (num(after, "y") - num(before, "y")).abs() > 1.0
+fn has_num(v: &Value, k: &str) -> bool {
+    v.get(k).and_then(Value::as_f64).is_some()
+}
+
+/// What a wheel did, read from the two samples of the page.
+#[derive(Debug, PartialEq)]
+struct Wheel {
+    from: f64,
+    to: f64,
+    /// The coordinate that moved, or the one the wheel asked for when nothing
+    /// moved.
+    axis: &'static str,
+    moved: bool,
+    /// The pane under the pointer is what this report is about.
+    container: bool,
+    /// The vertical scroller of record has reached its end. Reported even when
+    /// nothing moved: a wheel at the bottom is `moved:false, atBottom:true`.
+    at_bottom: bool,
+}
+
+/// Read a wheel's result. Pure, so the reporting rules are unit-tested instead
+/// of inferred from whatever a page happens to do.
+fn report(before: &Value, after: &Value, dx: f64, dy: f64) -> Wheel {
+    let page_moved = (num(after, "y") - num(before, "y")).abs() > 1.0
         || (num(after, "x") - num(before, "x")).abs() > 1.0;
-    let container = after.get("cy").and_then(Value::as_f64).is_some()
-        && before.get("cy").and_then(Value::as_f64).is_some()
+    let pane = has_num(before, "cy") && has_num(after, "cy");
+    let pane_moved = pane
         && ((num(after, "cy") - num(before, "cy")).abs() > 1.0
             || (num(after, "cx") - num(before, "cx")).abs() > 1.0);
-    (page, container)
+    // A page scroll does not make the pane its subject; a wheel that moved
+    // nothing is still about the pane when there is one, because that is what it
+    // was aimed at.
+    let container = !page_moved && pane;
+    let (fx, fy, tx, ty) = if container {
+        (
+            num(before, "cx"),
+            num(before, "cy"),
+            num(after, "cx"),
+            num(after, "cy"),
+        )
+    } else {
+        (num(before, "x"), num(before, "y"), num(after, "x"), num(after, "y"))
+    };
+    let (mx, my) = ((tx - fx).abs() > 1.0, (ty - fy).abs() > 1.0);
+    let axis = if my && (!mx || (ty - fy).abs() >= (tx - fx).abs()) {
+        "y"
+    } else if mx {
+        "x"
+    } else if dy == 0.0 && dx != 0.0 {
+        // Nothing moved, so report the direction that was asked for.
+        "x"
+    } else {
+        "y"
+    };
+    let (from, to) = if axis == "x" { (fx, tx) } else { (fy, ty) };
+    let (pos, size, view) = if container {
+        (num(after, "cy"), num(after, "ch"), num(after, "cvh"))
+    } else {
+        (num(after, "y"), num(after, "h"), num(after, "vh"))
+    };
+    let at_bottom = size > 0.0 && pos + view + 2.0 >= size;
+    Wheel {
+        from,
+        to,
+        axis,
+        moved: page_moved || pane_moved,
+        container,
+        at_bottom,
+    }
 }
 
 /// Dispatch one wheel at (x, y) and report what it did.
@@ -98,15 +164,46 @@ pub(crate) fn send(conn: &mut Conn, x: f64, y: f64, dx: f64, dy: f64) -> Result<
 }
 
 fn wheel(conn: &mut Conn, x: f64, y: f64, dx: f64, dy: f64) -> Result<Value, String> {
-    let token = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+    let token = WHEEL_SEQ.fetch_add(1, Ordering::Relaxed);
     let js = |op: &str| format!("{WHEEL_JS}({op:?}, {x}, {y}, {token})");
     let begin = conn.eval(&js("begin"))?;
+    if let Err(why) = dispatch(conn, &js, &begin, x, y, dx, dy) {
+        // A failed call must not leave the delivery listener on the page. A dead
+        // connection or an open dialog means there is nothing to clean up in.
+        if !conn.dead && conn.dialog.is_none() {
+            let _ = conn.eval_within(&js("end"), 400);
+        }
+        return Err(why);
+    }
+    // `end` removes the listener and returns the settled state, so the page is
+    // left as it was found even when the wheel was dropped.
+    let after = conn.eval(&js("end"))?;
+    let delivered = reached_page(&after);
+    let r = report(&begin, &after, dx, dy);
+    // `moved:false` with `delivered:true` is a wheel that reached the page and
+    // found nothing scrollable: a canvas got its event. It is not the same
+    // answer as a wheel Chromium never delivered.
+    Ok(json!({
+        "from": r.from, "to": r.to, "axis": r.axis, "moved": r.moved,
+        "atBottom": r.at_bottom, "container": r.container, "delivered": delivered,
+        "wheel": { "x": x, "y": y, "dx": dx, "dy": dy },
+    }))
+}
+
+/// Send the wheel and wait for the page to own it. A slower second look comes
+/// before the retry: re-sending a wheel that was merely late would scroll twice.
+fn dispatch(
+    conn: &mut Conn,
+    js: &dyn Fn(&str) -> String,
+    begin: &Value,
+    x: f64,
+    y: f64,
+    dx: f64,
+    dy: f64,
+) -> Result<(), String> {
     for attempt in 0..2 {
-        // A human moves the pointer first; Chromium latches the scroll target
-        // to what is under it, so do the same.
+        // A human moves the pointer first; Chromium latches the scroll target to
+        // what is under it, so do the same.
         conn.call_many(&[
             ("Input.dispatchMouseEvent", json!({ "type": "mouseMoved", "x": x, "y": y })),
             ("Input.dispatchMouseEvent", json!({
@@ -116,8 +213,6 @@ fn wheel(conn: &mut Conn, x: f64, y: f64, dx: f64, dy: f64) -> Result<Value, Str
         std::thread::sleep(std::time::Duration::from_millis(60));
         let mut seen = conn.eval(&js("read"))?;
         if !reached_page(&seen) && attempt == 0 {
-            // One slower look before sending it again: re-sending a wheel that
-            // was merely late would scroll the page twice.
             std::thread::sleep(std::time::Duration::from_millis(120));
             seen = conn.eval(&js("read"))?;
         }
@@ -126,41 +221,14 @@ fn wheel(conn: &mut Conn, x: f64, y: f64, dx: f64, dy: f64) -> Result<Value, Str
             // moved:false is not.
             continue;
         }
-        if moved(&begin, &seen) == (false, false) {
+        if !report(begin, &seen, dx, dy).moved {
             // A compositor-driven scroll may land a beat later; without this the
             // canvas answer and a slow scroll look alike.
             std::thread::sleep(std::time::Duration::from_millis(80));
         }
         break;
     }
-    // `end` removes the listener and returns the settled state, so the page is
-    // left as it was found even when the wheel was dropped.
-    let after = conn.eval(&js("end"))?;
-    let delivered = reached_page(&after);
-    let (page_moved, cont_moved) = moved(&begin, &after);
-    let (from, to, at_bottom) = if page_moved {
-        (
-            num(&begin, "y"),
-            num(&after, "y"),
-            num(&after, "y") + num(&after, "vh") + 2.0 >= num(&after, "h"),
-        )
-    } else if cont_moved {
-        (
-            num(&begin, "cy"),
-            num(&after, "cy"),
-            num(&after, "cy") + num(&after, "cvh") + 2.0 >= num(&after, "ch"),
-        )
-    } else {
-        (num(&begin, "y"), num(&after, "y"), false)
-    };
-    // `moved:false` with `delivered:true` is a wheel that reached the page and
-    // found nothing scrollable: a canvas got its event. It is not the same
-    // answer as a wheel Chromium never delivered.
-    Ok(json!({
-        "from": from, "to": to, "moved": page_moved || cont_moved,
-        "atBottom": at_bottom, "container": cont_moved, "delivered": delivered,
-        "wheel": { "x": x, "y": y, "dx": dx, "dy": dy },
-    }))
+    Ok(())
 }
 
 #[cfg(test)]
@@ -175,17 +243,63 @@ mod tests {
         assert!(deltas(Some(0.0), Some(0.0)).unwrap_err().contains("non-zero"));
     }
 
-    #[test]
-    fn movement_is_read_per_scroller() {
-        let page = |y: f64, cy: Option<f64>| {
-            json!({ "y": y, "x": 0.0, "h": 3000.0, "vh": 700.0,
-                    "cy": cy, "cx": cy.map(|_| 0.0), "ch": 1200.0, "cvh": 200.0 })
-        };
-        assert_eq!(moved(&page(0.0, None), &page(400.0, None)), (true, false));
-        assert_eq!(moved(&page(0.0, Some(0.0)), &page(0.0, Some(300.0))), (false, true));
-        // A pixel of rounding, not a move.
-        assert_eq!(moved(&page(100.0, None), &page(100.4, None)), (false, false));
-        // No container at all (a canvas): neither scroller moved.
-        assert_eq!(moved(&page(0.0, None), &page(0.0, None)), (false, false));
+    fn sample(y: f64, x: f64, h: f64, vh: f64) -> Value {
+        json!({ "y": y, "x": x, "h": h, "vh": vh, "cy": null, "cx": null,
+                "ch": 0.0, "cvh": 0.0 })
     }
+
+    fn pane(y: f64, cy: f64, ch: f64, cvh: f64) -> Value {
+        json!({ "y": y, "x": 0.0, "h": 4000.0, "vh": 700.0,
+                "cy": cy, "cx": 0.0, "ch": ch, "cvh": cvh })
+    }
+
+    #[test]
+    fn a_wheel_at_the_bottom_reports_at_bottom() {
+        let at = sample(1362.0, 0.0, 2080.0, 718.0);
+        let r = report(&at, &at, 0.0, 400.0);
+        assert!(!r.moved, "nothing moved");
+        assert!(r.at_bottom, "but the page is at its end");
+        assert_eq!((r.from, r.to, r.axis), (1362.0, 1362.0, "y"));
+    }
+
+    #[test]
+    fn a_horizontal_wheel_reports_the_x_axis() {
+        let r = report(
+            &sample(0.0, 0.0, 500.0, 700.0),
+            &sample(0.0, 300.0, 500.0, 700.0),
+            300.0,
+            0.0,
+        );
+        assert!(r.moved);
+        assert_eq!((r.from, r.to, r.axis), (0.0, 300.0, "x"));
+    }
+
+    #[test]
+    fn a_pane_is_the_subject_when_the_page_did_not_move() {
+        let r = report(
+            &pane(0.0, 0.0, 1200.0, 200.0),
+            &pane(0.0, 300.0, 1200.0, 200.0),
+            0.0,
+            300.0,
+        );
+        assert!(r.moved && r.container && !r.at_bottom);
+        assert_eq!((r.from, r.to), (0.0, 300.0));
+
+        // At the pane's end the same wheel reports the bottom, not a silent no-op.
+        let end = pane(0.0, 1010.0, 1200.0, 200.0);
+        let r = report(&end, &end, 0.0, 300.0);
+        assert!(!r.moved && r.container && r.at_bottom);
+    }
+
+    #[test]
+    fn a_sub_pixel_change_is_not_a_move() {
+        let r = report(
+            &sample(100.0, 0.0, 3000.0, 700.0),
+            &sample(100.4, 0.0, 3000.0, 700.0),
+            0.0,
+            400.0,
+        );
+        assert!(!r.moved && !r.at_bottom);
+    }
+
 }
