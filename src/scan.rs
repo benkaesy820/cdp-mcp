@@ -951,7 +951,7 @@ pub(crate) fn elements(cfg: &Cfg, args: &Value) -> Result<Value, String> {
     let shot_mode = args.get("shot").and_then(Value::as_str).unwrap_or("none").to_string();
     let shot_fmt = args.get("shotFormat").and_then(Value::as_str).unwrap_or("jpeg").to_string();
     let max_w = args.get("shotMaxWidth").and_then(Value::as_f64).unwrap_or(1024.0);
-    let region = parse_region(args.get("region"));
+    let region = parse_region(args.get("region"))?;
 
     let within = match args.get("within") {
         None | Some(Value::Null) => None,

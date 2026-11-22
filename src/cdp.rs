@@ -368,7 +368,13 @@ fn split_endpoint(endpoint: &str) -> Res<(String, String)> {
 /// One request with no body, returning the response body as text.
 pub fn http(endpoint: &str, path: &str, method: &str) -> Res<String> {
     let (authority, base) = split_endpoint(endpoint)?;
-    let mut stream = TcpStream::connect(&authority)
+    // Bounded like Conn::open: a wedged endpoint must fail the call, not hang it.
+    let addr = authority
+        .to_socket_addrs()
+        .map_err(|e| format!("cannot resolve {authority}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("cannot resolve {authority}"))?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
         .map_err(|e| format!("cannot reach {authority}: {e}. Is the browser running with --remote-debugging-port?"))?;
     stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
     stream.set_write_timeout(Some(Duration::from_secs(10))).ok();

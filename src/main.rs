@@ -425,16 +425,25 @@ pub(crate) struct Cfg {
     pub(crate) profile: Profile,
 }
 
-fn is_loopback(endpoint: &str) -> bool {
-    let host = endpoint
+/// The endpoint's host, with the port and any userinfo removed. A bracketed
+/// IPv6 literal is unwrapped: `[::1]:9222` is host `::1`.
+fn endpoint_host(endpoint: &str) -> &str {
+    let authority = endpoint
         .trim_start_matches("http://")
         .split('/')
         .next()
-        .unwrap_or("")
-        .rsplit_once(':')
-        .map(|(h, _)| h)
         .unwrap_or("");
-    matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1")
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    match authority.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(""),
+        None => authority.split(':').next().unwrap_or(""),
+    }
+}
+
+fn is_loopback(endpoint: &str) -> bool {
+    // `rsplit_once(':')` read a portless `http://127.0.0.1` as no host at all and
+    // split `[::1]` inside the brackets; both were refused as non-loopback.
+    matches!(endpoint_host(endpoint), "127.0.0.1" | "localhost" | "::1")
 }
 
 /// A non-loopback endpoint is refused unless the build opted into the
@@ -1107,6 +1116,13 @@ mod tests {
         assert!(is_loopback("http://[::1]:9222"));
         assert!(!is_loopback("http://192.168.1.4:9222"));
         assert!(!is_loopback("http://example.com:9222"));
+        // A portless loopback endpoint is still loopback, and the bracketed form
+        // must not be split inside the brackets.
+        assert!(is_loopback("http://127.0.0.1"));
+        assert!(is_loopback("http://[::1]"));
+        assert!(is_loopback("http://localhost/base"));
+        assert!(!is_loopback("http://[::2]:9222"));
+        assert!(!is_loopback("http://127.0.0.1.evil.example:9222"));
     }
 
 

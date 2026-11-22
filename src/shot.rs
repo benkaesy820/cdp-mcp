@@ -143,9 +143,22 @@ pub(crate) fn padded_box(x: f64, y: f64, w: f64, h: f64, padding: f64) -> (f64, 
     (px, py, (x + w + padding) - px, (y + h + padding) - py)
 }
 
-pub(crate) fn parse_region(v: Option<&Value>) -> Option<(f64, f64, f64, f64)> {
-    let r = v?;
-    Some((r.get("x")?.as_f64()?, r.get("y")?.as_f64()?, r.get("w")?.as_f64()?, r.get("h")?.as_f64()?))
+/// A capture region, validated. A zero or negative width used to reach
+/// `Page.captureScreenshot` as a negative `scale`, which fails with a protocol
+/// error that names neither the field nor the mistake.
+pub(crate) fn parse_region(v: Option<&Value>) -> Result<Option<(f64, f64, f64, f64)>, String> {
+    let Some(r) = v.filter(|r| !r.is_null()) else {
+        return Ok(None);
+    };
+    let num = |k: &str| r.get(k).and_then(Value::as_f64);
+    let (x, y, w, h) = match (num("x"), num("y"), num("w"), num("h")) {
+        (Some(x), Some(y), Some(w), Some(h)) => (x, y, w, h),
+        _ => return Err("region needs x, y, w and h as numbers".into()),
+    };
+    if ![x, y, w, h].iter().all(|n| n.is_finite()) || w <= 0.0 || h <= 0.0 {
+        return Err("region needs finite x/y and a w and h above 0".into());
+    }
+    Ok(Some((x, y, w, h)))
 }
 
 /// Screenshot the tab: the viewport, the whole document, a region, or one element
@@ -181,7 +194,7 @@ pub(crate) fn run(cfg: &Cfg, args: &Value) -> Result<Value, String> {
         .and_then(Value::as_u64)
         .or_else(|| prof.get_u64("shot_quality"))
         .unwrap_or(85) as u32;
-    let region = parse_region(args.get("region"));
+    let region = parse_region(args.get("region"))?;
     let index = args.get("i").and_then(Value::as_u64);
     // An explicit empty `within` means unscoped, as it does for elements;
     // only an absent one falls back to the tab's last scope.
@@ -265,6 +278,22 @@ mod tests {
         assert_eq!(padded_box(100.0, 200.0, 160.0, 40.0, 20.0), (80.0, 180.0, 200.0, 80.0));
         assert_eq!(padded_box(10.0, 5.0, 160.0, 40.0, 20.0), (0.0, 0.0, 190.0, 65.0));
         assert_eq!(padded_box(0.0, 0.0, 160.0, 40.0, 0.0), (0.0, 0.0, 160.0, 40.0));
+    }
+
+    #[test]
+    fn a_region_must_have_a_positive_area() {
+        let ok = parse_region(Some(&json!({ "x": 10, "y": 20, "w": 30, "h": 40 }))).unwrap();
+        assert_eq!(ok, Some((10.0, 20.0, 30.0, 40.0)));
+        assert_eq!(parse_region(None).unwrap(), None);
+        assert_eq!(parse_region(Some(&Value::Null)).unwrap(), None);
+        for bad in [
+            json!({ "x": 0, "y": 0, "w": 0, "h": 10 }),
+            json!({ "x": 0, "y": 0, "w": -5, "h": 10 }),
+            json!({ "x": 0, "y": 0, "w": 10 }),
+            json!({ "x": 0, "y": 0, "w": 10, "h": "10" }),
+        ] {
+            assert!(parse_region(Some(&bad)).is_err(), "{bad}");
+        }
     }
 
     #[test]

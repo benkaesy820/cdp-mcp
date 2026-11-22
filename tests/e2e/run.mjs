@@ -204,6 +204,12 @@ await withTab(page("gestures.html"), async (tab, ev) => {
   check("paste text", (await ev("ta.value")) === "pasted ✓ 123", await ev("ta.value"));
   await s.tool("paste", { tab, i: I("Paste image"), path: join(here, "pages", "red.png") });
   check("paste an image into an editor that reads clipboard files", (await ev("ed.querySelectorAll('img').length")) === 1, await ev("R.paste"));
+  // `text` is what the page receives; `path` is what the reply describes. Giving
+  // both used to paste the text and report the file.
+  const both = await s.tool("paste", { tab, path: join(here, "pages", "red.png"), text: "x" });
+  check("paste refuses path and text together", !both.ok && /not both/.test(String(both.v)), both.v);
+  const badI = await s.tool("paste", { tab, i: "2", text: "x" });
+  check("paste rejects a non-integer index", !badI.ok && /whole number/.test(String(badI.v)), badI.v);
 });
 
 // ---- choosing which file input receives an upload ---------------------
@@ -549,6 +555,13 @@ await withTab(`http://localhost:${fport}/imgs`, async (tab) => {
     check("download saves the bytes the page fetched",
           ok.ok && ok.v?.bytes === pageBytes.length && got.equals(pageBytes),
           { v: ok.v, disk: got.length, want: pageBytes.length });
+    // A relative url must be echoed absolute: the page-cache fallback needs an
+    // absolute one, and a relative string silently fails there.
+    check("download echoes the resolved url",
+          /^http:\/\/localhost:\d+\/imgs$/.test(ok.v?.url || ""), ok.v?.url);
+    const both = await s.tool("download", { tab, url: "/imgs", i: 0, path: out });
+    check("download refuses url and i together",
+          !both.ok && /not both/.test(String(both.v)), both.v);
     const big = await s.tool("download", { tab, url: "/imgs", path: out, maxBytes: 10 });
     check("download refuses a body over maxBytes instead of writing it",
           !big.ok && /over the 10-byte limit/.test(String(big.v)), big.v);

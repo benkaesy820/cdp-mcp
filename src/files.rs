@@ -47,6 +47,9 @@ pub(crate) fn download(cfg: &Cfg, args: &Value) -> Result<Value, String> {
     let max_bytes = args.get("maxBytes").and_then(Value::as_u64).unwrap_or(10 * 1024 * 1024);
     let explicit = args.get("url").and_then(Value::as_str).map(str::to_string);
     let index = args.get("i").and_then(Value::as_u64);
+    if explicit.is_some() && index.is_some() {
+        return Err("download: give url or i, not both".into());
+    }
     with_conn(&cfg.endpoint, tab, |conn, tab_id| {
         // Resolve the URL in-page (so it may come from an <img> index),
         // then fetch it there too: cookies and referer stay correct, which
@@ -65,6 +68,10 @@ pub(crate) fn download(cfg: &Cfg, args: &Value) -> Result<Value, String> {
         };
         let js = format!(
             r#"(async () => {{
+                // Resolve against the document first: a relative src is fine for
+                // fetch, but Page.getResourceContent needs an absolute URL.
+                let abs = {src};
+                try {{ abs = new URL({src}, location.href).href; }} catch (e) {{}}
                 try {{
                     // 'include' keeps cookies (same-origin, authenticated
                     // images); 'omit' is what a public CDN needs, because
@@ -72,24 +79,25 @@ pub(crate) fn download(cfg: &Cfg, args: &Value) -> Result<Value, String> {
                     // stricter CORS grant than ACAO:*.
                     let r = null;
                     for (const cred of ['include', 'omit']) {{
-                        try {{ r = await fetch({src}, {{ credentials: cred }}); }}
+                        try {{ r = await fetch(abs, {{ credentials: cred }}); }}
                         catch (e) {{ r = null; }}
                         if (r && r.ok) break;
                     }}
-                    if (!r) return {{ error: 'network' }};
-                    if (!r.ok) return {{ error: 'http ' + r.status }};
+                    if (!r) return {{ error: 'network', url: abs }};
+                    if (!r.ok) return {{ error: 'http ' + r.status, url: abs }};
                     const buf = new Uint8Array(await (await r.blob()).arrayBuffer());
-                    if (buf.length > {max}) return {{ error: 'too large', size: buf.length }};
+                    if (buf.length > {max}) return {{ error: 'too large', size: buf.length, url: abs }};
                     let bin = '';
                     for (let k = 0; k < buf.length; k += 0x8000)
                         bin += String.fromCharCode.apply(null, buf.subarray(k, k + 0x8000));
-                    return {{ b64: btoa(bin), size: buf.length }};
-                }} catch (e) {{ return {{ error: String(e).slice(0, 120) }}; }}
+                    return {{ b64: btoa(bin), size: buf.length, url: abs }};
+                }} catch (e) {{ return {{ error: String(e).slice(0, 120), url: abs }}; }}
             }})()"#,
             src = serde_json::Value::String(src.clone()),
             max = max_bytes
         );
         let v = conn.eval(&js)?;
+        let abs = v.get("url").and_then(Value::as_str).unwrap_or(&src).to_string();
         // The limit is the caller's, so name it here instead of letting a page
         // that reported `too large` fall through to the cache, which would only
         // hand back the same oversized body.
@@ -114,7 +122,7 @@ pub(crate) fn download(cfg: &Cfg, args: &Value) -> Result<Value, String> {
                 .ok_or_else(|| format!("download failed: {err}"))?
                 .to_string();
             let r = conn
-                .call("Page.getResourceContent", json!({ "frameId": frame_id, "url": src }))
+                .call("Page.getResourceContent", json!({ "frameId": frame_id, "url": abs }))
                 .map_err(|e| format!("download failed: {err} (and the page cache had it not: {e})"))?;
             let content = r.get("content").and_then(Value::as_str).ok_or("no content")?;
             if r.get("base64Encoded").and_then(Value::as_bool).unwrap_or(false) {
@@ -138,7 +146,8 @@ pub(crate) fn download(cfg: &Cfg, args: &Value) -> Result<Value, String> {
             ));
         }
         std::fs::write(&path, &bytes).map_err(|e| format!("cannot write {path}: {e}"))?;
-        Ok(json!({ "tab": tab_id, "path": path, "url": src, "bytes": bytes.len() }))
+        // `url` can be a data: URI; echo it clipped, the bytes are on disk.
+        Ok(json!({ "tab": tab_id, "path": path, "url": crate::clip_str(&abs, 300), "bytes": bytes.len() }))
     })
 }
 
@@ -339,9 +348,17 @@ pub(crate) fn paste(cfg: &Cfg, args: &Value) -> Result<Value, String> {
     let tab = args.get("tab").and_then(Value::as_str);
     let path = args.get("path").and_then(Value::as_str).map(str::to_string);
     let text = args.get("text").and_then(Value::as_str).map(str::to_string);
-    let click_i = args.get("i").and_then(Value::as_u64);
+    let click_i = match args.get("i") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(v.as_u64().ok_or("paste: i must be a whole number")?),
+    };
     if path.is_none() && text.is_none() {
         return Err("paste needs path (a file) or text".into());
+    }
+    if path.is_some() && text.is_some() {
+        // `text` wins inside the page while the reply describes the file, so
+        // the call used to paste one thing and report the other.
+        return Err("paste: give path or text, not both".into());
     }
     if text.as_deref() == Some("") {
         return Err("paste text is empty".into());
