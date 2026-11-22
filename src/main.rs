@@ -735,7 +735,7 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
                     out["browser"] = version.get("Browser").cloned().unwrap_or(Value::Null);
                     out["protocol"] = version.get("Protocol-Version").cloned().unwrap_or(Value::Null);
                     let pages: Vec<_> = tabs.iter().filter(|t| !t.url.starts_with("chrome-extension://")).collect();
-                    out["tabs"] = json!(pages.iter().map(|t| json!({ "tab": t.id, "title": t.title, "url": t.url })).collect::<Vec<_>>());
+                    out["tabs"] = json!(pages.iter().map(|t| json!({ "tab": t.id, "title": t.title, "url": t.url, "owned": cdp::is_owned(&t.id) })).collect::<Vec<_>>());
                     if tabs.is_empty() {
                         out["hint"] = json!("the browser is running but has no page tabs — open one with tabs {action:\"open\"}");
                     }
@@ -758,7 +758,7 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
                 let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
                 Ok(json!(tabs.iter()
                     .filter(|t| all || !t.url.starts_with("chrome-extension://"))
-                    .map(|t| json!({ "tab": t.id, "title": t.title, "url": t.url }))
+                    .map(|t| json!({ "tab": t.id, "title": t.title, "url": t.url, "owned": cdp::is_owned(&t.id) }))
                     .collect::<Vec<_>>()))
             }
             "open" => {
@@ -863,7 +863,7 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
             let actions = args.get("actions").and_then(Value::as_array).ok_or("input needs actions[]")?.clone();
             let announce = args.get("announce").and_then(Value::as_bool).unwrap_or(false);
             let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
-                          // Managed downloads: opt-in, so a human's own downloads are never
+                                        // Managed downloads: opt-in, so a human's own downloads are never
               // redirected by default. `0` from the caller means "default", and with a
               // managed folder that default is a real settle window.
               let save = args.get("saveDownloads").and_then(Value::as_bool).unwrap_or(false);
@@ -872,9 +872,13 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
                   Some(Value::String(s)) if !s.trim().is_empty() => Some(std::path::PathBuf::from(s)),
                   Some(_) => return Err("input: downloadDir must be a path".into()),
               };
-              let managed = dir.or_else(|| save.then(|| data_dir().join("downloads")));
-              if let Some(d) = &managed {
-                  std::fs::create_dir_all(d).map_err(|e| format!("cannot create {}: {e}", d.display()))?;
+              let mut managed = dir.or_else(|| save.then(|| data_dir().join("downloads")));
+              if let Some(d) = managed.as_mut() {
+                  std::fs::create_dir_all(&*d)
+                      .map_err(|e| format!("cannot create {}: {e}", d.display()))?;
+                  // Chromium resolves the folder on its own side; a relative one would diverge.
+                  *d = std::fs::canonicalize(&*d)
+                      .map_err(|e| format!("cannot resolve {}: {e}", d.display()))?;
               }
               let settle_arg = args.get("settleMs").and_then(Value::as_u64).unwrap_or(0);
               let settle_ms = if settle_arg == 0 && managed.is_some() { 5_000 } else { settle_arg.min(5_000) };

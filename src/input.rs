@@ -625,7 +625,7 @@ pub(crate) fn run_batch(
             // human's own downloads must never be hijacked into our folder.
             conn.begin_downloads(&dir.display().to_string())?;
             let out = run_batch_inner(
-                conn, tab_id, actions, announce, force, settle_ms.max(5_000), Some(dir),
+                conn, tab_id, actions, announce, force, settle_ms, Some(dir),
             );
             conn.end_downloads();
             out
@@ -767,13 +767,14 @@ fn run_batch_inner(
 /// A suggested filename with the directories stripped. The browser supplies this
 /// from a remote header, so `../../etc/passwd` must never reach a path join.
 fn sanitize_filename(suggested: &str, fallback: &str) -> String {
-    let name = std::path::Path::new(suggested)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(str::trim)
-        .filter(|n| !n.is_empty() && *n != "." && *n != "..")
-        .unwrap_or("");
-    if name.is_empty() { fallback.to_string() } else { name.to_string() }
+    // Both separators, on every platform: a Windows-style header is still a
+    // traversal string when it is handled on Linux.
+    let name = suggested.rsplit(['/', '\\']).next().unwrap_or("").trim();
+    if name.is_empty() || name == "." || name == ".." {
+        fallback.to_string()
+    } else {
+        name.to_string()
+    }
 }
 
 /// Never overwrite: the same download twice gives `report.txt`, `report-1.txt`.
@@ -835,6 +836,7 @@ mod tests {
     #[test]
     fn suggested_filenames_cannot_escape_the_folder() {
         assert_eq!(sanitize_filename("../../etc/passwd", "g1"), "passwd");
+        assert_eq!(sanitize_filename(r"..\..\windows\system32\evil.exe", "g1"), "evil.exe");
         assert_eq!(sanitize_filename("/abs/report.txt", "g1"), "report.txt");
         assert_eq!(sanitize_filename("", "g1"), "g1");
         assert_eq!(sanitize_filename("..", "g1"), "g1");

@@ -574,8 +574,9 @@ await withTab(`http://localhost:${fport}/download`, async (tab) => {
   const dl = els.find(e => (e.label || "").trim() === "Download");
   const r = await s.tool("input", { tab, actions: [{ click: { i: dl?.i } }], settleMs: 3000 });
   const got = r.v?.downloads?.[0];
-  check("a click-triggered download is reported as started",
-        !!got && got.status === "started" && /cdp-mcp-e2e-download/.test(got.filename || ""),
+  check("a click-triggered download is reported, with no invented path",
+        !!got && (got.status === "started" || got.status === "completed") &&
+        got.path === undefined && /cdp-mcp-e2e-download/.test(got.filename || ""),
         { got, v: JSON.stringify(r.v).slice(0, 220) });
   // The browser saved it somewhere on this machine; this test must not leave it.
   for (const name of ["cdp-mcp-e2e-download.bin", ...Array.from({ length: 6 }, (_, i) => `cdp-mcp-e2e-download (${i + 1}).bin`)]) {
@@ -616,8 +617,18 @@ await withTab(`http://localhost:${fport}/download`, async (tab) => {
   const fresh = after.filter(n => !before.has(n) && /cdp-mcp-e2e-download/.test(n));
   const p = plain.v?.downloads?.[0];
   check("plain settle downloads are not redirected and carry no path",
-        plain.ok && p?.status === "started" && p?.path === undefined && fresh.length >= 1,
-        { got: p, fresh });
+        plain.ok && (p?.status === "started" || p?.status === "completed") &&
+        p?.path === undefined && fresh.length >= 1 && plain.ms < 5000,
+        { got: p, fresh, ms: plain.ms });
+
+  const list = (await s.tool("tabs", { action: "list" })).v;
+  const mine = list.find(t => t.tab === tab);
+  check("tabs list marks an agent-opened tab as owned", mine?.owned === true, mine);
+  const human = await (await fetch("http://127.0.0.1:9222/json/new?about:blank", { method: "PUT" })).json();
+  const list2 = (await s.tool("tabs", { action: "list" })).v;
+  const theirs = list2.find(t => t.tab === human.id);
+  check("tabs list reports a tab it did not open as not owned", theirs?.owned === false, theirs);
+  await s.tool("tabs", { action: "close", tab: human.id });
   for (const n of after.filter(n => /cdp-mcp-e2e-download/.test(n))) {
     try { unlinkSync(`${process.env.HOME}/Downloads/${n}`); } catch {}
   }

@@ -250,7 +250,7 @@ impl Receipts {
                     "guid": guid,
                 }));
             }
-            "Browser.downloadProgress" => {
+            "Browser.downloadProgress" | "Page.downloadProgress" => {
                 let guid = p.get("guid").and_then(Value::as_str).unwrap_or("");
                 if guid.is_empty() {
                     return;
@@ -1413,8 +1413,10 @@ impl Conn {
     pub fn settle_receipts(&mut self, quiet_ms: u64, max_ms: u64) -> ReceiptOutcome {
         let started = std::time::Instant::now();
         let deadline = started + Duration::from_millis(max_ms);
-        // A running download is the action's outcome, not noise: keep the window
-        // open for it, up to 30 s from the start.
+        // Only a managed download (eventsEnabled was armed) has progress events
+        // to wait for. In plain settle mode a download stays "started" forever,
+        // and holding the window open for it would turn any settleMs into 30 s.
+        let managed = self.download_on && max_ms > 0;
         let download_deadline = started + Duration::from_millis(max_ms.max(30_000));
         // Quiet is measured from the last event that means the page is working.
         // Page.* events are seen (a dialog must end the wait) but do not count:
@@ -1427,7 +1429,8 @@ impl Conn {
             if self.dialog.is_some() {
                 break;
             }
-            let active = self.receipts.as_ref().map(|r| r.download_active()).unwrap_or(false);
+            let active = managed
+                && self.receipts.as_ref().map(|r| r.download_active()).unwrap_or(false);
             let cap = if active { download_deadline } else { deadline };
             let cap_left = cap.saturating_duration_since(std::time::Instant::now());
             if cap_left.is_zero() {
@@ -1441,7 +1444,7 @@ impl Conn {
                 let idle = self
                     .receipts
                     .as_ref()
-                    .map(|r| r.requests.is_empty() && !r.download_active())
+                    .map(|r| r.requests.is_empty() && !(managed && r.download_active()))
                     .unwrap_or(true);
                 if idle {
                     break;
