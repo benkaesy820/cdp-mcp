@@ -51,6 +51,7 @@ pub(crate) fn navigate(
 
     match &action {
         Action::Goto(url) => {
+            conn.begin_navigation();
             let r = match conn.call("Page.navigate", json!({ "url": url })) {
                 Ok(r) => r,
                 Err(_) if conn.dialog.is_some() => return Ok(dialog_outcome(conn, tab)),
@@ -82,6 +83,7 @@ pub(crate) fn navigate(
                 }));
             };
             let id = entry.get("id").and_then(Value::as_i64).ok_or("the history entry has no id")?;
+            conn.begin_navigation();
             if let Err(e) = conn.call("Page.navigateToHistoryEntry", json!({ "entryId": id })) {
                 if conn.dialog.is_some() {
                     return Ok(dialog_outcome(conn, tab));
@@ -90,6 +92,7 @@ pub(crate) fn navigate(
             }
         }
         Action::Reload { ignore_cache } => {
+            conn.begin_navigation();
             if let Err(e) = conn.call("Page.reload", json!({ "ignoreCache": ignore_cache })) {
                 if conn.dialog.is_some() {
                     return Ok(dialog_outcome(conn, tab));
@@ -105,22 +108,36 @@ pub(crate) fn navigate(
         }));
     }
 
-    match conn.wait_navigation(COMMIT_MS) {
-        Some(cdp::NavOutcome::Dialog(d)) => Ok(json!({
-            "tab": tab, "moved": false, "url": current(conn), "dialog": d,
-            "note": "the page is asking before it leaves; answer it with \
-                     input { actions: [{ dialog: { accept: true } }] }",
-        })),
+    match conn.wait_navigation(COMMIT_MS)? {
+        Some(cdp::NavOutcome::Dialog) => Ok(dialog_outcome(conn, tab)),
         Some(cdp::NavOutcome::SameDocument(url)) => Ok(json!({
             "tab": tab, "moved": true, "url": url, "sameDocument": true,
         })),
         Some(cdp::NavOutcome::Committed(url)) => {
+            // A commit happened either way, so the old indexes are gone.
             clear_page_state(tab);
+            if url.starts_with("chrome-error://") {
+                // The browser committed its error page: the navigation failed,
+                // and reporting moved:true would hide it.
+                return Err(format!(
+                    "the navigation failed: the browser showed its own error page ({url})"
+                ));
+            }
             let mut out = json!({ "tab": tab, "moved": true, "url": url });
             if idle {
-                if let Ok(n) = wait_idle(conn, IDLE_MS, 300) {
-                    out["idle"] = json!(true);
-                    out["resources"] = json!(n);
+                match wait_idle(conn, IDLE_MS, 300) {
+                    Ok(n) => {
+                        out["idle"] = json!(true);
+                        out["resources"] = json!(n);
+                    }
+                    Err(e) => {
+                        // A dialog or a dead socket is not "settled": say which.
+                        if let Some(d) = conn.dialog.clone() {
+                            out["dialog"] = d;
+                        } else {
+                            return Err(e);
+                        }
+                    }
                 }
             }
             Ok(out)

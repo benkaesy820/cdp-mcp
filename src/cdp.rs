@@ -27,13 +27,17 @@ struct Receipts {
 }
 
 /// What the first navigation event after a command says.
+/// How long a committed document gets to reach DOMContentLoaded before the
+/// caller is told where it is anyway.
+const DOM_READY_MS: u64 = 3_000;
+
 pub enum NavOutcome {
     /// A new document committed, at this URL.
     Committed(String),
     /// The URL changed without a new document: a hash change or the History API.
     SameDocument(String),
-    /// A dialog interrupted the navigation; the navigation may not have happened.
-    Dialog(Value),
+    /// A dialog interrupted the navigation; it is on `Conn::dialog`.
+    Dialog,
 }
 
 /// What a settle window saw beyond the error list: a tab the action opened.
@@ -600,6 +604,15 @@ pub struct Conn {
     /// these, and the event is recorded in the funnel every message passes, so
     /// it still counts when it arrives before the close's own reply.
     destroyed: Vec<String>,
+    /// The first top-frame commit since the last navigation command: (url, type).
+    /// Same reason as `destroyed`: a fast navigation can answer before the
+    /// command's own reply, and a reply-waiting call would discard it.
+    nav_committed: Option<(String, String)>,
+    /// The first same-document jump since the last navigation command.
+    nav_same: Option<String>,
+    /// `Page.domContentEventFired` since the last navigation command: the
+    /// document parsed, which `frameNavigated` alone does not mean.
+    nav_dom_ready: bool,
 }
 
 /// Events that mean the page is still doing something. `Page.*` is deliberately
@@ -661,7 +674,8 @@ impl Conn {
                               oopifs: Vec::new(), auto_attach: false, runtime_on: false,
                               binding: None, timed_out: false, contexts_cleared: false,
                               receipts: None, page_on: false, dialog: None, dialog_seq: 0, network_on: false,
-                              destroyed: Vec::new() };
+                              destroyed: Vec::new(), nav_committed: None, nav_same: None,
+                              nav_dom_ready: false };
         conn.set_read_timeout(ms);
         // No domain is enabled on connect: each enable costs a round trip, and
         // most commands do not need one. `enable_runtime` turns on the Runtime
@@ -825,6 +839,26 @@ impl Conn {
                 }));
             }
             Some("Page.javascriptDialogClosed") => self.dialog = None,
+            // Recorded here, not by the caller: a fast navigation (a same-document
+            // history move, a BFCache restore) can answer before the command's own
+            // reply, and a reply-waiting call discards what it does not expect.
+            Some("Page.frameNavigated") => {
+                let frame = &v["params"]["frame"];
+                if !frame.get("parentId").map(|p| !p.is_null()).unwrap_or(false) {
+                    let url = frame.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+                    let ty = v.pointer("/params/type").and_then(Value::as_str).unwrap_or("Navigation");
+                    if self.nav_committed.is_none() {
+                        self.nav_committed = Some((url, ty.to_string()));
+                    }
+                }
+            }
+            Some("Page.navigatedWithinDocument") => {
+                let url = v.pointer("/params/url").and_then(Value::as_str).unwrap_or("").to_string();
+                if self.nav_same.is_none() {
+                    self.nav_same = Some(url);
+                }
+            }
+            Some("Page.domContentEventFired") => self.nav_dom_ready = true,
             Some("Target.targetDestroyed") => {
                 if let Some(id) = v.pointer("/params/targetId").and_then(Value::as_str) {
                     if !self.destroyed.iter().any(|d| d == id) {
@@ -1088,57 +1122,85 @@ impl Conn {
     }
 
 
+    /// Clear the navigation slots before a command that may start one.
+    pub fn begin_navigation(&mut self) {
+        self.nav_committed = None;
+        self.nav_same = None;
+        self.nav_dom_ready = false;
+    }
+
     /// Wait for the first navigation event, or for a dialog to interrupt it.
     ///
-    /// Used right after `Page.navigate`, a history move or a reload: the old
-    /// document already reports `readyState: complete`, so the readyState trick
-    /// `tabs open` uses would return instantly and wrongly. Here the event is the
-    /// answer, and a hash change answers with `SameDocument` instead of waiting
-    /// for a document that will never arrive.
-    pub fn wait_navigation(&mut self, ms: u64) -> Option<NavOutcome> {
-        let start_seq = self.dialog_seq;
+    /// The old document already reports `readyState: complete`, so the answer
+    /// has to come from Page events. Those are recorded in `track_frames`, which
+    /// means one that arrived before the command's reply still counts.
+    ///
+    /// After a commit it waits a short time for `Page.domContentEventFired`: a
+    /// commit is not a parsed document, and a caller that scans immediately would
+    /// catch half a page. A BFCache restore is already parsed, so it returns at
+    /// once.
+    pub fn wait_navigation(&mut self, ms: u64) -> Res<Option<NavOutcome>> {
+        let out = self.wait_navigation_inner(ms);
+        self.set_read_timeout(self.timeout_ms);
+        out
+    }
+
+    fn wait_navigation_inner(&mut self, ms: u64) -> Res<Option<NavOutcome>> {
         let deadline = std::time::Instant::now() + Duration::from_millis(ms);
-        let out = loop {
-            if self.dialog_seq != start_seq {
-                break self.dialog.clone().map(NavOutcome::Dialog);
+        loop {
+            // A dialog wins over everything, including one that arrived during
+            // the command itself (the command can still reply Ok).
+            if self.dialog.is_some() {
+                return Ok(Some(NavOutcome::Dialog));
+            }
+            if let Some(url) = self.nav_same.take() {
+                return Ok(Some(NavOutcome::SameDocument(url)));
+            }
+            if let Some((url, ty)) = self.nav_committed.take() {
+                if ty == "BackForwardCacheRestore" || self.nav_dom_ready {
+                    return Ok(Some(NavOutcome::Committed(url)));
+                }
+                // Parsed, not just committed: bounded, and a dialog still wins.
+                let dom_deadline = std::time::Instant::now() + Duration::from_millis(DOM_READY_MS);
+                loop {
+                    if self.dialog.is_some() {
+                        return Ok(Some(NavOutcome::Dialog));
+                    }
+                    if self.nav_dom_ready {
+                        break;
+                    }
+                    let left = dom_deadline.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+                    if !self.nav_read(left.as_millis().max(1) as u64)? {
+                        break;
+                    }
+                }
+                return Ok(Some(NavOutcome::Committed(url)));
             }
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
-                break None;
+                return Ok(None);
             }
-            self.set_read_timeout(left.as_millis().max(1) as u64);
-            match self.next_msg("navigation", ms) {
-                Ok(v) => {
-                    if self.dialog_seq != start_seq {
-                        break self.dialog.clone().map(NavOutcome::Dialog);
-                    }
-                    match v.get("method").and_then(Value::as_str) {
-                        Some("Page.navigatedWithinDocument") => {
-                            let url = v.pointer("/params/url").and_then(Value::as_str).unwrap_or("");
-                            break Some(NavOutcome::SameDocument(url.to_string()));
-                        }
-                        Some("Page.frameNavigated") => {
-                            let frame = &v["params"]["frame"];
-                            // The top frame only: a subframe navigating is not where
-                            // the action went.
-                            if frame.get("parentId").map(|p| !p.is_null()).unwrap_or(false) {
-                                continue;
-                            }
-                            let url = frame.get("url").and_then(Value::as_str).unwrap_or("");
-                            break Some(NavOutcome::Committed(url.to_string()));
-                        }
-                        _ => {}
-                    }
-                }
-                Err(_) if self.timed_out => {
-                    self.timed_out = false;
-                    break None;
-                }
-                Err(_) => break None,
+            if !self.nav_read(left.as_millis().max(1) as u64)? {
+                return Ok(None);
             }
-        };
-        self.set_read_timeout(self.timeout_ms);
-        out
+        }
+    }
+
+    /// One message, `true` if one arrived, `false` on the read deadline. A dead
+    /// socket is an error: reporting it as "no commit" would hide it.
+    fn nav_read(&mut self, left: u64) -> Res<bool> {
+        self.set_read_timeout(left.max(1));
+        match self.next_msg("navigation", left) {
+            Ok(_) => Ok(true),
+            Err(_) if self.timed_out => {
+                self.timed_out = false;
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Read until `quiet_ms` passes with no message while no same-origin

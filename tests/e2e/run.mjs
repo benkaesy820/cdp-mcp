@@ -592,6 +592,16 @@ await withTab(`http://localhost:${fport}/sprint2`, async (tab) => {
   check("a hash-only goto returns at once as same-document",
         h.ok && h.v?.moved === true && h.v?.sameDocument === true && h.ms < 2000, h.v);
 
+  const backHash = await s.tool("tabs", { action: "back", tab });
+  check("a same-document history move is reported as same-document",
+        backHash.ok && backHash.v?.moved === true && backHash.v?.sameDocument === true && backHash.ms < 3000,
+        { v: backHash.v, ms: backHash.ms });
+
+  const fwdHash = await s.tool("tabs", { action: "forward", tab });
+  check("forward returns to the hash entry",
+        fwdHash.ok && fwdHash.v?.moved === true && /#part$/.test(fwdHash.v?.url || "") && fwdHash.ms < 3000,
+        { v: fwdHash.v, ms: fwdHash.ms });
+
   const bad = await s.tool("tabs", { action: "goto", url: "http://cdp-mcp-e2e.invalid/", tab });
   check("an unreachable host is an error, not a success",
         !bad.ok && /ERR_NAME_NOT_RESOLVED|net::ERR_/.test(String(bad.v)), String(bad.v).slice(0, 160));
@@ -619,9 +629,8 @@ await withTab(`http://localhost:${fport}/sprint2`, async (tab) => {
   check("reload with ignoreCache commits the same document",
         rl.ok && rl.v?.moved === true, rl.v);
 
-  // A second reload inside the first one's load is rejected by Chrome
-  // ("Not attached to an active page"), so let the page finish first.
-  await s.tool("idle", { tab, timeoutMs: 8000, maxIdleMs: 1200 });
+  // Back to back, with no sleep: the navigation waits for DOMContentLoaded, so
+  // the page is out of the "not attached" window by the time the second starts.
   const rl2 = await s.tool("tabs", { action: "reload", tab });
   check("a plain reload commits too", rl2.ok && rl2.v?.moved === true, rl2.v);
 
