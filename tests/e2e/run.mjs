@@ -513,9 +513,15 @@ await withTab(`http://localhost:${fport}/imgs`, async (tab) => {
     const big = await s.tool("download", { tab, url: "/imgs", path: out, maxBytes: 10 });
     check("download refuses a body over maxBytes instead of writing it",
           !big.ok && /over the 10-byte limit/.test(String(big.v)), big.v);
+    const byIndex = await s.tool("download", { tab, i: 0, path: out });
+    check("download {i} resolves the sourced-image list the schema describes",
+          byIndex.ok && /real-image\.png$/.test(byIndex.v?.url || ""), byIndex.v);
     const long = await s.tool("input", { tab, actions: [{ sleep: { ms: 900001 } }] });
     check("an action cannot park the tool past the wait cap",
           !long.ok && /at most 900000/.test(String(long.v)), long.v);
+    const longIdle = await s.tool("idle", { tab, timeoutMs: 900001 });
+    check("idle refuses a timeout past the same cap",
+          !longIdle.ok && /at most 900000/.test(String(longIdle.v)), longIdle.v);
   } finally {
     try { unlinkSync(out); } catch {}
   }
