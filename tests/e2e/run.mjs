@@ -568,6 +568,82 @@ await withTab(`http://localhost:${fport}/unload`, async (tab) => {
   const close = await s.tool("tabs", { action: "close", tab });
   check("a plain close is confirmed by the browser", close.ok && close.v?.closed === true, close.v);
 });
+// ---- in-tab navigation: goto, back, forward, reload ----------------------
+await withTab(`http://localhost:${fport}/sprint2`, async (tab) => {
+  // A scope and a delta baseline exist before the navigation; neither may
+  // survive it, or an old index would resolve against the old page.
+  await s.tool("elements", { tab, within: "#modal-form", limit: 20 });
+
+  const g = await s.tool("tabs", { action: "goto", url: `http://localhost:${fport}/imgs`, tab });
+  check("goto moves the tab and reports the new url",
+        g.ok && g.v?.moved === true && /\/imgs$/.test(g.v?.url || ""), g.v);
+
+  const stale = await s.tool("input", { tab, actions: [{ click: { i: 99 } }] });
+  check("a document navigation clears the tab's click scope",
+        !stale.ok && !/within/.test(String(stale.v)), String(stale.v).slice(0, 160));
+
+  const d = (await s.tool("elements", { tab, mode: "delta" })).v;
+  check("a document navigation clears the delta baseline", d.baseline === false, d);
+
+  const title = (await s.tool("eval", { tab, expression: "document.title" })).v?.value;
+  check("the new document is what the page answers with", title === "images", title);
+
+  const h = await s.tool("tabs", { action: "goto", url: `http://localhost:${fport}/imgs#part`, tab });
+  check("a hash-only goto returns at once as same-document",
+        h.ok && h.v?.moved === true && h.v?.sameDocument === true && h.ms < 2000, h.v);
+
+  const bad = await s.tool("tabs", { action: "goto", url: "http://cdp-mcp-e2e.invalid/", tab });
+  check("an unreachable host is an error, not a success",
+        !bad.ok && /ERR_NAME_NOT_RESOLVED|net::ERR_/.test(String(bad.v)), String(bad.v).slice(0, 160));
+});
+
+await withTab(`http://localhost:${fport}/sprint2`, async (tab) => {
+  const first = await s.tool("tabs", { action: "back", tab });
+  check("back at the start of history is an honest no-op",
+        first.ok && first.v?.moved === false, first.v);
+
+  await s.tool("tabs", { action: "goto", url: `http://localhost:${fport}/imgs`, tab });
+  const back = await s.tool("tabs", { action: "back", tab });
+  check("back returns to the previous document",
+        back.ok && back.v?.moved === true && /sprint2$/.test(back.v?.url || ""), back.v);
+
+  const fwd = await s.tool("tabs", { action: "forward", tab });
+  check("forward returns to the next document",
+        fwd.ok && fwd.v?.moved === true && /imgs$/.test(fwd.v?.url || ""), fwd.v);
+
+  const last = await s.tool("tabs", { action: "forward", tab });
+  check("forward at the end of history is an honest no-op",
+        last.ok && last.v?.moved === false, last.v);
+
+  const rl = await s.tool("tabs", { action: "reload", tab, ignoreCache: true });
+  check("reload with ignoreCache commits the same document",
+        rl.ok && rl.v?.moved === true, rl.v);
+
+  // A second reload inside the first one's load is rejected by Chrome
+  // ("Not attached to an active page"), so let the page finish first.
+  await s.tool("idle", { tab, timeoutMs: 8000, maxIdleMs: 1200 });
+  const rl2 = await s.tool("tabs", { action: "reload", tab });
+  check("a plain reload commits too", rl2.ok && rl2.v?.moved === true, rl2.v);
+
+  const gi = await s.tool("tabs", { action: "goto", url: `http://localhost:${fport}/imgs`, tab, idle: true });
+  check("goto with idle waits for loading to settle", gi.ok && gi.v?.idle === true, gi.v);
+});
+
+// A beforeunload guard turns a navigation into a dialog, not a timeout.
+await withTab(`http://localhost:${fport}/unload`, async (tab) => {
+  const els = (await s.tool("elements", { tab, limit: 20 })).v.elements || [];
+  const guard = els.find(e => (e.label || "").trim() === "Add beforeunload guard");
+  await s.tool("input", { tab, actions: [{ click: { i: guard?.i } }] });
+  const nav = await s.tool("tabs", { action: "goto", url: `http://localhost:${fport}/imgs`, tab });
+  check("a beforeunload guard makes goto report the dialog",
+        nav.ok && nav.v?.dialog?.type === "beforeunload" && nav.v?.moved === false,
+        { v: nav.v, ms: nav.ms });
+  const leave = await s.tool("input", { tab, actions: [{ dialog: { accept: true } }], settleMs: 1500 });
+  const href = (await s.tool("eval", { tab, expression: "location.href" })).v?.value || "";
+  check("accepting it lets the navigation finish",
+        leave.ok && /\/imgs$/.test(href), { ok: leave.ok, href });
+});
+
 await withTab(page("chatty.html"), async (tab, ev) => {
   const before = Number(await ev("window.__ticks")) || 0;
   const r = (await s.tool("idle", { tab, maxIdleMs: 1500, timeoutMs: 4000 })).v;

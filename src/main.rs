@@ -13,6 +13,7 @@
 
 mod cdp;
 mod clip;
+mod nav;
 mod scan;
 mod wait;
 
@@ -874,15 +875,16 @@ fn tool_defs() -> Value {
         },
         {
             "name": "tabs",
-            "description": "List, open or close page tabs.",
+            "description": "List, open, close or navigate page tabs. goto, back, forward and reload act on the tab in place: they report moved and the resulting url, return moved:false at the ends of history, and return the dialog instead of waiting when the page asks before it leaves. A document navigation also drops this tab's scanned indexes and scope, so rescan before using an old index.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["list", "open", "close"] },
-                    "url": { "type": "string", "description": "for action=open" },
-                    "idle": { "type": "boolean", "description": "for action=open: also wait for loading to settle (single-page apps paint after readyState)" },
+                    "action": { "type": "string", "enum": ["list", "open", "close", "goto", "back", "forward", "reload"] },
+                    "url": { "type": "string", "description": "for action=open or goto" },
+                    "idle": { "type": "boolean", "description": "for action=open or a navigation: also wait for loading to settle (single-page apps paint after readyState)" },
+                    "ignoreCache": { "type": "boolean", "description": "for action=reload: bypass the HTTP cache" },
                     "foreground": { "type": "boolean", "description": "for action=open: bring the tab to the front and focus the browser. Default false, because activating a tab takes the keyboard away from whoever is typing." },
-                    "tab": { "type": "string", "description": "for action=close" },
+                    "tab": { "type": "string", "description": "the tab to act on; omit for the last tab this server used" },
                     "all": { "type": "boolean", "description": "for action=list: include chrome-extension:// pages (default false)" }
                 },
                 "required": ["action"]
@@ -2184,6 +2186,23 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                                whether to leave. The tab is still open and its connection is kept.")
                     },
                 }))
+            }
+            "goto" | "back" | "forward" | "reload" => {
+                let name = args.get("action").and_then(Value::as_str).unwrap_or("");
+                let idle = args.get("idle").and_then(Value::as_bool).unwrap_or(false);
+                let action = match name {
+                    "goto" => nav::Action::Goto(
+                        args.get("url").and_then(Value::as_str).ok_or("goto needs url")?.to_string(),
+                    ),
+                    "back" => nav::Action::Back,
+                    "forward" => nav::Action::Forward,
+                    _ => nav::Action::Reload {
+                        ignore_cache: args.get("ignoreCache").and_then(Value::as_bool).unwrap_or(false),
+                    },
+                };
+                with_conn(&cfg.endpoint, tab, |conn, tab_id| {
+                    nav::navigate(conn, tab_id, action.clone(), idle)
+                })
             }
             other => Err(format!("unknown tabs action: {other}")),
         },

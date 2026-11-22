@@ -26,6 +26,16 @@ struct Receipts {
     downloads: Vec<Value>,
 }
 
+/// What the first navigation event after a command says.
+pub enum NavOutcome {
+    /// A new document committed, at this URL.
+    Committed(String),
+    /// The URL changed without a new document: a hash change or the History API.
+    SameDocument(String),
+    /// A dialog interrupted the navigation; the navigation may not have happened.
+    Dialog(Value),
+}
+
 /// What a settle window saw beyond the error list: a tab the action opened.
 #[derive(Default)]
 pub struct ReceiptOutcome {
@@ -1077,6 +1087,59 @@ impl Conn {
         out
     }
 
+
+    /// Wait for the first navigation event, or for a dialog to interrupt it.
+    ///
+    /// Used right after `Page.navigate`, a history move or a reload: the old
+    /// document already reports `readyState: complete`, so the readyState trick
+    /// `tabs open` uses would return instantly and wrongly. Here the event is the
+    /// answer, and a hash change answers with `SameDocument` instead of waiting
+    /// for a document that will never arrive.
+    pub fn wait_navigation(&mut self, ms: u64) -> Option<NavOutcome> {
+        let start_seq = self.dialog_seq;
+        let deadline = std::time::Instant::now() + Duration::from_millis(ms);
+        let out = loop {
+            if self.dialog_seq != start_seq {
+                break self.dialog.clone().map(NavOutcome::Dialog);
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break None;
+            }
+            self.set_read_timeout(left.as_millis().max(1) as u64);
+            match self.next_msg("navigation", ms) {
+                Ok(v) => {
+                    if self.dialog_seq != start_seq {
+                        break self.dialog.clone().map(NavOutcome::Dialog);
+                    }
+                    match v.get("method").and_then(Value::as_str) {
+                        Some("Page.navigatedWithinDocument") => {
+                            let url = v.pointer("/params/url").and_then(Value::as_str).unwrap_or("");
+                            break Some(NavOutcome::SameDocument(url.to_string()));
+                        }
+                        Some("Page.frameNavigated") => {
+                            let frame = &v["params"]["frame"];
+                            // The top frame only: a subframe navigating is not where
+                            // the action went.
+                            if frame.get("parentId").map(|p| !p.is_null()).unwrap_or(false) {
+                                continue;
+                            }
+                            let url = frame.get("url").and_then(Value::as_str).unwrap_or("");
+                            break Some(NavOutcome::Committed(url.to_string()));
+                        }
+                        _ => {}
+                    }
+                }
+                Err(_) if self.timed_out => {
+                    self.timed_out = false;
+                    break None;
+                }
+                Err(_) => break None,
+            }
+        };
+        self.set_read_timeout(self.timeout_ms);
+        out
+    }
 
     /// Read until `quiet_ms` passes with no message while no same-origin
     /// request is in flight, or `max_ms` elapses, then turn the domains off.
