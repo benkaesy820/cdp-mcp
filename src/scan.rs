@@ -169,6 +169,10 @@ pub const SCAN_JS: &str = r#"(() => {
                   x: Math.round(x), y: Math.round(y), scrolled };
     out.connected = el.isConnected;
     out.zero = r.width === 0 || r.height === 0;
+    // Document-space bounds after any scroll: the clip for an element shot.
+    // `r` is in the top document's viewport space, frames included.
+    out.rect = { x: Math.round(r.x + scrollX), y: Math.round(r.y + scrollY),
+                 w: Math.round(r.width), h: Math.round(r.height) };
     out.disabled = !!el.disabled || el.getAttribute('aria-disabled') === 'true';
     try { if (!out.disabled && el.matches && el.matches(':disabled')) out.disabled = true; } catch (e) {}
     // Would a real click at the centre reach this element, or something on

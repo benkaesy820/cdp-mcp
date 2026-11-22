@@ -66,6 +66,7 @@ async function serveFrames() {
       "/xnav-src": "xnav-src.html", "/xnav-dst": "xnav-dst.html",
       "/emulate": "emulate.html",
       "/alertload": "alertload.html",
+      "/tall": "tall.html",
     };
     const file = files[path] || "cross.html";
     res.end(readFileSync(join(here, "pages", file)));
@@ -729,6 +730,64 @@ await withTab(`http://localhost:${fport}/emulate`, async (tab) => {
         { before, after });
   check("reset reports that touch needs a reload to leave the page",
         reset?.touchNeedsReload === true, reset);
+});
+
+// ---- element screenshots and PDF -----------------------------------------
+await withTab(`http://localhost:${fport}/tall`, async (tab) => {
+  const els = (await s.tool("elements", { tab, limit: 99 })).v.elements || [];
+  const btn = els.find(e => (e.label || "").includes("Below the fold"));
+  const dpr = (await s.tool("eval", { tab, expression: "devicePixelRatio" })).v?.value || 1;
+  const png = p => { const b = readFileSync(p); return { w: b.readUInt32BE(16), h: b.readUInt32BE(20) }; };
+
+  const at = `/tmp/opencode/e2e-element-${process.pid}.png`;
+  const one = (await s.tool("shot", { tab, i: btn?.i, path: at })).v;
+  const p1 = png(at);
+  check("an element shot captures the element's box, not the viewport",
+        one?.mode === "element" && one?.element?.w === 160 && one?.element?.h === 40 &&
+        Math.abs(p1.w - Math.round(160 * dpr)) <= 1 && Math.abs(p1.h - Math.round(40 * dpr)) <= 1,
+        { element: one?.element, png: p1, dpr });
+  check("the element shot names what it captured",
+        /Below the fold/.test(one?.element?.label || "") && one?.element?.i === btn?.i, one?.element);
+
+  const padded = `/tmp/opencode/e2e-padded-${process.pid}.png`;
+  const two = (await s.tool("shot", { tab, i: btn?.i, padding: 20, path: padded })).v;
+  const p2 = png(padded);
+  check("padding widens the element's box",
+        two?.element?.w === 200 && two?.element?.h === 80 &&
+        Math.abs(p2.w - Math.round(200 * dpr)) <= 1 && Math.abs(p2.h - Math.round(80 * dpr)) <= 1,
+        { element: two?.element, png: p2, dpr });
+
+  const miss = await s.tool("shot", { tab, i: 999, path: at });
+  check("an element shot at a missing index fails cleanly",
+        !miss.ok && /no element with index 999/.test(String(miss.v)), String(miss.v).slice(0, 140));
+
+  const both = await s.tool("shot", { tab, i: 0, region: { x: 0, y: 0, w: 10, h: 10 }, path: at });
+  check("i and region cannot be combined",
+        !both.ok && /two different captures|use one/.test(String(both.v)), String(both.v).slice(0, 140));
+
+  for (const f of [at, padded]) { try { unlinkSync(f); } catch {} }
+
+  // PDF: the default path is under the profile's data directory.
+  const def = (await s.tool("pdf", { tab })).v;
+  let head = "";
+  try { head = readFileSync(def?.path || "").subarray(0, 5).toString(); } catch {}
+  check("pdf writes a real PDF to the default path",
+        head === "%PDF-" && (def?.bytes || 0) > 1000 && /pdfs\/page-\d+\.pdf$/.test(def?.path || ""),
+        { path: def?.path, bytes: def?.bytes, head });
+  try { unlinkSync(def?.path || ""); } catch {}
+
+  const explicit = `/tmp/opencode/e2e-${process.pid}.pdf`;
+  const a4 = (await s.tool("pdf", { tab, path: explicit, format: "a4", landscape: true, pageRanges: "1" })).v;
+  let head2 = "";
+  try { head2 = readFileSync(explicit).subarray(0, 5).toString(); } catch {}
+  check("pdf honours format, landscape and pageRanges",
+        head2 === "%PDF-" && a4?.format === "a4" && a4?.landscape === true &&
+        a4?.paper?.width === 8.27 && a4?.pageRanges === "1",
+        { v: a4, head: head2 });
+  try { unlinkSync(explicit); } catch {}
+
+  const bad = await s.tool("pdf", { tab, format: "legal" });
+  check("pdf rejects an unknown paper size", !bad.ok && /letter or a4/.test(String(bad.v)), String(bad.v).slice(0, 120));
 });
 
 await withTab(page("chatty.html"), async (tab, ev) => {

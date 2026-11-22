@@ -15,6 +15,7 @@ mod cdp;
 mod clip;
 mod emulate;
 mod nav;
+mod pdf;
 mod scan;
 mod wait;
 
@@ -892,6 +893,23 @@ fn tool_defs() -> Value {
             }
         },
         {
+            "name": "pdf",
+            "description": "Print the page to a PDF. Saves to `path` when given, otherwise under this profile's data directory as pdfs/page-<ms>.pdf. Backgrounds print by default: a styled page is what a human expects to read. Letter by default; a4, landscape, scale, pageRanges and preferCSSPageSize are explicit.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tab": { "type": "string" },
+                    "path": { "type": "string", "description": "where to write it; omit for the profile's pdfs folder" },
+                    "format": { "type": "string", "enum": ["letter", "a4"], "description": "paper size (default letter)" },
+                    "landscape": { "type": "boolean", "description": "default false" },
+                    "printBackground": { "type": "boolean", "description": "default true" },
+                    "scale": { "type": "number", "description": "0.1..2.0, default 1.0" },
+                    "pageRanges": { "type": "string", "description": "e.g. \"1-2,4\"" },
+                    "preferCSSPageSize": { "type": "boolean", "description": "honour an @page size when the page sets one" }
+                }
+            }
+        },
+        {
             "name": "emulate",
             "description": "Emulate a viewport, touch input and CSS media. A preset sets all of it: mobile 390x844@3, tablet 768x1024@2, desktop 1280x800@1; explicit width/height/deviceScaleFactor/mobile/touch override the preset. Media calls add up: colorScheme then reducedMotion keeps both, because Emulation.setEmulatedMedia replaces the whole list and the active set is tracked per tab. reset clears metrics, touch and media. A viewport change moves every element, so this tab's scan cache is dropped and the next elements rescans; a within scope survives.",
             "inputSchema": {
@@ -1082,7 +1100,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "shot",
-            "description": "Screenshot the tab. `path` is optional: omit it and the file lands in this profile's screenshot_dir with a timestamped name.",
+            "description": "Screenshot the tab: the viewport by default, the whole page, a region, or one element by index. `path` is optional: omit it and the file lands in this profile's screenshot_dir with a timestamped name. `i` resolves in the main document, open shadow roots and same-origin frames (not cross-origin iframes), scrolls the element into view and captures just its box; `padding` widens that box.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1093,7 +1111,10 @@ fn tool_defs() -> Value {
                     "region": { "type": "object", "description": "for mode=custom: {x,y,w,h} in CSS pixels",
                                 "properties": { "x": {"type":"number"}, "y": {"type":"number"}, "w": {"type":"number"}, "h": {"type":"number"} } },
                     "format": { "type": "string", "enum": ["png", "jpeg", "webp"], "description": "default: the profile's shot_format, else png" },
-                    "quality": { "type": "integer", "description": "jpeg/webp quality 0-100 (default 85)" }
+                    "quality": { "type": "integer", "description": "jpeg/webp quality 0-100 (default 85)" },
+                    "i": { "type": "integer", "description": "capture this element's box, from elements; scrolls it into view first" },
+                    "within": { "type": "string", "description": "scope for i; defaults to the last elements scope for this tab" },
+                    "padding": { "type": "number", "description": "extra pixels around an element capture, 0..200 (default 0)" }
                 }
             }
         }
@@ -2228,6 +2249,7 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
             other => Err(format!("unknown tabs action: {other}")),
         },
         "emulate" => with_conn(&cfg.endpoint, tab, |conn, tab_id| emulate::run(conn, tab_id, &args)),
+        "pdf" => with_conn(&cfg.endpoint, tab, |conn, tab_id| pdf::run(conn, tab_id, &args)),
         "eval" => {
             let expr = args.get("expression").and_then(Value::as_str).ok_or("eval needs expression")?;
             with_conn(&cfg.endpoint, tab, |conn, tab_id| {
@@ -3091,6 +3113,28 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                 .or_else(|| prof.get_u64("shot_quality"))
                 .unwrap_or(85) as u32;
             let region = parse_region(args.get("region"));
+            let index = args.get("i").and_then(Value::as_u64);
+            // An explicit empty `within` means unscoped, as it does for elements;
+            // only an absent one falls back to the tab's last scope.
+            let within_given = matches!(args.get("within"), Some(v) if !v.is_null());
+            let within = match args.get("within") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => nonempty_scope(s),
+                Some(_) => return Err("shot: within must be a CSS selector".into()),
+            };
+            let padding = match args.get("padding") {
+                None | Some(Value::Null) => 0.0,
+                Some(v) => v
+                    .as_f64()
+                    .ok_or("shot: padding must be a number of pixels")?
+                    .clamp(0.0, 200.0),
+            };
+            if index.is_some() && region.is_some() {
+                return Err("shot: i and region name two different captures; use one".into());
+            }
+            if index.is_some() && mode == "full" {
+                return Err("shot: i cannot be combined with mode \"full\"".into());
+            }
             with_conn(&cfg.endpoint, tab, |conn, tab_id| {
                 // Someone else's tab: let it render just long enough to be
                 // captured, then hand its normal behaviour back.
@@ -3116,14 +3160,54 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                          screenshot — every other tool works without it. ({why})"
                     ));
                 }
-                let shot = capture_png(conn, &mode, region, None, &fmt, quality);
+                let (shot, element) = match index {
+                    Some(i) => {
+                        let scope = if within_given { within.clone() } else { scope_for(tab_id) };
+                        let at = pick(conn, scope.as_deref(), i, true, None)?;
+                        if at.get("connected").and_then(Value::as_bool) == Some(false) {
+                            return Err(format!("shot: element {i} is detached; call elements again"));
+                        }
+                        let rect = at
+                            .get("rect")
+                            .ok_or_else(|| format!("shot: the page did not report bounds for element {i}"))?;
+                        let (x, y, w, h) = (
+                            rect.get("x").and_then(Value::as_f64).unwrap_or(0.0),
+                            rect.get("y").and_then(Value::as_f64).unwrap_or(0.0),
+                            rect.get("w").and_then(Value::as_f64).unwrap_or(0.0),
+                            rect.get("h").and_then(Value::as_f64).unwrap_or(0.0),
+                        );
+                        if w < 1.0 || h < 1.0 {
+                            return Err(format!("shot: element {i} has no visible box to capture"));
+                        }
+                        // Widen by padding, but never past the document's origin:
+                        // a negative clip start is rejected by CDP.
+                        let px = (x - padding).max(0.0);
+                        let py = (y - padding).max(0.0);
+                        let pw = (x + w + padding) - px;
+                        let ph = (y + h + padding) - py;
+                        let element = json!({
+                            "i": i, "tag": at.get("tag"), "label": at.get("label"),
+                            "x": px.round(), "y": py.round(), "w": pw.round(), "h": ph.round(),
+                        });
+                        (capture_png(conn, "custom", Some((px, py, pw, ph)), None, &fmt, quality), Some(element))
+                    }
+                    None => (capture_png(conn, &mode, region, None, &fmt, quality), None),
+                };
                 conn.stop_frames();
                 if borrowed {
                     let _ = conn.set_focus_emulation(false);
                 }
                 let (bytes, clipped, _mime) = shot?;
                 std::fs::write(&path, &bytes).map_err(|e| format!("cannot write {path}: {e}"))?;
-                Ok(json!({ "tab": tab_id, "path": path, "bytes": bytes.len(), "mode": mode, "format": fmt, "clipped": clipped }))
+                let mut out = json!({
+                    "tab": tab_id, "path": path, "bytes": bytes.len(),
+                    "mode": if index.is_some() { "element" } else { mode.as_str() },
+                    "format": fmt, "clipped": clipped,
+                });
+                if let Some(el) = element {
+                    out["element"] = el;
+                }
+                Ok(out)
             })
         }
         other => Err(format!("unknown tool: {other}")),
@@ -3425,7 +3509,7 @@ mod tests {
         let defs = tool_defs();
         let names: Vec<&str> = defs.as_array().unwrap().iter()
             .map(|t| t["name"].as_str().unwrap()).collect();
-        for want in ["status", "tabs", "eval", "elements", "input", "shot", "paste", "flow", "emulate"] {
+        for want in ["status", "tabs", "eval", "elements", "input", "shot", "paste", "flow", "emulate", "pdf"] {
             assert!(names.contains(&want), "{want} missing");
         }
         for t in defs.as_array().unwrap() {
