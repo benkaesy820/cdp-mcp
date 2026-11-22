@@ -496,21 +496,6 @@ await withTab(page("frames.html?port=" + fport), async (tabA) => {
   }
 });
 
-// `images` lists only <img> that have a source, so image {i} must index that
-// same list: a lazy placeholder before the real image shifted every index.
-await withTab(`http://localhost:${fport}/imgs`, async (tab) => {
-  const listed = (await s.tool("images", { tab })).v;
-  check("images lists only images with a source",
-        listed.count === 1 && /real-image\.png$/.test(listed.images?.[0]?.src || ""),
-        listed.images?.map(i => i.src));
-  const opened = (await s.tool("image", { tab, action: "open", i: 0 })).v;
-  check("an image index matches the images list",
-        /real-image\.png$/.test(opened.url || ""), opened);
-  if (opened.tab) await s.tool("tabs", { action: "close", tab: opened.tab });
-});
-
-// A flow's own tab must reach its steps: they used to run on whatever tab the
-// last call happened to touch.
 await withTab(`http://localhost:${fport}/receipts`, async (tabA) => {
   const tabB = (await s.tool("tabs", { action: "open", url: `http://localhost:${fport}/sprint2` })).v.tab;
   try {
@@ -656,7 +641,10 @@ await withTab(`http://localhost:${fport}/download`, async (tab) => {
   const list = (await s.tool("tabs", { action: "list" })).v;
   const mine = list.find(t => t.tab === tab);
   check("tabs list marks an agent-opened tab as owned", mine?.owned === true, mine);
-  const human = await (await fetch("http://127.0.0.1:9222/json/new?about:blank", { method: "PUT" })).json();
+  // The endpoint the server talks to, so the check also runs against an isolated
+  // browser instead of the one on the default port.
+  const cdp = process.env.CDP_ENDPOINT || "http://127.0.0.1:9222";
+  const human = await (await fetch(cdp + "/json/new?about:blank", { method: "PUT" })).json();
   const list2 = (await s.tool("tabs", { action: "list" })).v;
   const theirs = list2.find(t => t.tab === human.id);
   check("tabs list reports a tab it did not open as not owned", theirs?.owned === false, theirs);

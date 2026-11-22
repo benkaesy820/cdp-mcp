@@ -374,11 +374,11 @@ pub(crate) struct Profile {
 }
 
 impl Cfg {
-    /// The profile as it is on disk *now*: `profile set` may have changed it
-    /// during this process's lifetime, and a stale copy would silently write
-    /// screenshots to the old folder.
+    /// The settings loaded at startup. Nothing in the server writes the file, so
+    /// re-reading it per call would only pick up a hand edit made behind a
+    /// running process.
     pub(crate) fn profile_now(&self) -> Profile {
-        Profile::load(&self.profile.name)
+        self.profile.clone()
     }
 }
 
@@ -396,18 +396,6 @@ impl Profile {
     }
     pub(crate) fn get_u64(&self, key: &str) -> Option<u64> {
         self.data.get(key).and_then(Value::as_u64)
-    }
-    fn set(&mut self, key: &str, value: Value) -> Result<(), String> {
-        if let Some(obj) = self.data.as_object_mut() {
-            obj.insert(key.to_string(), value);
-        } else {
-            self.data = json!({ key: value });
-        }
-        if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-        }
-        let body = serde_json::to_string_pretty(&self.data).map_err(|e| e.to_string())?;
-        std::fs::write(&self.path, body).map_err(|e| format!("cannot write {}: {e}", self.path.display()))
     }
     /// Where a screenshot goes when the caller gave no path.
     pub(crate) fn shot_dir(&self) -> std::path::PathBuf {
@@ -626,93 +614,6 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
                 v["untilSelector"] = json!(sel);
             }
             Ok(v)
-        }
-        "report" => {
-            let action = args.get("action").and_then(Value::as_str).unwrap_or("add");
-            let file = data_dir().join("reports.jsonl");
-            match action {
-                "add" => {
-                    let summary = args.get("summary").and_then(Value::as_str).ok_or("report needs summary")?;
-                    let kind = args.get("kind").and_then(Value::as_str).unwrap_or("issue");
-                    if !matches!(kind, "issue" | "idea") {
-                        return Err("kind must be issue or idea".into());
-                    }
-                    // Context that makes a report actionable without the caller
-                    // having to write an essay.
-                    let mut where_ = Value::Null;
-                    if let Some(tb) = args.get("tab").and_then(Value::as_str) {
-                        if let Ok(target) = cdp::resolve(&cfg.endpoint, Some(tb)) {
-                            where_ = json!({ "url": target.url, "title": target.title });
-                        }
-                    }
-                    let ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis())
-                        .unwrap_or(0);
-                    let rec = json!({
-                        "id": ts,
-                        "ts": ts,
-                        "kind": kind,
-                        "summary": summary,
-                        "details": args.get("details").cloned().unwrap_or(Value::Null),
-                        "tool": args.get("tool").cloned().unwrap_or(Value::Null),
-                        "profile": cfg.profile.name,
-                        "agent": cfg.profile_now().get_str("agent"),
-                        "version": VERSION,
-                        "where": where_,
-                    });
-                    if let Some(dir) = file.parent() {
-                        std::fs::create_dir_all(dir)
-                            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-                    }
-                    use std::io::Write as _;
-                    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&file)
-                        .map_err(|e| format!("cannot open {}: {e}", file.display()))?;
-                    writeln!(f, "{rec}").map_err(|e| e.to_string())?;
-                    Ok(json!({ "reported": summary, "kind": kind, "id": ts, "path": file.display().to_string() }))
-                }
-                "list" => {
-                    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20) as usize;
-                    let body = std::fs::read_to_string(&file).unwrap_or_default();
-                    let items: Vec<Value> = body
-                        .lines()
-                        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-                        .collect();
-                    let start = items.len().saturating_sub(limit);
-                    Ok(json!({ "total": items.len(), "recent": &items[start..], "path": file.display().to_string() }))
-                }
-                other => Err(format!("unknown report action: {other}")),
-            }
-        }
-        "batch" => {
-            // Several tool calls in ONE request. The transport is already ~2 ms;
-            // what actually costs time is the model's turn between calls, so the
-            // win is doing a whole flow in a single exchange.
-            let calls = args.get("calls").and_then(Value::as_array).ok_or("batch needs calls[]")?;
-            if calls.len() > 20 {
-                return Err("batch takes at most 20 calls".into());
-            }
-            let mut out = Vec::with_capacity(calls.len());
-            for c in calls {
-                let name = c.get("tool").and_then(Value::as_str).ok_or("each call needs a tool")?;
-                if name == "batch" {
-                    return Err("batch cannot nest".into());
-                }
-                let a = c.get("args").cloned().unwrap_or(json!({}));
-                let started = std::time::Instant::now();
-                match call_tool(cfg, name, &a) {
-                    Ok(v) => out.push(json!({
-                        "tool": name,
-                        "ok": true,
-                        "ms": started.elapsed().as_millis() as u64,
-                        "result": v,
-                    })),
-                    Err(e) => out.push(json!({
-                        "tool": name, "ok": false, "ms": started.elapsed().as_millis() as u64, "error": e,
-                    })),
-                }
-            }
-            Ok(json!({ "results": out }))
         }
         "status" => {
             let prof = cfg.profile_now();
@@ -956,52 +857,6 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
         "download" => files::download(cfg, args),
         "upload" => files::upload(cfg, args),
         "paste" => files::paste(cfg, args),
-        "profile" => {
-            let action = args.get("action").and_then(Value::as_str).unwrap_or("show");
-            let mut prof = cfg.profile_now();
-            match action {
-                "remember" => {
-                    let note = args.get("note").and_then(Value::as_str).ok_or("remember needs note")?;
-                    let ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    let mut hist = prof.data.get("history").and_then(Value::as_array).cloned().unwrap_or_default();
-                    let mut entry = json!({ "ts": ts, "note": note });
-                    if let Some(agent) = prof.get_str("agent") {
-                        entry["agent"] = json!(agent);
-                    }
-                    hist.push(entry);
-                    // Small on purpose: a memory, not a log. Keep the tail.
-                    if hist.len() > 50 {
-                        let cut = hist.len() - 50;
-                        hist.drain(0..cut);
-                    }
-                    prof.set("history", Value::Array(hist.clone()))?;
-                    Ok(json!({ "remembered": note, "entries": hist.len(), "path": prof.path.display().to_string() }))
-                }
-                "history" => {
-                    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20) as usize;
-                    let hist = prof.data.get("history").and_then(Value::as_array).cloned().unwrap_or_default();
-                    let start = hist.len().saturating_sub(limit);
-                    Ok(json!({ "name": prof.name, "total": hist.len(), "recent": &hist[start..] }))
-                }
-                "show" => Ok(json!({
-                    "name": prof.name,
-                    "path": prof.path.display().to_string(),
-                    "values": prof.data,
-                    "screenshotDir": prof.shot_dir().display().to_string(),
-                })),
-                "set" => {
-                    let key = args.get("key").and_then(Value::as_str).ok_or("set needs key")?;
-                    let value = args.get("value").cloned().ok_or("set needs value")?;
-                    prof.set(key, value.clone())?;
-                    Ok(json!({ "name": prof.name, "path": prof.path.display().to_string(),
-                               "set": { key: value } }))
-                }
-                other => Err(format!("unknown profile action: {other}")),
-            }
-        }
         "shot" => shot::run(cfg, args),
         other => Err(format!("unknown tool: {other}")),
     }

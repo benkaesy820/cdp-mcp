@@ -50,41 +50,6 @@ pub(crate) fn tool_defs() -> Value {
             }
         },
         {
-            "name": "report",
-            "description": "Report a problem or an improvement idea about these tools, while it is fresh. One line of JSONL per report, with version, profile, agent and the page it happened on. Use it instead of only complaining in prose — it is the channel that gets read.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": { "type": "string", "enum": ["add", "list"], "description": "default add" },
-                    "kind": { "type": "string", "enum": ["issue", "idea"] },
-                    "summary": { "type": "string", "description": "one line: what went wrong, or what would make this better" },
-                    "details": { "type": "string", "description": "optional: what you tried, what you expected" },
-                    "tool": { "type": "string", "description": "which tool it concerns, e.g. elements" },
-                    "tab": { "type": "string", "description": "optional: capture the page URL for context" },
-                    "limit": { "type": "integer", "description": "for list, default 20" }
-                },
-                "required": ["summary"]
-            }
-        },
-        {
-            "name": "batch",
-            "description": "Run several tool calls in one request, in order. Use it for a whole flow (observe, act, verify) to cut the round trips between you and the browser. Each entry is {tool, args}; results come back in order with per-call timing. A failed call does not stop the rest.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "calls": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": { "tool": { "type": "string" }, "args": { "type": "object" } },
-                            "required": ["tool"]
-                        }
-                    }
-                },
-                "required": ["calls"]
-            }
-        },
-        {
             "name": "status",
             "description": "Report the browser version and every open page tab. Start here.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
@@ -301,21 +266,6 @@ pub(crate) fn tool_defs() -> Value {
                     "tab": { "type": "string" }
                 },
                 "required": ["path"]
-            }
-        },
-        {
-            "name": "profile",
-            "description": "Read or change this agent's settings (a small JSON file). Keys: screenshot_dir, shot_format (png|jpeg|webp), shot_quality. Use set once, and shot() will keep writing there.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": { "type": "string", "enum": ["show", "set", "remember", "history"], "description": "show: all settings; set: {key,value}; remember: {note} appends to a capped history; history: {limit} reads it" },
-                    "key": { "type": "string" },
-                    "value": {},
-                    "note": { "type": "string", "description": "for remember" },
-                    "limit": { "type": "integer", "description": "for history, default 20" }
-                },
-                "required": ["action"]
             }
         },
         {
