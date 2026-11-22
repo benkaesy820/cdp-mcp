@@ -912,6 +912,22 @@ pub(crate) fn suspect_render(total: u64, nodes: u64) -> bool {
     total < 3 && nodes < 400
 }
 
+/// Keys `scan_with_frames` keeps for the click path. They are cache state, not
+/// answers: `session` and `target` are 32-char ids, `fi`/`lx`/`ly` are the
+/// frame-local index and point, and none of them is readable by the caller.
+const INTERNAL_KEYS: [&str; 5] = ["session", "target", "fi", "lx", "ly"];
+
+/// One element as the caller sees it: the record minus the cache-only keys.
+fn public_element(e: &Value) -> Value {
+    let mut keep = e.clone();
+    if let Some(o) = keep.as_object_mut() {
+        for k in INTERNAL_KEYS {
+            o.remove(k);
+        }
+    }
+    keep
+}
+
 pub(crate) fn fingerprint(e: &Value) -> String {
     format!(
         "{}|{}|{}|{}",
@@ -972,8 +988,10 @@ pub(crate) fn elements(cfg: &Cfg, args: &Value) -> Result<Value, String> {
             let prev_els = previous.get("elements").and_then(Value::as_array).cloned().unwrap_or_default();
             let old_set: std::collections::HashSet<String> = prev_els.iter().map(fingerprint).collect();
             let new_set: std::collections::HashSet<String> = all.iter().map(fingerprint).collect();
-            let added: Vec<Value> = all.iter().filter(|e| !old_set.contains(&fingerprint(e))).cloned().collect();
-            let removed: Vec<Value> = prev_els.iter().filter(|e| !new_set.contains(&fingerprint(e))).cloned().collect();
+            let added: Vec<Value> = all.iter().filter(|e| !old_set.contains(&fingerprint(e)))
+                .map(public_element).collect();
+            let removed: Vec<Value> = prev_els.iter().filter(|e| !new_set.contains(&fingerprint(e)))
+                .map(public_element).collect();
             let prev_ov = previous.get("overlays").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0) as i64;
             let now_ov = scan_v.get("overlays").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0) as i64;
             return Ok(json!({
@@ -1016,7 +1034,7 @@ pub(crate) fn elements(cfg: &Cfg, args: &Value) -> Result<Value, String> {
             if unique && !label.is_empty() && !seen_labels.insert(label.to_lowercase()) {
                 continue;
             }
-            let mut keep = e.clone();
+            let mut keep = public_element(e);
             if !full {
                 if let Some(o) = keep.as_object_mut() {
                     o.remove("w");

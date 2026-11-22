@@ -484,6 +484,11 @@ await withTab(page("frames.html?port=" + fport), async (tabA) => {
     const a = await frameEl(tabA);
     const b = await frameEl(tabB);
     check("both tabs list their own frame element", !!a && !!b && a.i === b.i, { a: a?.i, b: b?.i });
+    // The cache needs session/target/fi/lx/ly to act inside the frame; the caller
+    // does not, and two 32-char ids per element is prompt paid for nothing.
+    check("a frame element hides its cache-only keys",
+          !!a && !!a.frame && !("session" in a) && !("target" in a) && !("fi" in a) &&
+          !("lx" in a) && !("ly" in a), a);
     const ca = await s.tool("input", { tab: tabA, actions: [{ click: { i: a?.i } }] });
     const cb = await s.tool("input", { tab: tabB, actions: [{ click: { i: b?.i } }] });
     const hits = async (t) => JSON.parse((await s.tool("eval", { tab: t, expression: "JSON.stringify(H)" })).v.value);
