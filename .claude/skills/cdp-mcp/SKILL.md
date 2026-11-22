@@ -67,31 +67,35 @@ Claude Code:
 claude mcp add cdp -- /home/YOU/.local/bin/cdp-mcp --profile default
 ```
 
-Restart or reload the agent after editing MCP config. A Claude Code project-scoped server needs one approval on next launch. Use a different
-`--profile` per agent if they should not share the last-used tab.
+Restart or reload the agent after editing MCP config. A Claude Code
+project-scoped server needs one approval on next launch. Use a different
+`--profile` per agent if they should read separate settings (`screenshot_dir`,
+`shot_format`, `shot_quality`, `call_timeout_ms`).
 
 ## Verify
 
-Call the `status` tool. It should return `"up": true` with the browser version,
-or a doctor result with the fix. Then call `tabs list`. Do not claim it works
-without that call.
+Call the `status` tool. On success it returns `browser`, `protocol` and `tabs`;
+when the browser is unreachable it returns `"up": false` with a hint. Then call
+`tabs` with `action: "list"`. Do not claim it works without that call.
 
 ## Safety
 
 - CDP has no authentication. Keep the endpoint on loopback; never tunnel or
   proxy the port.
-- The default build refuses non-loopback endpoints and
-  `paste { method: "system" }`. `--allow-remote` and the system paste exist only
-  in `cargo build --features experimental`. Do not build experimental unless the
-  user asks and understands the risk.
+- The default build refuses non-loopback endpoints. `--allow-remote` exists
+  only in `cargo build --features experimental`. Do not build experimental
+  unless the user asks and understands the risk.
+- `paste` always delivers data through the page and never touches the system
+  clipboard.
 - The tool acts as the logged-in user. Ask before anything irreversible:
   posting, paying, deleting, sending.
 
 ## Limits to state plainly
 
 - Linux x86-64 only for v1.
-- No network awareness: a click that fetches while the DOM stays still can read
-  as idle before the response renders.
+- `idle` has no network awareness: a click that fetches while the DOM stays
+  still can read as idle before the response renders (use `input` with
+  `settleMs` to wait on same-origin requests).
 - One call at a time per server; a long wait queues the rest.
 - Reports coalesce at 80 ms, text checks at 50 ms, `maxIdleMs` below about
   100 ms is approximate.
