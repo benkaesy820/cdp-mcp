@@ -26,11 +26,11 @@ struct Receipts {
     downloads: Vec<Value>,
 }
 
-/// What the first navigation event after a command says.
 /// How long a committed document gets to reach DOMContentLoaded before the
 /// caller is told where it is anyway.
 const DOM_READY_MS: u64 = 3_000;
 
+/// What the first navigation event after a command says.
 pub enum NavOutcome {
     /// A new document committed, at this URL.
     Committed(String),
@@ -553,6 +553,15 @@ pub fn close_tab(endpoint: &str, id: &str) -> Res<bool> {
 }
 
 /// An open DevTools connection to one page.
+/// The emulated media overrides active on this connection.
+/// `Emulation.setEmulatedMedia` replaces the whole feature list, so the state
+/// has to be kept here for the next call to merge into instead of wiping.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MediaState {
+    pub media: String,
+    pub features: Vec<(String, String)>,
+}
+
 pub struct Conn {
     ws: WebSocket<TcpStream>,
     next: i64,
@@ -613,6 +622,11 @@ pub struct Conn {
     /// `Page.domContentEventFired` since the last navigation command: the
     /// document parsed, which `frameNavigated` alone does not mean.
     nav_dom_ready: bool,
+    /// Media overrides currently applied, because the CDP call is a replace.
+    pub media: MediaState,
+    /// Touch emulation is on. Tracked because disabling it only affects
+    /// documents created afterwards: an existing page keeps `ontouchstart`.
+    pub touch_on: bool,
 }
 
 /// Events that mean the page is still doing something. `Page.*` is deliberately
@@ -675,7 +689,7 @@ impl Conn {
                               binding: None, timed_out: false, contexts_cleared: false,
                               receipts: None, page_on: false, dialog: None, dialog_seq: 0, network_on: false,
                               destroyed: Vec::new(), nav_committed: None, nav_same: None,
-                              nav_dom_ready: false };
+                              nav_dom_ready: false, media: MediaState::default(), touch_on: false };
         conn.set_read_timeout(ms);
         // No domain is enabled on connect: each enable costs a round trip, and
         // most commands do not need one. `enable_runtime` turns on the Runtime
@@ -1163,8 +1177,11 @@ impl Conn {
                 // Parsed, not just committed: bounded, and a dialog still wins.
                 let dom_deadline = std::time::Instant::now() + Duration::from_millis(DOM_READY_MS);
                 loop {
+                    // The document committed, so a load-time dialog is not a
+                    // failed navigation: stop waiting for the parser and let the
+                    // caller report the moved page plus the dialog.
                     if self.dialog.is_some() {
-                        return Ok(Some(NavOutcome::Dialog));
+                        break;
                     }
                     if self.nav_dom_ready {
                         break;

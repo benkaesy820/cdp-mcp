@@ -13,6 +13,7 @@
 
 mod cdp;
 mod clip;
+mod emulate;
 mod nav;
 mod scan;
 mod wait;
@@ -888,6 +889,26 @@ fn tool_defs() -> Value {
                     "all": { "type": "boolean", "description": "for action=list: include chrome-extension:// pages (default false)" }
                 },
                 "required": ["action"]
+            }
+        },
+        {
+            "name": "emulate",
+            "description": "Emulate a viewport, touch input and CSS media. A preset sets all of it: mobile 390x844@3, tablet 768x1024@2, desktop 1280x800@1; explicit width/height/deviceScaleFactor/mobile/touch override the preset. Media calls add up: colorScheme then reducedMotion keeps both, because Emulation.setEmulatedMedia replaces the whole list and the active set is tracked per tab. reset clears metrics, touch and media. A viewport change moves every element, so this tab's scan cache is dropped and the next elements rescans; a within scope survives.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tab": { "type": "string" },
+                    "reset": { "type": "boolean", "description": "clear device metrics, touch and media" },
+                    "preset": { "type": "string", "enum": ["mobile", "tablet", "desktop"] },
+                    "width": { "type": "integer", "description": "viewport width, 100..7680" },
+                    "height": { "type": "integer", "description": "viewport height, 100..7680" },
+                    "deviceScaleFactor": { "type": "number", "description": "device pixel ratio, greater than 0" },
+                    "mobile": { "type": "boolean", "description": "emulate a mobile viewport" },
+                    "touch": { "type": "boolean", "description": "defaults to mobile when a viewport is applied; works on its own too" },
+                    "colorScheme": { "type": "string", "enum": ["light", "dark", "no-preference"] },
+                    "reducedMotion": { "type": "string", "enum": ["reduce", "no-preference"] },
+                    "media": { "type": "string", "enum": ["screen", "print", ""] }
+                }
             }
         },
         {
@@ -2206,6 +2227,7 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
             }
             other => Err(format!("unknown tabs action: {other}")),
         },
+        "emulate" => with_conn(&cfg.endpoint, tab, |conn, tab_id| emulate::run(conn, tab_id, &args)),
         "eval" => {
             let expr = args.get("expression").and_then(Value::as_str).ok_or("eval needs expression")?;
             with_conn(&cfg.endpoint, tab, |conn, tab_id| {
@@ -3403,7 +3425,7 @@ mod tests {
         let defs = tool_defs();
         let names: Vec<&str> = defs.as_array().unwrap().iter()
             .map(|t| t["name"].as_str().unwrap()).collect();
-        for want in ["status", "tabs", "eval", "elements", "input", "shot", "paste", "flow"] {
+        for want in ["status", "tabs", "eval", "elements", "input", "shot", "paste", "flow", "emulate"] {
             assert!(names.contains(&want), "{want} missing");
         }
         for t in defs.as_array().unwrap() {

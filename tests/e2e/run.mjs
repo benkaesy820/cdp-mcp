@@ -64,6 +64,7 @@ async function serveFrames() {
       "/receipts": "receipts.html", "/sprint2": "sprint2.html", "/imgs": "imgs.html",
       "/dialogs": "dialogs.html", "/unload": "unload.html", "/download": "download.html",
       "/xnav-src": "xnav-src.html", "/xnav-dst": "xnav-dst.html",
+      "/emulate": "emulate.html",
     };
     const file = files[path] || "cross.html";
     res.end(readFileSync(join(here, "pages", file)));
@@ -651,6 +652,68 @@ await withTab(`http://localhost:${fport}/unload`, async (tab) => {
   const href = (await s.tool("eval", { tab, expression: "location.href" })).v?.value || "";
   check("accepting it lets the navigation finish",
         leave.ok && /\/imgs$/.test(href), { ok: leave.ok, href });
+});
+
+// ---- emulate: viewport, touch and media ----------------------------------
+await withTab(`http://localhost:${fport}/emulate`, async (tab) => {
+  const read = async () => JSON.parse((await s.tool("eval", { tab, expression:
+    "JSON.stringify({ w: innerWidth, h: innerHeight, dpr: devicePixelRatio, \
+       mtp: navigator.maxTouchPoints, ot: 'ontouchstart' in window, \
+       dark: matchMedia('(prefers-color-scheme: dark)').matches, \
+       reduce: matchMedia('(prefers-reduced-motion: reduce)').matches, \
+       print: matchMedia('print').matches })" })).v?.value);
+  const before = await read();
+  const near = (a, b) => Math.abs(a - b) < 0.01;
+
+  const mob = (await s.tool("emulate", { tab, preset: "mobile" })).v;
+  const m = await read();
+  check("a mobile preset changes the page's own viewport, dpr and touch",
+        m.w === 390 && m.h === 844 && near(m.dpr, 3) && m.mtp === 1,
+        { applied: mob?.viewport, measured: mob?.measured, page: m });
+  check("the tool says touch needs a reload to reach the page",
+        mob?.touchNeedsReload === true, mob);
+
+  // Every coordinate moved, so the previous scan's baseline is worthless.
+  const dd = (await s.tool("elements", { tab, mode: "delta" })).v;
+  check("a viewport change drops the delta baseline", dd.baseline === false, dd);
+
+  const scan = (await s.tool("elements", { tab, limit: 5 })).v;
+  check("the scan reports the emulated viewport height", scan.scroll?.vh === 844, scan.scroll);
+
+  // Touch events are created with the document: a reload is what makes
+  // 'ontouchstart' true, and the tool reported exactly that above.
+  await s.tool("tabs", { action: "reload", tab });
+  const afterReload = await read();
+  check("after the reload the page sees touch events",
+        afterReload.ot === true && afterReload.mtp === 1, afterReload);
+
+  const ex = (await s.tool("emulate", { tab, width: 800, height: 600, colorScheme: "dark" })).v;
+  const d = await read();
+  check("explicit metrics apply and colorScheme reaches matchMedia",
+        d.w === 800 && d.h === 600 && d.dark === true, { applied: ex?.viewport, page: d });
+
+  await s.tool("emulate", { tab, reducedMotion: "reduce" });
+  const both = await read();
+  check("a second media call keeps the first feature",
+        both.dark === true && both.reduce === true, both);
+
+  await s.tool("emulate", { tab, media: "print" });
+  const pr = await read();
+  check("media:print is what the page sees", pr.print === true, pr);
+
+  // Leave touch on so reset has something to turn off, which is the case the
+  // reload note exists for.
+  await s.tool("emulate", { tab, touch: true });
+  const reset = (await s.tool("emulate", { tab, reset: true })).v;
+  const after = await read();
+  check("reset restores the real viewport",
+        after.w === before.w && after.h === before.h && near(after.dpr, before.dpr),
+        { before, after });
+  check("reset drops the emulated media",
+        after.print === false && after.dark === before.dark && after.reduce === before.reduce,
+        { before, after });
+  check("reset reports that touch needs a reload to leave the page",
+        reset?.touchNeedsReload === true, reset);
 });
 
 await withTab(page("chatty.html"), async (tab, ev) => {

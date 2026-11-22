@@ -124,6 +124,12 @@ pub(crate) fn navigate(
                 ));
             }
             let mut out = json!({ "tab": tab, "moved": true, "url": url });
+            // The page committed and then asked something: the move stands, and
+            // the dialog is reported for the next call to answer.
+            if let Some(d) = conn.dialog.clone() {
+                out["dialog"] = d;
+                out["note"] = json!("the document is the new one; a load-time dialog is open");
+            }
             if idle {
                 match wait_idle(conn, IDLE_MS, 300) {
                     Ok(n) => {
