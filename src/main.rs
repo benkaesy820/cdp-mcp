@@ -323,6 +323,13 @@ pub(crate) fn nap(ms: u64) -> Result<(), String> {
 /// The scope (`within`) of the last `elements` scan per tab. An index is only
 /// meaningful in the scan that produced it, so a click must resolve it in the
 /// same scope or it lands on a different element.
+/// Emulation state per tab. See the "emulate" arm: it is page state, not
+/// connection state, so it must not be lost when a socket dies.
+fn emu_cache() -> &'static Mutex<HashMap<String, emulate::Emulated>> {
+    static EMU: OnceLock<Mutex<HashMap<String, emulate::Emulated>>> = OnceLock::new();
+    EMU.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn scope_cache() -> &'static Mutex<HashMap<String, Option<String>>> {
     static SCOPES: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
     SCOPES.get_or_init(|| Mutex::new(HashMap::new()))
@@ -709,6 +716,7 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
                     conn_cache().lock().unwrap().remove(&id);
                     scope_cache().lock().unwrap().remove(&id);
                     scan_cache().lock().unwrap().remove(&id);
+                    emu_cache().lock().unwrap().remove(&id);
                 }
                 Ok(json!({
                     "closed": closed,
@@ -738,7 +746,18 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
             }
             other => Err(format!("unknown tabs action: {other}")),
         },
-        "emulate" => with_conn(&cfg.endpoint, tab, |conn, tab_id| emulate::run(conn, tab_id, &args)),
+        "emulate" => with_conn(&cfg.endpoint, tab, |conn, tab_id| {
+            // The record is keyed by tab, not held on the connection: the
+            // overrides live on the target, so they survive a socket that died,
+            // and a merge from an empty record would wipe a feature the page
+            // still has. Read, run unlocked, write back.
+            let mut state = emu_cache().lock().unwrap().get(tab_id).cloned().unwrap_or_default();
+            let out = emulate::run(conn, tab_id, &args, &mut state);
+            if out.is_ok() {
+                emu_cache().lock().unwrap().insert(tab_id.to_string(), state);
+            }
+            out
+        }),
         "pdf" => with_conn(&cfg.endpoint, tab, |conn, tab_id| pdf::run(conn, tab_id, &args)),
         "eval" => {
             let expr = args.get("expression").and_then(Value::as_str).ok_or("eval needs expression")?;
@@ -1037,9 +1056,24 @@ mod tests {
 
 
 
+    /// The emulation record has to follow the tab, not the socket: a reconnect
+    /// drops the Conn, while the browser keeps the override applied.
     #[test]
-    fn base64_round_trips() {
-        for n in 0..10 {
+    fn emulation_state_is_kept_per_tab() {
+        let mut st = emulate::Emulated::default();
+        st.media.features.push(("prefers-color-scheme".into(), "dark".into()));
+        emu_cache().lock().unwrap().insert("tab-a".into(), st);
+        let other = emu_cache().lock().unwrap().get("tab-b").cloned().unwrap_or_default();
+        assert!(other.media.features.is_empty(), "a new tab starts with nothing");
+        let same = emu_cache().lock().unwrap().get("tab-a").cloned().unwrap_or_default();
+        assert_eq!(same.media.features, vec![("prefers-color-scheme".to_string(), "dark".to_string())]);
+        // Closing a tab drops its record, as it drops the scan and scope caches.
+        emu_cache().lock().unwrap().remove("tab-a");
+        assert!(emu_cache().lock().unwrap().get("tab-a").is_none());
+    }
+
+    #[test]
+    fn base64_round_trips() {        for n in 0..10 {
             let bytes: Vec<u8> = (0..n * 7 + 1).map(|b| (b * 37) as u8).collect();
             assert_eq!(b64decode(&b64encode(&bytes)).unwrap(), bytes);
         }

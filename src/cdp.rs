@@ -681,11 +681,6 @@ pub struct Conn {
     /// `Page.domContentEventFired` since the last navigation command: the
     /// document parsed, which `frameNavigated` alone does not mean.
     nav_dom_ready: bool,
-    /// Media overrides currently applied, because the CDP call is a replace.
-    pub media: MediaState,
-    /// Touch emulation is on. Tracked because disabling it only affects
-    /// documents created afterwards: an existing page keeps `ontouchstart`.
-    pub touch_on: bool,
     /// The last `Page.fileChooserOpened` this connection saw, waiting to be
     /// consumed. Recorded in the funnel because the event can arrive before the
     /// click's own reply.
@@ -775,7 +770,7 @@ impl Conn {
                               focus_restore: false,
                               nav_batch: false,
                                nav_committed: None, nav_same: None,
-                              nav_dom_ready: false, media: MediaState::default(), touch_on: false };
+                              nav_dom_ready: false };
         conn.set_read_timeout(ms);
         // No domain is enabled on connect: each enable costs a round trip, and
         // most commands do not need one. `enable_runtime` turns on the Runtime

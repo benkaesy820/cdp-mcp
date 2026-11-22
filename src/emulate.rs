@@ -1,9 +1,10 @@
 // Viewport, touch and CSS media emulation.
 //
 // Two things make this more than a thin wrapper. `Emulation.setEmulatedMedia`
-// replaces the entire feature list, so the state lives on `Conn` and calls
-// merge into it. And a viewport change moves every element, so the tab's scan
-// cache is dropped rather than handed back with stale coordinates.
+// replaces the entire feature list, so the active set is tracked per tab (see
+// `Emulated`) and calls merge into it. And a viewport change moves every
+// element, so the tab's scan cache is dropped rather than handed back with
+// stale coordinates.
 
 use serde_json::{json, Value};
 
@@ -224,9 +225,27 @@ fn settle_viewport(conn: &mut Conn, before: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// What this tab is emulating. Kept per TAB, never on the connection: the
+/// overrides live on the target in the browser, so they outlive a socket that
+/// died, and the next `Emulation.setEmulatedMedia` replaces the whole feature
+/// list. A connection-keyed record would silently drop a feature the page still
+/// has.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Emulated {
+    pub(crate) media: MediaState,
+    /// Touch emulation is on. Tracked because disabling it only affects
+    /// documents created afterwards: an existing page keeps `ontouchstart`.
+    pub(crate) touch_on: bool,
+}
+
 /// Apply a call and report what is active, plus what the page itself measures.
-pub(crate) fn run(conn: &mut Conn, tab: &str, args: &Value) -> Result<Value, String> {
-    let plan = plan(args, &conn.media)?;
+pub(crate) fn run(
+    conn: &mut Conn,
+    tab: &str,
+    args: &Value,
+    state: &mut Emulated,
+) -> Result<Value, String> {
+    let plan = plan(args, &state.media)?;
     let viewport_before = if plan.reset || plan.metrics.is_some() {
         viewport(conn)
     } else {
@@ -248,11 +267,11 @@ pub(crate) fn run(conn: &mut Conn, tab: &str, args: &Value) -> Result<Value, Str
         conn.call("Emulation.clearDeviceMetricsOverride", json!({}))?;
         conn.call("Emulation.setTouchEmulationEnabled", touch_param(false))?;
         conn.call("Emulation.setEmulatedMedia", json!({ "media": "", "features": [] }))?;
-        conn.media = MediaState::default();
-        if conn.touch_on {
+        state.media = MediaState::default();
+        if state.touch_on {
             touch_needs_reload = true;
         }
-        conn.touch_on = false;
+        state.touch_on = false;
         scan_cache().lock().unwrap().remove(tab);
         applied["reset"] = json!(true);
     }
@@ -266,10 +285,10 @@ pub(crate) fn run(conn: &mut Conn, tab: &str, args: &Value) -> Result<Value, Str
             }),
         )?;
         conn.call("Emulation.setTouchEmulationEnabled", touch_param(m.touch))?;
-        if m.touch != conn.touch_on {
+        if m.touch != state.touch_on {
             touch_needs_reload = true;
         }
-        conn.touch_on = m.touch;
+        state.touch_on = m.touch;
         // Every coordinate and every `off` flag just moved; the scope did not.
         scan_cache().lock().unwrap().remove(tab);
         applied["viewport"] = json!({
@@ -278,10 +297,10 @@ pub(crate) fn run(conn: &mut Conn, tab: &str, args: &Value) -> Result<Value, Str
         });
     } else if let Some(t) = plan.touch {
         conn.call("Emulation.setTouchEmulationEnabled", touch_param(t))?;
-        if t != conn.touch_on {
+        if t != state.touch_on {
             touch_needs_reload = true;
         }
-        conn.touch_on = t;
+        state.touch_on = t;
         applied["touch"] = json!(t);
     }
 
@@ -297,7 +316,7 @@ pub(crate) fn run(conn: &mut Conn, tab: &str, args: &Value) -> Result<Value, Str
             map.insert(name.clone(), json!(value));
         }
         applied["media"] = json!({ "media": media.media, "features": Value::Object(map) });
-        conn.media = media;
+        state.media = media;
     }
 
     if let Some(b) = &viewport_before {
