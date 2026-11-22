@@ -241,11 +241,15 @@ fn sh_quote(s: &str) -> String {
 /// A fresh temp path per call: two clipboard writes inside the restore delay
 /// must not share a file, or the first restore deletes the second payload.
 pub(crate) fn clip_temp(prefix: &str) -> std::path::PathBuf {
+    // The clock can be coarse, and two calls in the same tick would collide; the
+    // counter makes uniqueness independent of the clock.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+    std::env::temp_dir().join(format!("{prefix}-{}-{nanos}-{seq}", std::process::id()))
 }
 
 /// Write clipboard bytes where only this user can read them.
@@ -303,7 +307,7 @@ pub(crate) fn clip_append(profile: &str, text: &str, label: Option<&str>) -> Res
 mod tests {
     use super::*;
 
-#[test]
+    #[test]
     fn the_clipboard_backend_follows_the_session() {
         let wayland = |k: &str| match k { "WAYLAND_DISPLAY" => Some("wayland-0".to_string()), _ => None };
         let both = |k: &str| match k {

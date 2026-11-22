@@ -1220,8 +1220,6 @@ fn click_log(at: &Value) -> Value {
     c
 }
 
-/* ------------------------------ clipboard -------------------------------- */
-
 
 /* -------------------------------- capture -------------------------------- */
 
@@ -2941,7 +2939,7 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                     (Some((m, b)), Some(bk)) => {
                         let tmp = clip_temp("cdp-mcp-restore");
                         if clip_stage(&tmp, b).is_ok() {
-                            match clip_restore_script(bk, m, &tmp.to_string_lossy()) {
+                            let spawned = match clip_restore_script(bk, m, &tmp.to_string_lossy()) {
                                 Ok(cmd) => std::process::Command::new("sh")
                                     .arg("-c")
                                     .arg(cmd)
@@ -2955,7 +2953,13 @@ fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, String> {
                                     .spawn()
                                     .is_ok(),
                                 Err(_) => false,
+                            };
+                            if !spawned {
+                                // Nothing will read the staged bytes: the script
+                                // that would have fed them was never started.
+                                let _ = std::fs::remove_file(&tmp);
                             }
+                            spawned
                         } else {
                             false
                         }
