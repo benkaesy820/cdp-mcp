@@ -56,7 +56,9 @@ cd cdp-mcp
 ./install.sh
 ```
 
-Non-interactive: `./install.sh --global --yes --harness opencode,codex`.
+Non-interactive: `./install.sh --global --yes --harness opencode,codex`. Without a
+terminal nothing can grant consent, so add `--allow-launch helium-browser` (or
+whichever command you use) to write it in the same run.
 
 **By hand:**
 
@@ -323,8 +325,8 @@ first. Nothing experimental is published as a release.
 ## Limits
 
 - Chromium only. Firefox and Safari are not supported.
-- **Linux x86_64 only for now** (static musl). aarch64, macOS and Windows are not
-  built.
+- **Linux x86_64 and aarch64** (static musl). The aarch64 binary is built but has
+  not been run on hardware; macOS and Windows are not built.
 - **No network awareness.** A click that starts a fetch and leaves the DOM
   unchanged can be reported idle before the response renders.
 - **Wait reports are coalesced.** `changes` is at most one per 80 ms, the text
@@ -346,7 +348,7 @@ first. Nothing experimental is published as a release.
 | platform | status |
 |---|---|
 | **Linux x86_64** | **one static musl binary; everything above measured here** |
-| Linux aarch64 | not built |
+| Linux aarch64 | static binary built by CI; **not run on hardware** |
 | macOS / Windows | not built or run |
 
 The release builds for `x86_64-unknown-linux-musl`: `file` reports *statically
