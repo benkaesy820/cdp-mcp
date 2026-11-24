@@ -34,6 +34,23 @@ fn default_tab(cfg: &Cfg) -> Result<String, String> {
         .ok_or_else(|| "no page tab is open; `cdp tabs open URL` first".to_string())
 }
 
+/// Handles are positional in the CLI: each invocation is a new process, so the
+/// server's handle table is empty. `t1` therefore means "the first tab `status`
+/// lists", which is the same order the server uses when it assigns them.
+fn resolve_tab(cfg: &Cfg, raw: &str) -> Result<String, String> {
+    let Some(n) = raw.strip_prefix('t').and_then(|d| d.parse::<usize>().ok()) else {
+        return Ok(raw.to_string());
+    };
+    let v = crate::call_tool(cfg, "status", &json!({}))?;
+    v.get("tabs")
+        .and_then(Value::as_array)
+        .and_then(|t| t.get(n.wrapping_sub(1)))
+        .and_then(|t| t.get("tab"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| format!("no tab {raw}; run `cdp status` to see what exists"))
+}
+
 fn tab_lines(v: &Value) {
     let Some(tabs) = v.get("tabs").and_then(Value::as_array) else {
         // Not a listing: print the payload as it came.
@@ -90,12 +107,11 @@ pub(crate) fn run(cfg: &Cfg, argv: &[String]) -> i32 {
     // One place for the tab argument, so a handle is resolved exactly as the
     // server would resolve it.
     let with_tab = |mut args: Value| -> Result<Value, String> {
-        match &tab_opt {
-            Some(t) => args["tab"] = json!(t),
-            None => args["tab"] = json!(default_tab(cfg)?),
-        }
-        crate::call_tool(cfg, "status", &json!({}))?; // surface a dead browser early
-        let args = crate::normalize_tab(args)?;
+        let raw = match &tab_opt {
+            Some(t) => t.clone(),
+            None => default_tab(cfg)?,
+        };
+        args["tab"] = json!(resolve_tab(cfg, &raw)?);
         Ok(args)
     };
     let result: Result<Value, String> = (|| match verb {
