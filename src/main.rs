@@ -12,6 +12,7 @@
 //!     has to be an explicit opt-in.
 
 mod cdp;
+mod cli;
 mod emulate;
 mod files;
 mod input;
@@ -411,7 +412,7 @@ fn handle_to_id(handle: &str) -> Option<String> {
 /// handler sees it. An unknown handle is an error rather than a pass-through:
 /// sending `t9` on as an id produces a confusing CDP failure instead of saying
 /// what went wrong.
-fn normalize_tab(mut args: Value) -> Result<Value, String> {
+pub(crate) fn normalize_tab(mut args: Value) -> Result<Value, String> {
     let Some(raw) = args.get("tab").and_then(Value::as_str).map(str::to_string) else {
         return Ok(args);
     };
@@ -1253,7 +1254,11 @@ fn send(v: Value) {
 }
 
 fn main() {
-    if std::env::args().nth(1).as_deref() == Some("setup") {
+    // `cdp <verb>`: the CLI path, decided before flag parsing so a verb is not
+    // mistaken for an unknown argument.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let cli_mode = argv.first().map(|a| cli::is_verb(a)).unwrap_or(false);
+    if argv.first().map(String::as_str) == Some("setup") {
         setup();
         return;
     }
@@ -1261,7 +1266,7 @@ fn main() {
     let mut endpoint_set = false;
     let mut profile_name = std::env::var("CDP_PROFILE").unwrap_or_else(|_| "default".to_string());
     let mut allow_remote = false;
-    let mut args = std::env::args().skip(1);
+    let mut args = argv.clone().into_iter().skip(if cli_mode { usize::MAX } else { 0 });
     while let Some(a) = args.next() {
         match a.as_str() {
             "-h" | "--help" => {
@@ -1316,6 +1321,9 @@ fn main() {
         std::env::set_var("CDP_MCP_TIMEOUT_MS", ms.to_string());
     }
     let cfg = Cfg { endpoint, profile };
+    if cli_mode {
+        std::process::exit(cli::run(&cfg, &argv));
+    }
 
     // Stdin is read on its own thread so a cancellation (or a ping) is seen
     // while a tool is still running; the tools themselves run one at a time on
