@@ -5,6 +5,13 @@ description: Install and configure cdp-mcp, a small MCP server that lets a codin
 
 # cdp-mcp
 
+## One tab
+
+Work in **one tab**, navigated in place: `cdp go <url>`, or `tabs {action:"goto"}`.
+Open a second tab only when the task genuinely needs two pages at once — comparing,
+or keeping one while another navigates — and close it when done. Never bring a tab
+to the front: the person's own tab stays untouched while you work behind it.
+
 A browser tool for coding agents: one static Rust binary over MCP stdio, attached
 to the user's real browser. No extension, no Playwright, no second profile, so
 every login is already there.

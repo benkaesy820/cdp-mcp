@@ -322,7 +322,7 @@ fi
 
 if [ -f "$HOME/.config/cdp-mcp/consent.json" ]; then
     if interactive; then
-        read -r -p "A consent file exists. Walk through those questions again? [y/N] " answer
+        read -r -p "A consent file exists. Ask the one consent question again (may it start your browser)? [y/N] " answer
     else
         answer=n
     fi
@@ -331,7 +331,7 @@ if [ -f "$HOME/.config/cdp-mcp/consent.json" ]; then
         *) say "consent: kept (change it any time with: cdp-mcp setup)" ;;
     esac
 elif interactive; then
-    read -r -p "Ask the consent questions now (may cdp-mcp start a browser, which one, may a tab take the foreground)? [Y/n] " answer
+    read -r -p "Ask the consent question now (may cdp-mcp start your browser when none is running, and which one)? [Y/n] " answer
     case "${answer:-y}" in
         y | Y | yes | YES) "$BIN" setup ;;
         *) say "consent: none written — cdp-mcp will not start a browser until you run 'cdp-mcp setup'" ;;

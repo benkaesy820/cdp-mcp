@@ -574,17 +574,13 @@ fn setup() {
     } else {
         "helium-browser".to_string()
     };
-    let background = ask(
-        "\nMay it open background tabs in a browser you are using? It never switches to them.",
-        true,
-    );
-    let foreground = ask("May it ever bring a tab to the front, or focus the window?", false);
-    // These two are recorded but not enforced by this build: every tab this
-    // server opens is already background, and nothing here activates a tab.
+    // The tab policy is not a question: one tab, navigated in place, opened in the
+    // background only when a task truly needs a second page. Asking a person to
+    // decide that invites a worse answer than the rule.
     let body = json!({
         "launch": { "allowed": launch, "browser": browser },
-        "tabs": { "background": background, "foreground": foreground },
-        "written": "re-run `cdp-mcp setup` to change these answers",
+        "tabs": { "background": true, "foreground": false },
+        "written": "one tab, navigated in place; edit tabs.foreground only if you mean it",
     });
     let path = consent_path();
     if let Some(dir) = path.parent() {
@@ -595,7 +591,7 @@ fn setup() {
         Ok(()) => {
             println!("\nwrote {}", path.display());
             println!(
-                "launch: {}   background tabs: {background}   foreground: {foreground}",
+                "launch: {}   tabs: one, background, never focused",
                 if launch { format!("allowed ({browser})") } else { "not allowed".to_string() }
             );
         }
