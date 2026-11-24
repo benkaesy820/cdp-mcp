@@ -12,7 +12,8 @@
 set -euo pipefail
 
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$REPO/Cargo.toml" | head -1)
+[ -f "$REPO/Cargo.toml" ] && VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$REPO/Cargo.toml" | head -1)
+VERSION=${VERSION:-unknown}
 BIN="$HOME/.local/bin/cdp-mcp"
 SCOPE=""
 PROJECT=""
@@ -71,7 +72,13 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-[ -f "$REPO/Cargo.toml" ] || die "run this from the cdp-mcp checkout: git clone https://github.com/benkaesy820/cdp-mcp && cd cdp-mcp && ./install.sh"
+# Two ways to install: from a source checkout (builds with cargo), or standalone
+# (downloads the prebuilt release; needs only curl and tar).
+if [ -f "$REPO/Cargo.toml" ]; then
+    say "source: $REPO"
+else
+    say "no source tree here: will download a prebuilt release for $(uname -m)"
+fi
 command -v python3 >/dev/null || die "python3 is required to merge JSON config safely"
 
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -167,13 +174,15 @@ fi
 
 # ---------------------------------------------------------------- the binary
 
-if [ -x "$BIN" ]; then
+# Always install: skipping when a binary already exists meant a re-run never
+# upgraded anything, which is exactly when people re-run it.
+previous=$("$BIN" --version 2>/dev/null || true)
+[ -n "$previous" ] && say "" && say "replacing: $previous"
+
+if [ -f "$REPO/Cargo.toml" ]; then
+    have cargo || die "no cargo here, and no source tree to build from; run the installer from a release tarball instead"
     say ""
-    say "binary: $BIN ($("$BIN" --version 2>/dev/null || printf 'present'))"
-else
-    have cargo || die "cargo is required to build cdp-mcp; install Rust 1.88+ or put a cdp-mcp binary in $BIN"
-    say ""
-    say "building cdp-mcp $VERSION ..."
+    say "building cdp-mcp $VERSION from source ..."
     if have rustup && rustup target list --installed 2>/dev/null | grep -qx x86_64-unknown-linux-musl; then
         cargo build --quiet --release --target x86_64-unknown-linux-musl --manifest-path "$REPO/Cargo.toml"
         SRC="$REPO/target/x86_64-unknown-linux-musl/release/cdp-mcp"
@@ -181,13 +190,43 @@ else
         cargo build --quiet --release --manifest-path "$REPO/Cargo.toml"
         SRC="$REPO/target/release/cdp-mcp"
     fi
-    mkdir -p "$HOME/.local/bin"
-    # Write beside it and rename: overwriting a running binary fails with
-    # "Text file busy", and the server a harness spawned is usually running.
-    install -m 755 "$SRC" "$BIN.new"
-    mv -f "$BIN.new" "$BIN"
-    say "binary: $BIN"
+else
+    # No source: take the prebuilt release. Needs curl and tar, nothing else.
+    case "$(uname -m)" in
+        x86_64 | amd64) triple=x86_64-unknown-linux-musl ;;
+        aarch64 | arm64) triple=aarch64-unknown-linux-musl ;;
+        *) die "no prebuilt binary for $(uname -m); build from source instead" ;;
+    esac
+    have curl || die "curl is required to download the release"
+    have tar || die "tar is required to unpack the release"
+    base=${CDP_RELEASE_BASE:-https://github.com/benkaesy820/cdp-mcp/releases/latest/download}
+    name="cdp-mcp-$triple.tar.gz"
+    fetch=$(mktemp -d)
+    trap 'rm -rf "$fetch"' EXIT
+    say ""
+    say "downloading $base/$name"
+    curl -fsSL "$base/$name" -o "$fetch/$name" || die "download failed: $base/$name"
+    if curl -fsSL "$base/SHA256SUMS" -o "$fetch/SHA256SUMS" 2>/dev/null; then
+        want=$(awk -v n="$name" '$2 == n { print $1 }' "$fetch/SHA256SUMS")
+        [ -n "$want" ] || die "no checksum for $name in SHA256SUMS"
+        got=$(sha256sum "$fetch/$name" | awk '{ print $1 }')
+        [ "$got" = "$want" ] || die "checksum mismatch for $name: expected $want, got $got"
+        say "checksum: ok"
+    else
+        warn "no SHA256SUMS published for this release; installing unverified"
+    fi
+    tar -xzf "$fetch/$name" -C "$fetch" || die "cannot unpack $name"
+    # The tarball mirrors the repository layout the rest of this script reads:
+    # cdp-mcp, .claude/skills/cdp-mcp/SKILL.md, scripts/helium-cdp, scripts/uninstall.sh.
+    REPO=$fetch
+    SRC=$fetch/cdp-mcp
 fi
+mkdir -p "$HOME/.local/bin"
+# Write beside it and rename: overwriting a running binary fails with
+# "Text file busy", and the server a harness spawned is usually running.
+install -m 755 "$SRC" "$BIN.new"
+mv -f "$BIN.new" "$BIN"
+say "binary: $BIN ($("$BIN" --version 2>/dev/null || printf 'installed'))"
 
 # ---------------------------------------------------------------- JSON merge
 

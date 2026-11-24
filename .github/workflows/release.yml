@@ -1,0 +1,66 @@
+# Releases: build static binaries and publish them with the installer.
+#
+# A machine that installs from a release needs curl and tar — no Rust, no
+# toolchain. The tarball mirrors the repository layout for the files the
+# installer touches, so install.sh runs the same checks either way.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        # x86_64 is universal for the machines this targets; add aarch64 here
+        # once a musl cross-linker is wired into the job.
+        target: [x86_64-unknown-linux-musl]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: build (static)
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: package
+        run: |
+          set -euo pipefail
+          name="cdp-mcp-${{ matrix.target }}"
+          rm -rf package && mkdir -p package/.claude/skills/cdp-mcp package/scripts
+          cp "target/${{ matrix.target }}/release/cdp-mcp" package/cdp-mcp
+          cp .claude/skills/cdp-mcp/SKILL.md package/.claude/skills/cdp-mcp/
+          cp scripts/helium-cdp scripts/uninstall.sh package/scripts/
+          cp install.sh package/
+          tar -czf "$name.tar.gz" -C package .
+          ls -l "$name.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: cdp-mcp-*.tar.gz
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: checksums, and the installer beside them
+        run: |
+          set -euo pipefail
+          cp install.sh dist/install.sh
+          cd dist
+          sha256sum cdp-mcp-*.tar.gz install.sh > SHA256SUMS
+          cat SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/cdp-mcp-*.tar.gz
+            dist/install.sh
+            dist/SHA256SUMS
