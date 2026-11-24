@@ -486,6 +486,23 @@ fn discover_endpoint() -> Option<(String, String)> {
 /// Consent lives in one small file a person can read and edit, beside the
 /// profiles. Starting a browser is a visible action on someone's desktop, so it
 /// is opt-in and asked once, in a terminal, where a person is there to answer.
+/// A Chromium-family process is running even though nothing answers on the
+/// endpoint. Linux-only, which this binary already is: /proc/<pid>/comm is the
+/// cheapest honest signal, and the difference between "start one" and "restart
+/// the one you have" is the whole value of the message.
+fn a_browser_is_running() -> bool {
+    const NAMES: [&str; 7] = ["helium", "chromium", "chrome", "google-chrome", "brave", "msedge", "vivaldi"];
+    let Ok(entries) = std::fs::read_dir("/proc") else { return false };
+    for entry in entries.flatten() {
+        let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) else { continue };
+        let name = comm.trim().to_ascii_lowercase();
+        if NAMES.iter().any(|known| name == *known || name.starts_with(&format!("{known}-"))) {
+            return true;
+        }
+    }
+    false
+}
+
 fn consent_path() -> std::path::PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
@@ -980,17 +997,24 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
                     // names the command. "Nothing works" is not actionable.
                     let consent = std::fs::read_to_string(consent_path()).unwrap_or_default();
                     let launch = launch_allowed(&consent);
-                    let hint = match &launch {
+                    let running = a_browser_is_running();
+                    let hint = if running {
+                        format!(
+                            "a Chromium-family browser is running but publishes no DevTools port on {}. Quit it and restart with --remote-debugging-port, or run `cdp-browser`.",
+                            cfg.endpoint
+                        )
+                    } else { match &launch {
                         Some(browser) => format!(
                             "no browser on {}. Starting one is allowed ({browser}): run `helium-cdp`, or `{browser} --remote-debugging-port`, then retry.",
                             cfg.endpoint
                         ),
                         None => "no browser on this endpoint, and starting one is not permitted. Run `cdp-mcp setup` to allow it, or start a browser with --remote-debugging-port.".to_string(),
-                    };
+                    } };
                     Ok(json!({
                         "endpoint": cfg.endpoint,
                         "up": false,
                         "error": e,
+                        "running": running,
                         "launchAllowed": launch.is_some(),
                         "canLaunch": launch.unwrap_or_default(),
                         "hint": hint,

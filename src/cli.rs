@@ -189,8 +189,22 @@ pub(crate) fn run(cfg: &Cfg, argv: &[String]) -> i32 {
 
     match result {
         Ok(v) => {
+            // A doctor result is not a table of tabs: print the two lines a
+            // person can act on, and fail the command so a script notices.
+            let doctor = v.get("up").and_then(Value::as_bool) == Some(false);
             if as_json {
                 println!("{v}");
+            } else if doctor && verb == "status" {
+                println!(
+                    "no browser at {}",
+                    v.get("endpoint").and_then(Value::as_str).unwrap_or("the default endpoint")
+                );
+                if let Some(e) = v.get("error").and_then(Value::as_str) {
+                    println!("  {e}");
+                }
+                if let Some(hint) = v.get("hint").and_then(Value::as_str) {
+                    println!("  {hint}");
+                }
             } else if verb == "status" || verb == "tabs" {
                 tab_lines(&v);
             } else if verb == "find" {
@@ -209,7 +223,11 @@ pub(crate) fn run(cfg: &Cfg, argv: &[String]) -> i32 {
             } else {
                 println!("{v}");
             }
-            0
+            if doctor {
+                1
+            } else {
+                0
+            }
         }
         Err(e) => {
             eprintln!("ERROR: {e}");
