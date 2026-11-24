@@ -94,6 +94,7 @@ have opencode && add_detected opencode
 have claude && add_detected claude
 [ -d "$HOME/.config/opencode" ] && add_detected opencode
 [ -d "$HOME/.claude" ] && add_detected claude
+[ -d "$HOME/.codex" ] && add_detected codex
 
 # ---------------------------------------------------------------- what to install
 
@@ -102,7 +103,7 @@ if [ -z "$HARNESSES" ]; then
         if [ ${#DETECTED[@]} -gt 0 ]; then
             HARNESSES=$(IFS=,; printf '%s' "${DETECTED[*]}")
         else
-            HARNESSES="opencode,claude"
+            HARNESSES="opencode,claude,codex"
         fi
     else
         [ -t 0 ] || die "no terminal to ask in: pass --harness LIST and --global/--project with --yes"
@@ -111,28 +112,32 @@ if [ -z "$HARNESSES" ]; then
         say "Which harness gets the cdp-mcp entry and the skill?"
         say "  1) opencode"
         say "  2) claude"
-        say "  3) both"
+        say "  3) codex"
+        say "  4) everything detected"
         [ ${#DETECTED[@]} -gt 0 ] && say "  detected on this machine: ${DETECTED[*]}"
         case "$(printf '%s' "${DETECTED[*]:-}")" in
             opencode) def=1 ;;
             claude) def=2 ;;
-            *) def=3 ;;
+            codex) def=3 ;;
+            *) def=4 ;;
         esac
-        read -r -p "Type 1, 2 or 3 [$def]: " answer
+        read -r -p "Type 1, 2, 3 or 4 [$def]: " answer
+        detected_list=$(IFS=,; printf '%s' "${DETECTED[*]:-opencode,claude}")
         case "${answer:-$def}" in
             1) HARNESSES=opencode ;;
             2) HARNESSES=claude ;;
-            3) HARNESSES=opencode,claude ;;
-            *opencode* | *claude*) HARNESSES=$answer ;;   # typing names still works
-            *) die "choose 1, 2 or 3" ;;
+            3) HARNESSES=codex ;;
+            4) HARNESSES=$detected_list ;;
+            *opencode* | *claude* | *codex*) HARNESSES=$answer ;;   # typing names still works
+            *) die "choose 1, 2, 3 or 4" ;;
         esac
     fi
 fi
 
 for h in ${HARNESSES//,/ }; do
     case "$h" in
-        opencode | claude) ;;
-        *) die "unknown harness $h (supported: opencode, claude)" ;;
+        opencode | claude | codex) ;;
+        *) die "unknown harness $h (supported: opencode, claude, codex)" ;;
     esac
 done
 
@@ -337,6 +342,26 @@ for h in ${HARNESSES//,/ }; do
                 warn "claude CLI not found; add this to your Claude Code MCP config:"
                 say "  command: $BIN"
                 say "  args:    [\"--profile\", \"$PROFILE\"]"
+            fi
+            ;;
+        codex)
+            if [ "$SCOPE" = global ]; then
+                install_skill "$HOME/.codex/skills"
+                if have codex; then
+                    # Codex keeps servers in ~/.codex/config.toml and owns that
+                    # file, so ask its CLI rather than editing TOML by hand.
+                    codex mcp remove cdp >/dev/null 2>&1 || true
+                    codex mcp add cdp -- "$BIN" --profile "$PROFILE" >/dev/null 2>&1 ||
+                        warn "codex mcp add failed; run by hand: codex mcp add cdp -- $BIN --profile $PROFILE"
+                    say "config: Codex (~/.codex/config.toml)"
+                else
+                    warn "codex CLI not found; add the server by hand:"
+                    say "  codex mcp add cdp -- $BIN --profile $PROFILE"
+                fi
+            else
+                install_skill "$PROJECT/.codex/skills"
+                say "skill : $PROJECT/.codex/skills/cdp-mcp/SKILL.md"
+                say "note  : Codex MCP servers are user-global; re-run with --global to wire the server"
             fi
             ;;
     esac
