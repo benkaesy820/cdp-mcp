@@ -243,7 +243,57 @@ pub const SCAN_JS: &str = r#"(() => {
             if (d) Object.assign(b, desc(d));
         }
         out.blocker = b;
+        // Opt-in: when the only thing in the way is an advertisement, hide it
+        // and re-test, so the click reaches the revealed target the way it
+        // would after a person dismisses it. Anything dialog-shaped, anything
+        // holding a form or a password field, and anything unclassified is left
+        // alone: those refusals are the point.
+        if (PICK.clearAds && top) {
+            const dialogish = (n) => {
+                if (!n || n.nodeType !== 1) return false;
+                if (n.tagName === 'DIALOG') return true;
+                const role = (n.getAttribute('role') || '').toLowerCase();
+                if (role === 'dialog' || role === 'alertdialog') return true;
+                if (n.getAttribute('aria-modal') === 'true') return true;
+                try { if (n.querySelector('input[type=password],form')) return true; } catch (e) {}
+                return false;
+            };
+            const AD = /(^|[-_\s])(ad|ads|advert|advertisement|sponsor|sponsored|promo|promotion|banner)([-_\s]|$)/i;
+            const AD_HOST = /(doubleclick|googlesyndication|adservice|taboola|outbrain|adsystem|criteo|pubmatic)/i;
+            const adish = (n) => {
+                if (!n || n.nodeType !== 1) return false;
+                if (n.tagName === 'IFRAME' && AD_HOST.test(n.src || '')) return true;
+                const a = [n.id || '', n.className ? String(n.className) : '',
+                           n.getAttribute('aria-label') || ''].join(' ');
+                if (AD.test(a)) return true;
+                try {
+                    if (n.querySelector('[id*="google_ads"],[id^="aswift"],[class*="adsbygoogle"]')) return true;
+                } catch (e) {}
+                return false;
+            };
+            const chain = [];
+            for (let n = top, k = 0; n && k < 6; k++, n = up(n)) chain.push(n);
+            const dial = chain.find(dialogish);
+            const ad = dial ? null : chain.find(adish);
+            if (dial) out.clearRefused = 'dialog';
+            else if (!ad) out.clearRefused = 'unclassified';
+            else {
+                const prev = ad.getAttribute('style');
+                ad.style.setProperty('display', 'none', 'important');
+                const again = deepAt(x, y);
+                if (again && (holds(el, again) || holds(again, el))) {
+                    out.hit = true;
+                    out.cleared = desc(ad) || { tag: ad.tagName.toLowerCase() };
+                } else {
+                    // It did not help, so put the page back as it was.
+                    if (prev === null) ad.removeAttribute('style');
+                    else ad.setAttribute('style', prev);
+                    out.clearRefused = 'still covered';
+                }
+            }
+        }
     }
+    if (PICK.clearAds && !out.hit && out.blocker) out.clearRefused = out.clearRefused || 'unclassified';
     if (PICK.select !== undefined) {
       const s = el.tagName === 'SELECT' ? el : el.closest('select');
       if (!s) { out.selectError = 'not a select'; }
@@ -568,11 +618,27 @@ pub(crate) fn scan_js(scope: Option<&str>, cap: u64) -> String {
 /// asked, and report where a click on it lands. One evaluation: this used to
 /// be four full scans per click.
 pub(crate) fn pick(conn: &mut cdp::Conn, scope: Option<&str>, i: u64, scroll: bool, select: Option<&Value>) -> Result<Value, String> {
+    pick_inner(conn, scope, i, scroll, select, false)
+}
+
+/// The click path asks for this only when a real click would land on an overlay:
+/// if that overlay is an advertisement, hide it and re-test so the click reaches
+/// the revealed target, as it would after a person dismissed the ad. Dialogs,
+/// anything holding a form or a password field, and anything unclassified are
+/// left untouched and still refuse.
+pub(crate) fn pick_clear_ads(conn: &mut cdp::Conn, scope: Option<&str>, i: u64) -> Result<Value, String> {
+    pick_inner(conn, scope, i, true, None, true)
+}
+
+fn pick_inner(conn: &mut cdp::Conn, scope: Option<&str>, i: u64, scroll: bool, select: Option<&Value>, clear_ads: bool) -> Result<Value, String> {
     let lit = match scope {
         Some(s) => serde_json::to_string(s).unwrap_or_else(|_| "null".into()),
         None => "null".into(),
     };
     let mut p = json!({ "i": i, "scroll": scroll });
+    if clear_ads {
+        p["clearAds"] = json!(true);
+    }
     if let Some(v) = select {
         p["select"] = json!(v);
     }
@@ -1063,6 +1129,9 @@ pub(crate) fn elements(cfg: &Cfg, args: &Value) -> Result<Value, String> {
         let url = scan_v.get("url").and_then(Value::as_str).unwrap_or("").to_string();
         let url = if url.len() > 300 { format!("{}…", clip_str(&url, 300)) } else { url };
         let scope_missing = scan_v.get("scopeMissing").and_then(Value::as_bool).unwrap_or(false);
+        // Capped means matching elements were dropped. A field saying so is
+        // cheap; making the caller guess at `limit` is not.
+        let capped = scan_v.get("capped").and_then(Value::as_bool).unwrap_or(false);
         let payload = json!({
             "tab": tab_id,
             "url": url,
@@ -1080,8 +1149,15 @@ pub(crate) fn elements(cfg: &Cfg, args: &Value) -> Result<Value, String> {
             "truncated": shown.len() < total,
             // The scanner stopped at its cap with matching elements left over;
             // `limit` above 600 lifts it.
-            "capped": scan_v.get("capped").and_then(Value::as_bool).unwrap_or(false),
+            "capped": capped,
             "cap": cap,
+            // Only present when it is true: an absent hint cannot be mistaken
+            // for "nothing to narrow".
+            "hint": if capped {
+                json!(format!("capped at {cap}: narrow with find:/within:, or raise limit (max 2000)"))
+            } else {
+                Value::Null
+            },
             // How many of these came from inside a cross-origin frame.
             // Absent would read as "none", which is a lie when it is
             // non-zero, so it is always present.
@@ -1110,7 +1186,7 @@ pub(crate) fn elements(cfg: &Cfg, args: &Value) -> Result<Value, String> {
         Ok(json!({ "__content": [
             { "type": "text", "text": payload.to_string() },
             { "type": "image", "data": b64encode(&bytes), "mimeType": mime },
-            { "type": "text", "text": format!("(attached {shot_mode} capture, {} bytes{})", bytes.len(), if clipped { ", clipped to 8000px" } else { "" }) }
+            { "type": "text", "text": format!("(attached {shot_mode} capture, {} bytes inline as base64{}; shot {{path}} answers ~250 B instead)", bytes.len(), if clipped { ", clipped to 8000px" } else { "" }) }
         ]}))
     })
 }

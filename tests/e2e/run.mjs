@@ -1626,6 +1626,28 @@ await withTab(`http://127.0.0.1:${rport}/sprint2`, async (tab, ev) => {
         { navigated: nv.navigated, url: nv.url });
 });
 
+// Clicking past an overlay: an advertisement is hidden and the click lands on
+// the target; a dialog, anything holding a form, and anything unclassified keep
+// the refusal. The distinction matters because a blind click through a sign-in
+// or consent dialog is how an unattended run does something nobody asked for.
+for (const [fixture, clears] of [["ad-overlay.html", true], ["dialog-overlay.html", false], ["plain-overlay.html", false]]) {
+  await withTab(page(fixture), async (tab, ev) => {
+    const els = (await s.tool("elements", { tab })).v.elements || [];
+    const under = els.find(e => (e.label || "").startsWith("Target under ad"));
+    const r = await s.tool("input", { tab, actions: [{ click: { i: under?.i } }] });
+    const cleared = ((r.v || {}).log || []).find(l => l.cleared)?.cleared;
+    const clicked = await ev("document.body.dataset.clicked || 'no'");
+    if (clears) {
+      check("a click under an advertisement clears it and lands on the target",
+            !!cleared && clicked === "yes", { cleared, clicked, got: String(r.v).slice(0, 120) });
+    } else {
+      check(`a click under ${fixture.replace("-overlay.html", "")} still refuses`,
+            !r.ok && /obscured/.test(String(r.v)) && clicked === "no",
+            { clicked, got: String(r.v).slice(0, 120) });
+    }
+  });
+}
+
 s.close();
 console.log(failed ? `\n${failed} failed` : "\nall passed");
 process.exit(failed ? 1 : 0);

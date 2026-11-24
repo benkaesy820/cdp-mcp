@@ -425,9 +425,10 @@ pub(crate) fn run_input(
                 // Resolve first (one evaluation), then check the label before
                 // clicking: a repeat of a final confirmation is the failure that
                 // bites an unattended run.
-                let at = pick(conn, scope, i, true, None)?;
+                let mut at = pick(conn, scope, i, true, None)?;
+                let mut cleared = Value::Null;
                 if !force {
-                    let reason = if at.get("connected").and_then(Value::as_bool) == Some(false) {
+                    let mut reason = if at.get("connected").and_then(Value::as_bool) == Some(false) {
                         Some("detached")
                     } else if at.get("zero").and_then(Value::as_bool) == Some(true) {
                         Some("zero_size")
@@ -438,6 +439,18 @@ pub(crate) fn run_input(
                     } else {
                         None
                     };
+                    // A real click would land on the overlay. If that overlay is
+                    // an advertisement, hide it and re-test, then click the
+                    // revealed target. Anything else keeps its refusal.
+                    if reason == Some("obscured") {
+                        if let Ok(value) = scan::pick_clear_ads(conn, scope, i) {
+                            if value.get("hit").and_then(Value::as_bool) == Some(true) {
+                                cleared = value.get("cleared").cloned().unwrap_or(Value::Null);
+                                at = value;
+                                reason = None;
+                            }
+                        }
+                    }
                     if let Some(reason) = reason {
                         return Err(blocked_click(
                             reason,
@@ -476,7 +489,13 @@ pub(crate) fn run_input(
                 if let Some(label) = &guard_label {
                     record_irreversible(tab, label, i);
                 }
-                log.push(json!({ "clicked": click_log(&at) }));
+                let mut hit = json!({ "clicked": click_log(&at) });
+                if !cleared.is_null() {
+                    // The page changed to make this click possible; say so
+                    // rather than reporting a clean click on a page that moved.
+                    hit["cleared"] = cleared;
+                }
+                log.push(hit);
             } else {
                 let (x, y) = point_of(conn, scope, c)?;
                 let clicked = if button != "left" || count > 1 || mods != 0 {
