@@ -9,6 +9,12 @@ use, so every login you have is already there when an agent starts working.
 
 **One static musl binary, no async runtime, no network service of its own.**
 
+> **Tested on exactly one machine.** Arch Linux, x86_64, Helium 157 on
+> niri/Wayland. Every number and behaviour below was measured there. Nothing has
+> been run on another distribution, browser, desktop, architecture or OS — the
+> aarch64 binary is built in CI and has never been executed. Where this page says
+> "works", read "expected to work on the same setup, untested elsewhere".
+
 ---
 
 ![cdp-mcp: one binary, a real browser, a live status](docs/preview.gif)
@@ -82,19 +88,17 @@ Removal: `scripts/uninstall.sh` (binaries and harness entries) or
 
 ## Requirements
 
-A Chromium-family browser started with a DevTools port:
+Linux, and a Chromium-family browser on the same machine started with a DevTools
+port. The first line is the one that has actually been used; the second is the
+equivalent for Chrome and is untested here:
 
 ```sh
-# Linux (Helium, Chrome, Chromium, Brave, Edge, Vivaldi…)
 helium-browser --remote-debugging-port=9222
 google-chrome --remote-debugging-port=9222
-
-# macOS
-/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222
-
-# Windows
-chrome.exe --remote-debugging-port=9222
 ```
+
+macOS and Windows are not built, so there is nothing to launch a browser for on
+those systems yet — the server is a Linux binary.
 
 `--remote-debugging-port=0` also works: the browser writes the chosen port to
 `DevToolsActivePort` in its profile, and this server reads it. When neither 9222
@@ -106,8 +110,10 @@ dedicated `--user-data-dir` if the port never opens. Helium is exempt in practic
 (measured on 157: no `--user-data-dir`, port open). Firefox and Safari are not
 supported — different protocol.
 
-Any Chromium-family browser works; the tool speaks CDP, so it is not tied to one
-vendor.
+Any Chromium-family browser should work — the tool speaks CDP, not a vendor API —
+but only **Helium 157** has actually been driven. Chrome, Chromium, Brave, Edge and
+Vivaldi are untested, and the Chrome 136 restriction above is reported, not
+reproduced here.
 
 ## Configure
 
@@ -343,17 +349,21 @@ first. Nothing experimental is published as a release.
 - Drag is one round trip per interpolation step, deliberately: batching makes
   Chromium coalesce the moves into a single jump.
 
-### What is verified, and what is not
+### What has been built, and what has been run
 
-| platform | status |
-|---|---|
-| **Linux x86_64** | **one static musl binary; everything above measured here** |
-| Linux aarch64 | static binary built by CI; **not run on hardware** |
-| macOS / Windows | not built or run |
+| target | built | run | status |
+|---|---|---|---|
+| Linux x86_64, Arch, Helium 157 | yes | **yes** | everything above was measured here |
+| Linux x86_64, other distros | same binary | **no** | static, zero `GLIBC_` symbols: expected to run, untested |
+| Linux x86_64, Chrome / Chromium / Brave / Edge / Vivaldi | — | **no** | same protocol, no guarantee: only Helium was driven |
+| Linux aarch64 | yes (CI, `cross`) | **no** | never executed; treat as unproven |
+| macOS, Windows | no | no | not supported |
 
-The release builds for `x86_64-unknown-linux-musl`: `file` reports *statically
-linked* and `objdump` finds zero `GLIBC_` symbols, so it runs on Arch, Debian,
-Ubuntu, Fedora and Alpine without a distro package.
+The x86_64 release is `x86_64-unknown-linux-musl`: `file` reports *statically
+linked* and `objdump` finds zero `GLIBC_` symbols. That is why it is **expected**
+to run on Debian, Ubuntu, Fedora and Alpine — an inference from the linkage, not a
+test. Only Arch x86_64 was run, and the aarch64 tarball has the same standing: it
+builds, it is check-summed, and nobody has started it.
 
 ## Fork it, make it yours
 
