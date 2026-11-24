@@ -34,7 +34,7 @@ jobs:
           rm -rf package && mkdir -p package/.claude/skills/cdp-mcp package/scripts
           cp "target/${{ matrix.target }}/release/cdp-mcp" package/cdp-mcp
           cp .claude/skills/cdp-mcp/SKILL.md package/.claude/skills/cdp-mcp/
-          cp scripts/helium-cdp scripts/uninstall.sh package/scripts/
+          cp scripts/cdp-browser scripts/drop-harness-entry.py scripts/uninstall.sh package/scripts/
           cp install.sh package/
           tar -czf "$name.tar.gz" -C package .
           ls -l "$name.tar.gz"

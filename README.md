@@ -73,7 +73,7 @@ Removal: `scripts/uninstall.sh` (binaries and harness entries) or
 |---|---|
 | `~/.local/bin/cdp-mcp` | the server |
 | `~/.local/bin/cdp` | symlink, the CLI |
-| `~/.local/bin/helium-cdp` | launcher: takes 9222, or a free port, and publishes it |
+| `~/.local/bin/cdp-browser` | launcher: starts the first Chromium it finds on 9222, or a free port, and publishes it |
 | `~/.config/cdp-mcp/consent.json` | whether a browser may be started, and which |
 | `~/.config/opencode/skills/cdp-mcp/SKILL.md` | skill for OpenCode (and per-harness paths for Claude Code, Codex) |
 | harness MCP config | the `cdp` server entry, backed up before editing |
@@ -96,7 +96,7 @@ chrome.exe --remote-debugging-port=9222
 
 `--remote-debugging-port=0` also works: the browser writes the chosen port to
 `DevToolsActivePort` in its profile, and this server reads it. When neither 9222
-nor a published port answers, `helium-cdp` gives it a free port and publishes it
+nor a published port answers, `cdp-browser` gives it a free port and publishes it
 in `$XDG_RUNTIME_DIR/helium-cdp.port`.
 
 Recent Chrome builds **ignore the flag on the default profile**; give Chrome a
@@ -144,6 +144,12 @@ Starting a browser is a visible action on someone's desktop, so it is opt-in.
 `cdp-mcp setup` asks once — may it start a browser, and which one — and writes
 `~/.config/cdp-mcp/consent.json`. No file means no launch: `status` then answers
 `up:false` with `launchAllowed`, `canLaunch` and a hint naming the command.
+
+Nothing assumes a vendor: the launcher starts whichever Chromium-family
+command is installed (Helium, Chromium, Chrome, Brave, Edge, Vivaldi), a
+consented name that is missing falls back to the first one found, and
+discovery reads whatever publishes a DevTools port — the browser is never
+named in the code path that finds it.
 
 The tab policy is a rule, not a question: **one tab, navigated in place**. New
 tabs open in the background and never take the keyboard; bringing one to the front

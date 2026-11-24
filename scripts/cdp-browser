@@ -15,7 +15,7 @@
 # cdp-mcp looks when 9222 has no browser.
 set -u
 
-URL=${1:-https://gemini.google.com/app}
+URL=${1:-about:blank}
 WANT=${HELIUM_CDP_PORT:-}                       # pinned port, if the caller insists
 PORT=""
 LOG=${HELIUM_CDP_LOG:-${XDG_RUNTIME_DIR:-/tmp}/helium-cdp.log}
@@ -75,6 +75,18 @@ reuse() {
   tabs | sed 's/^/  tab: /'
   exit 0
 }
+# The browser is whichever one is installed. Consent may name one; if that name
+# is not on PATH, the first Chromium-family command found is used, and the tool
+# never assumes a vendor.
+detect_browser() {
+  local c
+  for c in helium-browser chromium google-chrome-stable google-chrome brave \
+           microsoft-edge-stable vivaldi-stable; do
+    command -v "$c" >/dev/null 2>&1 && { printf '%s' "$c"; return 0; }
+  done
+  return 1
+}
+
 # Starting a browser is visible on someone's desktop, so it needs the consent
 # `cdp-mcp setup` records. No file, or "allowed": false, both mean no launch.
 consented_browser() {
@@ -87,7 +99,7 @@ except Exception:
 l = c.get("launch") or {}
 if not l.get("allowed"):
     sys.exit(2)
-print(l.get("browser") or "helium-browser")
+print(l.get("browser") or "")
 PY
 }
 
@@ -146,6 +158,15 @@ done
 #    are passed here because the wrapper's flags file deliberately carries none
 #    (automation must not inherit the endpoint).
 BROWSER=$(consented_browser); consent=$?
+# A consented name that is not installed (a consent file written on another
+# machine, or an uninstalled browser) falls back to whatever is here.
+if [ "$consent" = 0 ] && ! command -v "$BROWSER" >/dev/null 2>&1; then
+  echo "note: $BROWSER is not on PATH; using the first browser found" >&2
+  BROWSER=""
+fi
+if [ "$consent" = 0 ] && [ -z "$BROWSER" ]; then
+  BROWSER=$(detect_browser) || true
+fi
 case $consent in
   0) ;;
   2) echo "FAIL: no browser is publishing DevTools, and launching is not permitted." >&2

@@ -29,7 +29,7 @@ rmf() { for f in "$@"; do if [ -e "$f" ]; then say "  rm $f"; rm -f "$f"; fi; do
 rmd() { for d in "$@"; do if [ -e "$d" ]; then say "  rm -r $d"; rm -rf "$d"; fi; done; return 0; }
 
 say "binaries"
-rmf "$BIN/cdp" "$BIN/cdp-mcp" "$BIN/helium-cdp"
+rmf "$BIN/cdp" "$BIN/cdp-mcp" "$BIN/cdp-browser" "$BIN/helium-cdp"
 
 # Harness entries point at the binary; leaving them behind means an agent keeps
 # trying to start something that no longer exists.

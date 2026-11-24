@@ -170,6 +170,6 @@ Flags, anywhere after the verb: `--tab t1|id`, `--json` (raw payload),
 
 | Message | Meaning |
 |---|---|
-| `no browser is publishing a DevTools endpoint` | Nothing is listening on 9222 and discovery found no published port. Start one: `helium-cdp`, or `cdp-mcp setup` to allow it. |
+| `no browser is publishing a DevTools endpoint` | Nothing is listening on 9222 and discovery found no published port. Start one with `cdp-browser` (it launches whichever Chromium-family browser is installed), or run `cdp-mcp setup` to allow that. |
 | `unknown tab handle t9` | Handles are per server process; run `cdp status` again. |
 | `refusing non-loopback endpoint` | CDP has no auth; only 127.0.0.1 is allowed. |

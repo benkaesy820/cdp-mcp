@@ -265,7 +265,7 @@ else
     fi
     tar -xzf "$fetch/$name" -C "$fetch" || die "cannot unpack $name"
     # The tarball mirrors the repository layout the rest of this script reads:
-    # cdp-mcp, .claude/skills/cdp-mcp/SKILL.md, scripts/helium-cdp, scripts/uninstall.sh.
+    # cdp-mcp, .claude/skills/cdp-mcp/SKILL.md, scripts/cdp-browser, scripts/uninstall.sh.
     REPO=$fetch
     SRC=$fetch/cdp-mcp
 fi
@@ -415,17 +415,34 @@ done
 interactive() { [ -t 0 ] && [ "$ASSUME_YES" = 0 ]; }
 
 say ""
-if command -v helium-browser >/dev/null; then
+# Whichever Chromium-family browser is installed gets the launcher; the launcher
+# itself re-detects at run time, so this choice is only the prompt.
+found_browser=""
+for c in helium-browser chromium google-chrome-stable google-chrome brave \
+         microsoft-edge-stable vivaldi-stable; do
+    if have "$c"; then found_browser=$c; break; fi
+done
+if [ -n "$found_browser" ]; then
     if interactive; then
-        read_yn "Install the Helium launcher to ~/.local/bin/helium-cdp (takes 9222, or a free port, and publishes it)?" y
+        read_yn "Install the browser launcher to ~/.local/bin/cdp-browser (starts $found_browser on 9222, or a free port, and publishes it)?" y
         answer=$ANSWER
     else
         answer=y
     fi
     case "${answer:-y}" in
-        y | Y | yes | YES) install -m 755 "$REPO/scripts/helium-cdp" "$HOME/.local/bin/helium-cdp"; say "launcher: ~/.local/bin/helium-cdp" ;;
+        y | Y | yes | YES)
+            install -m 755 "$REPO/scripts/cdp-browser" "$HOME/.local/bin/cdp-browser"
+            say "launcher: ~/.local/bin/cdp-browser"
+            # Keep the old name working where it is already in muscle memory.
+            if [ "$found_browser" = helium-browser ]; then
+                ln -sf "$HOME/.local/bin/cdp-browser" "$HOME/.local/bin/helium-cdp"
+                say "         ~/.local/bin/helium-cdp -> cdp-browser"
+            fi
+            ;;
         *) say "launcher: skipped" ;;
     esac
+else
+    say "launcher: no Chromium-family browser on PATH; skipped"
 fi
 
 if [ -f "$HOME/.config/cdp-mcp/consent.json" ]; then
