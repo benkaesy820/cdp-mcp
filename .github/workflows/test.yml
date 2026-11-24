@@ -1,0 +1,23 @@
+# Unit tests only.
+#
+# The catalog byte-budget gate lives here: it fails the build when tools/list
+# grows past its budget or one tool's schema passes its ceiling, so schema creep
+# shows up in the commit that causes it instead of months later.
+#
+# The e2e suite is deliberately not here: tests/e2e/run.mjs drives a real
+# Chromium on 127.0.0.1:9222 and needs a headed browser, which a runner does not
+# have. Run it locally with `cargo build --release && node tests/e2e/run.mjs`.
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: unit tests (includes the catalog byte budget)
+        run: cargo test
