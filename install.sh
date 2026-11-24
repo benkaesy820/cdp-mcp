@@ -111,7 +111,7 @@ if [ -z "$HARNESSES" ]; then
             claude) def=2 ;;
             *) def=3 ;;
         esac
-        read -r -p "Choose [$def]: " answer
+        read -r -p "Type 1, 2 or 3 [$def]: " answer
         case "${answer:-$def}" in
             1) HARNESSES=opencode ;;
             2) HARNESSES=claude ;;
@@ -135,7 +135,7 @@ if [ -z "$SCOPE" ]; then
     say "Where should cdp-mcp be available?"
     say "  1) Every project (user level)"
     say "  2) One project only"
-    read -r -p "Choose [1]: " answer
+    read -r -p "Type 1 or 2 [1]: " answer
     case "${answer:-1}" in
         1) SCOPE=global ;;
         2) SCOPE=project ;;

@@ -528,7 +528,8 @@ fn on_path(cmd: &str) -> bool {    std::env::var_os("PATH")
 }
 
 fn ask(prompt: &str, default_yes: bool) -> bool {
-    println!("{prompt} [{}]", if default_yes { "Y/n" } else { "y/N" });
+    println!("{prompt} [{}]{}", if default_yes { "Y/n" } else { "y/N" },
+             if default_yes { "" } else { "  (Enter = no)" });
     let mut line = String::new();
     if std::io::stdin().read_line(&mut line).is_err() {
         return default_yes;
