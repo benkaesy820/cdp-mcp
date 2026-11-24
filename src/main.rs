@@ -372,18 +372,253 @@ pub(crate) fn clip_str(s: &str, max: usize) -> &str {
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:9222";
 
+/// 2026-07-28 makes `server/discover` mandatory and drops the initialize
+/// handshake. The advertised versions are what this build actually answers:
+/// the modern revision, and the handshake revisions its clients still use.
+/// `ttlMs`/`cacheScope` are required on this result, hence their presence.
+/// Short handles for tabs: a call can say `t2` instead of repeating a 32-character
+/// target hash. Anthropic's tool guidance measured that resolving opaque ids to a
+/// 0-indexed scheme cuts mistakes, so both forms are accepted — the handle is a
+/// convenience, never a replacement for the id.
+static TAB_HANDLES: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+fn register_tab(id: &str) -> String {
+    let mut map = TAB_HANDLES.lock().unwrap();
+    if let Some((handle, _)) = map.iter().find(|(_, known)| known == id) {
+        return handle.clone();
+    }
+    let handle = format!("t{}", map.len() + 1);
+    map.push((handle.clone(), id.to_string()));
+    handle
+}
+
+fn forget_tab(id: &str) {
+    if let Ok(mut map) = TAB_HANDLES.lock() {
+        map.retain(|(_, known)| known != id);
+    }
+}
+
+fn handle_to_id(handle: &str) -> Option<String> {
+    TAB_HANDLES
+        .lock()
+        .ok()?
+        .iter()
+        .find(|(h, _)| h == handle)
+        .map(|(_, id)| id.clone())
+}
+
+/// Rewrite `arguments.tab` from a handle to the target id, once, before any
+/// handler sees it. An unknown handle is an error rather than a pass-through:
+/// sending `t9` on as an id produces a confusing CDP failure instead of saying
+/// what went wrong.
+fn normalize_tab(mut args: Value) -> Result<Value, String> {
+    let Some(raw) = args.get("tab").and_then(Value::as_str).map(str::to_string) else {
+        return Ok(args);
+    };
+    let Some(rest) = raw.strip_prefix('t') else {
+        return Ok(args);
+    };
+    if rest.is_empty() || !rest.chars().all(|c| c.is_ascii_digit()) {
+        return Ok(args);
+    }
+    match handle_to_id(&raw) {
+        Some(id) => {
+            args["tab"] = json!(id);
+            Ok(args)
+        }
+        None => Err(format!("unknown tab handle {raw}; run status to see the handles")),
+    }
+}
+
+fn discover_result() -> Value {    json!({
+        "supportedVersions": ["2026-07-28", "2025-11-25", "2025-06-18"],
+        "capabilities": { "tools": {} },
+        "resultType": "complete",
+        "ttlMs": 600_000,
+        "cacheScope": "public",
+        "instructions": "Drives the person's own Chromium browser over DevTools: list, read and act on real pages. Tabs open in the background unless consent allows foreground.",
+    })
+}
+
+/// The first line of a Chromium's DevToolsActivePort file is the port it chose;
+/// the launcher publishes the same one-line shape, so both parse the same way.
+fn devtools_port(text: &str) -> Option<u16> {
+    text.lines().next()?.trim().parse().ok()
+}
+
+/// Where the browser really is when the default endpoint has nothing. Two
+/// sources, cheapest first: the port `helium-cdp` published for this session,
+/// then every Chromium profile that wrote DevToolsActivePort (a browser started
+/// with --remote-debugging-port=0 does; T3 Code's own endpoint shows up here).
+/// Only an endpoint that answers /json/version is returned.
+fn discover_endpoint() -> Option<(String, String)> {
+    let mut candidates: Vec<(String, String)> = Vec::new();
+    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+        if let Ok(text) = std::fs::read_to_string(format!("{dir}/helium-cdp.port")) {
+            if let Some(port) = devtools_port(&text) {
+                candidates.push((format!("http://127.0.0.1:{port}"), "helium-cdp".to_string()));
+            }
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        for base in [".config", ".local/share"] {
+            let Ok(entries) = std::fs::read_dir(std::path::Path::new(&home).join(base)) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(text) = std::fs::read_to_string(entry.path().join("DevToolsActivePort")) else {
+                    continue;
+                };
+                let Some(port) = devtools_port(&text) else { continue };
+                let url = format!("http://127.0.0.1:{port}");
+                if !candidates.iter().any(|(known, _)| *known == url) {
+                    candidates.push((url, entry.file_name().to_string_lossy().to_string()));
+                }
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .find(|(url, _)| cdp::http(url, "/json/version", "GET").is_ok())
+}
+
+/// Consent lives in one small file a person can read and edit, beside the
+/// profiles. Starting a browser is a visible action on someone's desktop, so it
+/// is opt-in and asked once, in a terminal, where a person is there to answer.
+fn consent_path() -> std::path::PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    base.join("cdp-mcp").join("consent.json")
+}
+
+/// Absent file, unreadable file, or "allowed": false all mean the same thing:
+/// no browser may be started. It fails closed because launching is the one thing
+/// here a person can see happen without having asked for it.
+fn launch_allowed(text: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    if v.get("launch")?.get("allowed")?.as_bool()? {
+        Some(v["launch"]["browser"].as_str().unwrap_or("helium-browser").to_string())
+    } else {
+        None
+    }
+}
+
+/// Only an explicit `tabs.foreground: true` lets a call take the keyboard.
+/// Absent file, malformed file, or a false answer all mean no: taking focus away
+/// from someone mid-sentence is the failure that no token budget makes up for.
+fn allows_foreground(text: &str) -> bool {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|v| v.get("tabs")?.get("foreground")?.as_bool())
+        .unwrap_or(false)
+}
+
+fn consent_allows_foreground() -> bool {
+    std::fs::read_to_string(consent_path())
+        .map(|t| allows_foreground(&t))
+        .unwrap_or(false)
+}
+
+fn on_path(cmd: &str) -> bool {    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(cmd).is_file()))
+        .unwrap_or(false)
+}
+
+fn ask(prompt: &str, default_yes: bool) -> bool {
+    println!("{prompt} [{}]", if default_yes { "Y/n" } else { "y/N" });
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return default_yes;
+    }
+    match line.trim().to_ascii_lowercase().as_str() {
+        "" => default_yes,
+        "y" | "yes" => true,
+        _ => false,
+    }
+}
+
+fn setup() {
+    const KNOWN: [&str; 6] = [
+        "helium-browser", "chromium", "google-chrome-stable", "google-chrome",
+        "brave", "microsoft-edge-stable",
+    ];
+    let found: Vec<&str> = KNOWN.iter().copied().filter(|c| on_path(c)).collect();
+    println!("cdp-mcp setup — what this machine may do on its own\n");
+    println!(
+        "Browsers on PATH: {}",
+        if found.is_empty() { "none".to_string() } else { found.join(", ") }
+    );
+    let launch = ask(
+        "\nMay cdp-mcp start a browser when none is publishing a DevTools endpoint?",
+        false,
+    );
+    let browser = if launch && !found.is_empty() {
+        println!("\nWhich one?");
+        for (n, b) in found.iter().enumerate() {
+            println!("  {}. {b}", n + 1);
+        }
+        println!("[1-{}], default {}", found.len(), found[0]);
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        line.trim()
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|n| found.get(n))
+            .map(|b| b.to_string())
+            .unwrap_or_else(|| found[0].to_string())
+    } else {
+        "helium-browser".to_string()
+    };
+    let background = ask(
+        "\nMay it open background tabs in a browser you are using? It never switches to them.",
+        true,
+    );
+    let foreground = ask("May it ever bring a tab to the front, or focus the window?", false);
+    // These two are recorded but not enforced by this build: every tab this
+    // server opens is already background, and nothing here activates a tab.
+    let body = json!({
+        "launch": { "allowed": launch, "browser": browser },
+        "tabs": { "background": background, "foreground": foreground },
+        "written": "re-run `cdp-mcp setup` to change these answers",
+    });
+    let path = consent_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let text = serde_json::to_string_pretty(&body).unwrap_or_default();
+    match std::fs::write(&path, text + "\n") {
+        Ok(()) => {
+            println!("\nwrote {}", path.display());
+            println!(
+                "launch: {}   background tabs: {background}   foreground: {foreground}",
+                if launch { format!("allowed ({browser})") } else { "not allowed".to_string() }
+            );
+        }
+        Err(e) => {
+            eprintln!("cannot write {}: {e}", path.display());
+            std::process::exit(1);
+        }
+    }
+}
+
 fn help() -> String {
     format!(
         "cdp-mcp {VERSION}\n\
          A tiny MCP server that drives your own Chromium browser over DevTools.\n\n\
-         USAGE:\n  cdp-mcp [--cdp URL] [--profile NAME] [--allow-remote]\n\n\
+         USAGE:\n  cdp-mcp [--cdp URL] [--profile NAME] [--allow-remote]\n  cdp-mcp setup\n\n\
          OPTIONS:\n\
          \x20 --cdp URL        DevTools endpoint (default {DEFAULT_ENDPOINT})\n\
          \x20 --profile NAME   settings file to read (default \"default\")\n\
          \x20 --allow-remote   permit a non-loopback endpoint (experimental builds only; CDP has no auth)\n\
          \x20 -h, --help       print this\n\
          \x20 -V, --version    print the version\n\n\
-         The browser must be started with --remote-debugging-port=9222.\n"
+         The browser must be started with --remote-debugging-port. Use 9222 for a\n\
+         fixed port, or 0 to let it choose: the port is then read from\n\
+         <user-data-dir>/DevToolsActivePort, and found automatically when no\n\
+         --cdp endpoint is given.\n"
     )
 }
 
@@ -692,7 +927,37 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
                     out["browser"] = version.get("Browser").cloned().unwrap_or(Value::Null);
                     out["protocol"] = version.get("Protocol-Version").cloned().unwrap_or(Value::Null);
                     let pages: Vec<_> = tabs.iter().filter(|t| !t.url.starts_with("chrome-extension://")).collect();
-                    out["tabs"] = json!(pages.iter().map(|t| json!({ "tab": t.id, "title": t.title, "url": t.url, "owned": cdp::is_owned(&t.id) })).collect::<Vec<_>>());
+                    out["tabs"] = json!(pages.iter().map(|t| json!({ "tab": t.id, "handle": register_tab(&t.id), "title": t.title, "url": t.url, "owned": cdp::is_owned(&t.id) })).collect::<Vec<_>>());
+                    // Opt-in, because it costs one evaluation per tab: "a window
+                    // is in front and a page has input focus" is the only portable
+                    // signal. There is none for "the human is typing right now",
+                    // so this is a proxy and is named as one.
+                    if args.get("inUse").and_then(Value::as_bool) == Some(true) {
+                        let expr = "({visible: document.visibilityState, focused: document.hasFocus()})";
+                        let mut in_use = false;
+                        let mut front = Value::Null;
+                        for t in &pages {
+                            // A tab this server opened reports focus right after
+                            // creation even though the window title, and the e2e
+                            // focus check, say the human's tab never moved. So only
+                            // pages we did not open count as evidence of use.
+                            if cdp::is_owned(&t.id) {
+                                continue;
+                            }
+                            if let Ok(v) = with_conn(&cfg.endpoint, Some(&t.id), |conn, _| conn.eval(expr)) {
+                                if v.get("focused").and_then(Value::as_bool) == Some(true) {
+                                    in_use = true;
+                                    front = json!({ "tab": t.id, "title": t.title });
+                                    break;
+                                }
+                            }
+                        }
+                        out["inUse"] = json!(in_use);
+                        out["inUseSignal"] = json!("a page this server did not open reports focus; not proof of human input");
+                        if in_use {
+                            out["inFront"] = front;
+                        }
+                    }
                     if tabs.is_empty() {
                         out["hint"] = json!("the browser is running but has no page tabs — open one with tabs {action:\"open\"}");
                     }
@@ -715,15 +980,23 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
                 let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
                 Ok(json!(tabs.iter()
                     .filter(|t| all || !t.url.starts_with("chrome-extension://"))
-                    .map(|t| json!({ "tab": t.id, "title": t.title, "url": t.url, "owned": cdp::is_owned(&t.id) }))
+                    .map(|t| json!({ "tab": t.id, "handle": register_tab(&t.id), "title": t.title, "url": t.url, "owned": cdp::is_owned(&t.id) }))
                     .collect::<Vec<_>>()))
             }
             "open" => {
                 let url = args.get("url").and_then(Value::as_str).ok_or("open needs url")?;
                 // Background by default: the human may be typing to me in the
                 // chat, and activating the tab hands their keyboard to the
-                // browser. `foreground: true` when the tab itself is the point.
+                // browser. `foreground: true` when the tab itself is the point,
+                // and only if the person allowed that at setup — research work
+                // wants a tab the user never notices, not one that steals focus.
                 let fg = args.get("foreground").and_then(Value::as_bool).unwrap_or(false);
+                if fg && !consent_allows_foreground() {
+                    return Err("bringing a tab to the front is not permitted \
+                                (consent.json says tabs.foreground=false). Open it in the \
+                                background, or run `cdp-mcp setup` if the user wants that."
+                        .into());
+                }
                 let id = cdp::new_tab(&cfg.endpoint, url, fg)?;
                 // A fresh tab is about:blank and a blank document already reports
                 // readyState "complete", so a real navigation is waited for by
@@ -817,6 +1090,9 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
                     scope_cache().lock().unwrap().remove(&id);
                     scan_cache().lock().unwrap().remove(&id);
                     emu_cache().lock().unwrap().remove(&id);
+                    // A handle must not outlive its tab: reusing the number for a
+                    // later tab would silently point at a different page.
+                    forget_tab(&id);
                 }
                 Ok(json!({
                     "closed": closed,
@@ -977,7 +1253,12 @@ fn send(v: Value) {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("setup") {
+        setup();
+        return;
+    }
     let mut endpoint = DEFAULT_ENDPOINT.to_string();
+    let mut endpoint_set = false;
     let mut profile_name = std::env::var("CDP_PROFILE").unwrap_or_else(|_| "default".to_string());
     let mut allow_remote = false;
     let mut args = std::env::args().skip(1);
@@ -991,13 +1272,27 @@ fn main() {
                 println!("cdp-mcp {VERSION}");
                 return;
             }
-            "--cdp" => endpoint = args.next().unwrap_or_else(|| DEFAULT_ENDPOINT.to_string()),
+            "--cdp" => {
+                endpoint = args.next().unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
+                endpoint_set = true;
+            }
             "--profile" => profile_name = args.next().unwrap_or_else(|| "default".to_string()),
             "--allow-remote" => allow_remote = true,
             other => {
                 eprintln!("cdp-mcp: unknown argument {other}\n{}", help());
                 std::process::exit(2);
             }
+        }
+    }
+    // No endpoint was named, so the browser may not be on the default port: a
+    // Playwright run can be holding 9222, and a browser started with
+    // --remote-debugging-port=0 gets one of its own choosing. Ask the launcher
+    // and the browsers' own DevToolsActivePort files before giving up, so an
+    // agent is never told "not running" while a browser is up.
+    if !endpoint_set && cdp::http(&endpoint, "/json/version", "GET").is_err() {
+        if let Some((url, who)) = discover_endpoint() {
+            eprintln!("cdp-mcp: {DEFAULT_ENDPOINT} has no browser; using {url} ({who})");
+            endpoint = url;
         }
     }
     if allow_remote && !cfg!(feature = "experimental") {
@@ -1089,7 +1384,15 @@ fn main() {
                 }}));
             }
             m if m.starts_with("notifications/") => {}
-            "tools/list" => send(json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": schema::tool_defs() } })),
+            "server/discover" => send(json!({ "jsonrpc": "2.0", "id": id, "result": discover_result() })),
+            "tools/list" => send(json!({ "jsonrpc": "2.0", "id": id, "result": {
+                "tools": schema::tool_defs(),
+                // Required by 2026-07-28 on list results: a client may cache the
+                // catalog. The order is static, so the cache key is stable.
+                "resultType": "complete",
+                "ttlMs": 60_000,
+                "cacheScope": "public",
+            }})),
             "tools/call" => {
                 let rid = id.to_string();
                 {
@@ -1105,7 +1408,10 @@ fn main() {
                 }
                 let name = params.get("name").and_then(Value::as_str).unwrap_or("");
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
-                let result = call_tool(&cfg, name, &args);
+                let result = match normalize_tab(args) {
+                    Ok(args) => call_tool(&cfg, name, &args),
+                    Err(e) => Err(e),
+                };
                 let was_cancelled = {
                     let mut f = inflight.lock().unwrap();
                     f.current = None;
@@ -1120,13 +1426,19 @@ fn main() {
                             Some(blocks) => blocks.clone(),
                             None => vec![json!({ "type": "text", "text": v.to_string() })],
                         };
-                        send(json!({ "jsonrpc": "2.0", "id": id, "result": { "content": content } }));
+                        // 2026-07-28 requires resultType on results; older clients
+                        // ignore the field, so this is additive for them.
+                        send(json!({ "jsonrpc": "2.0", "id": id, "result": {
+                            "content": content,
+                            "resultType": "complete"
+                        }}));
                     }
                     Err(e) => {
                         let content = vec![json!({ "type": "text", "text": format!("ERROR: {e}") })];
                         send(json!({ "jsonrpc": "2.0", "id": id, "result": {
                             "content": content,
-                            "isError": true
+                            "isError": true,
+                            "resultType": "complete"
                         }}));
                     }
                 }
@@ -1147,6 +1459,69 @@ mod tests {
         assert_eq!(clip_str(&s, 5), "éé");
         assert_eq!(clip_str(&s, 6), "ééé");
         assert_eq!(clip_str("short", 300), "short");
+    }
+
+    #[test]
+    fn a_devtools_active_port_file_is_read_from_its_first_line() {
+        // What a browser writes with --remote-debugging-port=0.
+        assert_eq!(devtools_port("33331\n/devtools/browser/13ed-\n"), Some(33331));
+        // What the launcher publishes: the port alone.
+        assert_eq!(devtools_port("9222\n"), Some(9222));
+        assert_eq!(devtools_port(""), None);
+        assert_eq!(devtools_port("not a port\n"), None);
+    }
+
+    #[test]
+    fn consent_fails_closed() {
+        // Granted: the browser to launch.
+        assert_eq!(
+            launch_allowed(r#"{"launch":{"allowed":true,"browser":"chromium"}}"#),
+            Some("chromium".to_string())
+        );
+        // Refused, missing, malformed, or older shape: no launcher.
+        assert_eq!(launch_allowed(r#"{"launch":{"allowed":false}}"#), None);
+        assert_eq!(launch_allowed("{}"), None);
+        assert_eq!(launch_allowed("not json"), None);
+    }
+
+    #[test]
+    fn foreground_needs_an_explicit_yes() {
+        // Research work must never take the keyboard: only a literal true allows it.
+        assert!(allows_foreground(r#"{"tabs":{"foreground":true}}"#));
+        assert!(!allows_foreground(r#"{"tabs":{"foreground":false}}"#));
+        assert!(!allows_foreground(r#"{"tabs":{"background":true}}"#));
+        assert!(!allows_foreground("{}"));
+        assert!(!allows_foreground(""));
+    }
+
+    #[test]
+    fn a_tab_handle_resolves_and_an_unknown_one_fails() {
+        let id = format!("TESTTARGET-{}", std::process::id());
+        let handle = register_tab(&id);
+        assert!(handle.starts_with('t') && handle.len() <= 5, "handle looks wrong: {handle}");
+        assert_eq!(normalize_tab(json!({ "tab": handle })).unwrap()["tab"], id.as_str());
+        // A real target id passes through untouched.
+        assert_eq!(normalize_tab(json!({ "tab": "ABC123" })).unwrap()["tab"], "ABC123");
+        // An unknown handle is an error that names the fix, not a later CDP failure.
+        assert!(normalize_tab(json!({ "tab": "t999999" })).is_err());
+    }
+
+    #[test]
+    fn discover_advertises_what_this_build_answers() {
+        let d = discover_result();
+        let versions: Vec<&str> = d["supportedVersions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        // Modern clients must find the stateless revision; legacy ones must still
+        // find theirs, because the handshake they use is still answered here.
+        assert!(versions.contains(&"2026-07-28"), "missing the modern revision");
+        assert!(versions.contains(&"2025-06-18"), "missing the legacy handshake revision");
+        assert_eq!(d["resultType"], "complete");
+        assert!(d["ttlMs"].is_u64() && d["cacheScope"].is_string());
+        assert!(d["capabilities"]["tools"].is_object());
     }
 
     #[test]

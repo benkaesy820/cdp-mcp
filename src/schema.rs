@@ -51,8 +51,14 @@ pub(crate) fn tool_defs() -> Value {
         },
         {
             "name": "status",
-            "description": "Report the browser version and every open page tab. Start here.",
-            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+            "description": "Report the browser version and every open page tab. Start here: each tab carries a handle (t1, t2...) that every tool accepts wherever a tab id is named.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "inUse": { "type": "boolean", "description": "also report whether a page is visible and focused (one evaluation per tab)" }
+                },
+                "additionalProperties": false
+            }
         },
         {
             "name": "tabs",
@@ -267,6 +273,34 @@ mod tests {
         }
         for t in defs.as_array().unwrap() {
             assert_eq!(t["inputSchema"]["type"], "object", "{}", t["name"]);
+        }
+    }
+
+    // The catalog is sent on every turn, so its size is a standing cost, not a
+    // detail. These ceilings exist to make growth visible in the commit that
+    // causes it: raise a number here deliberately, never drift past it.
+    //
+    // Baseline 2026-11-24: 17,233 B over 14 tools, widest `input` at 3,054 B.
+    // Headroom is ~4% total and ~145 B on the widest tool, which is roughly
+    // where a handful of new parameters lands — enough to work, not enough to
+    // hide a feature's worth of prose.
+    #[test]
+    fn the_catalog_stays_within_its_byte_budget() {
+        const TOTAL_BUDGET: usize = 17_920;
+        const TOOL_CEILING: usize = 3_200;
+        let defs = tool_defs();
+        let total = serde_json::to_string(&defs).unwrap().len();
+        assert!(
+            total <= TOTAL_BUDGET,
+            "tools/list is {total} B (budget {TOTAL_BUDGET})"
+        );
+        for t in defs.as_array().unwrap() {
+            let one = serde_json::to_string(t).unwrap().len();
+            assert!(
+                one <= TOOL_CEILING,
+                "{} schema is {one} B (ceiling {TOOL_CEILING})",
+                t["name"]
+            );
         }
     }
 }
