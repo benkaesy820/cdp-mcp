@@ -964,12 +964,28 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
                     }
                     Ok(out)
                 }
-                Err(e) => Ok(json!({
-                    "endpoint": cfg.endpoint,
-                    "up": false,
-                    "error": e,
-                    "hint": "launch the browser with --remote-debugging-port=9222; until then nothing here can work",
-                })),
+                Err(e) => {
+                    // What an agent can actually do about it: the consent file
+                    // decides whether a browser may be started here, and the hint
+                    // names the command. "Nothing works" is not actionable.
+                    let consent = std::fs::read_to_string(consent_path()).unwrap_or_default();
+                    let launch = launch_allowed(&consent);
+                    let hint = match &launch {
+                        Some(browser) => format!(
+                            "no browser on {}. Starting one is allowed ({browser}): run `helium-cdp`, or `{browser} --remote-debugging-port`, then retry.",
+                            cfg.endpoint
+                        ),
+                        None => "no browser on this endpoint, and starting one is not permitted. Run `cdp-mcp setup` to allow it, or start a browser with --remote-debugging-port.".to_string(),
+                    };
+                    Ok(json!({
+                        "endpoint": cfg.endpoint,
+                        "up": false,
+                        "error": e,
+                        "launchAllowed": launch.is_some(),
+                        "canLaunch": launch.unwrap_or_default(),
+                        "hint": hint,
+                    }))
+                }
             }
         }
         "tabs" => match args.get("action").and_then(Value::as_str).unwrap_or("list") {
