@@ -47,6 +47,9 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      # The tag's checkout, so install.sh can be published beside the binaries
+      # instead of only living inside the tarball.
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
