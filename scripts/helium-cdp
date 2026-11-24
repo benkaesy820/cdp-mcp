@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+# Start Helium with a loopback DevTools endpoint, or report the instance that
+# already has one. cdp-mcp dials 127.0.0.1; it reads the port this publishes.
+#
+# Why this exists, measured 2026-11-24: after a Helium exits it leaves a socket
+# on 127.0.0.1:<port> in FIN-WAIT-2, so a plain bind() fails while `ss -ltn`
+# shows no listener at all, and Chromium then binds [::1] instead and logs only
+# "bind() failed". The window opens, the browser looks healthy, and cdp-mcp
+# answers "browser not running". So: never start a second instance, wait until a
+# plain bind really succeeds, and verify the family before claiming success.
+#
+# 2026-11-24, second lesson: another program (a Playwright run from another
+# thread) can hold 9222. Then 9222 is not ours to wait for, so take a free port
+# and publish it in $XDG_RUNTIME_DIR/helium-cdp.port — which is exactly where
+# cdp-mcp looks when 9222 has no browser.
+set -u
+
+URL=${1:-https://gemini.google.com/app}
+WANT=${HELIUM_CDP_PORT:-}                       # pinned port, if the caller insists
+PORT=""
+LOG=${HELIUM_CDP_LOG:-${XDG_RUNTIME_DIR:-/tmp}/helium-cdp.log}
+STATE=${XDG_RUNTIME_DIR:-/tmp}/helium-cdp.port
+CONSENT=${XDG_CONFIG_HOME:-$HOME/.config}/cdp-mcp/consent.json
+WAIT_MS=${HELIUM_CDP_WAIT_MS:-30000}
+
+answers_on() { curl -s --max-time 1 -o /dev/null "http://$1:$2/json/version"; }
+answers() { answers_on 127.0.0.1 "$PORT"; }
+tabs() {
+  curl -s --max-time 2 "http://127.0.0.1:$PORT/json/list" |
+    grep -oE '"url": "https?://[^"]*"' | sed 's/"url": "//; s/"$//' | head -5
+}
+# The faithful test: could a listener bind the port right now, with no
+# SO_REUSEADDR to paper over a socket the last instance left behind.
+port_free() {
+  python3 - "$1" <<'PY'
+import socket, sys
+s = socket.socket()
+try:
+    s.bind(("127.0.0.1", int(sys.argv[1])))
+except OSError:
+    sys.exit(1)
+finally:
+    s.close()
+PY
+}
+free_port() {
+  python3 -c 'import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()'
+}
+now_ms() { date +%s%3N; }
+endpoint_pid() {
+  ss -Hltnp "sport = :$PORT" 2>/dev/null | grep -F '127.0.0.1:' |
+    grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2
+}
+# Playwright and other automation launch Helium headless with a throwaway
+# profile. Driving one of those instead of his browser is the worst outcome here,
+# so such an endpoint is never reused.
+is_automation() {
+  [ -n "${1:-}" ] && tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null |
+    grep -qE 'playwright_chromiumdev_profile|--headless'
+}
+# Best effort: what started that browser. Another session (a T3/Codex thread
+# running e2e or a render script) is the usual owner, and its run ends on its own.
+launcher_of() {
+  local parent
+  parent=$(ps -o ppid= -p "$1" 2>/dev/null | tr -d ' ')
+  [ -n "$parent" ] && ps -o args= -p "$parent" 2>/dev/null | cut -c1-100
+}
+reuse() {
+  echo "up: 127.0.0.1:$PORT (already running, nothing started)"
+  echo "$PORT" > "$STATE" 2>/dev/null
+  tabs | sed 's/^/  tab: /'
+  exit 0
+}
+# Starting a browser is visible on someone's desktop, so it needs the consent
+# `cdp-mcp setup` records. No file, or "allowed": false, both mean no launch.
+consented_browser() {
+  python3 - "$CONSENT" <<'PY'
+import json, sys
+try:
+    c = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(3)
+l = c.get("launch") or {}
+if not l.get("allowed"):
+    sys.exit(2)
+print(l.get("browser") or "helium-browser")
+PY
+}
+
+# 1. A usable endpoint already exists — unless an automation owns it. Check the
+#    pinned port, then the one published last, then 9222.
+for candidate in "$WANT" "$( [ -s "$STATE" ] && head -1 "$STATE" | tr -d '[:space:]' )" 9222; do
+  [ -n "$candidate" ] || continue
+  PORT=$candidate
+  if answers; then
+    owner=$(endpoint_pid)
+    if is_automation "$owner"; then
+      echo "WARN: 127.0.0.1:$PORT is held by a headless/Playwright browser (pid $owner)." >&2
+      echo "      launcher: $(launcher_of "$owner")" >&2
+      echo "      That is another session's automation (a T3 thread running e2e or a" >&2
+      echo "      render script), not his browser. It is neither reused nor killed:" >&2
+      echo "      cdp-mcp would drive the wrong browser. Rerun once that run ends." >&2
+      exit 5
+    fi
+    reuse
+  fi
+  if answers_on '[::1]' "$PORT"; then
+    echo "WARN: DevTools is on [::1]:$PORT only, so cdp-mcp cannot see it." >&2
+    echo "      Stop that instance first: pkill -x helium   (then rerun)" >&2
+    exit 2
+  fi
+done
+
+# 2. Choose a port: the pinned one, else 9222, else any free port when something
+#    else is sitting on 9222.
+PORT=${WANT:-9222}
+if ! port_free "$PORT"; then
+  if [ -n "$WANT" ]; then
+    echo "FAIL: port $PORT is taken and HELIUM_CDP_PORT pins it." >&2
+    ss -Hltnp "sport = :$PORT" >&2
+    exit 3
+  fi
+  PORT=$(free_port)
+  echo "note: 127.0.0.1:9222 is held by something else; using free port $PORT" >&2
+fi
+
+# 3. Wait until a plain bind really succeeds: a killed instance keeps its socket
+#    for a moment, and starting inside that window is what caused the [::1] bug.
+deadline=$(( $(now_ms) + WAIT_MS ))
+noted=0
+while ! port_free "$PORT"; do
+  if [ "$(now_ms)" -ge "$deadline" ]; then
+    echo "FAIL: 127.0.0.1:$PORT is still not bindable after ${WAIT_MS}ms." >&2
+    ss -Htan "sport = :$PORT" | awk '{print "        " $1}' >&2
+    exit 3
+  fi
+  [ "$noted" = 0 ] && { echo "  waiting for 127.0.0.1:$PORT to be bindable (last instance winding down)..." >&2; noted=1; }
+  sleep 0.2
+done
+
+# 4. Start one instance, detached, so it outlives this shell's cgroup. The flags
+#    are passed here because the wrapper's flags file deliberately carries none
+#    (automation must not inherit the endpoint).
+BROWSER=$(consented_browser); consent=$?
+case $consent in
+  0) ;;
+  2) echo "FAIL: no browser is publishing DevTools, and launching is not permitted." >&2
+     echo "      Run 'cdp-mcp setup' (or edit $CONSENT) to allow it." >&2
+     exit 6 ;;
+  *) echo "FAIL: no browser is publishing DevTools, and no consent file exists." >&2
+     echo "      Run 'cdp-mcp setup' to record whether this may start one." >&2
+     exit 6 ;;
+esac
+setsid nohup "$BROWSER" --remote-debugging-port="$PORT" \
+  --remote-debugging-address=127.0.0.1 "$URL" >>"$LOG" 2>&1 </dev/null &
+
+# 5. Prove the address family before reporting success.
+deadline=$(( $(now_ms) + WAIT_MS ))
+while :; do
+  if answers; then
+    echo "$PORT" > "$STATE" 2>/dev/null
+    echo "started: 127.0.0.1:$PORT -> $URL (port published to $STATE)"
+    tabs | sed 's/^/  tab: /'
+    exit 0
+  fi
+  if answers_on '[::1]' "$PORT"; then
+    echo "FAIL: bound [::1]:$PORT instead of 127.0.0.1:$PORT." >&2
+    echo "      Something bound 127.0.0.1:$PORT between the check and the start." >&2
+    grep -E 'bind\(\)|DevTools listening' "$LOG" | tail -3 >&2
+    exit 2
+  fi
+  if [ "$(now_ms)" -ge "$deadline" ]; then
+    echo "FAIL: no DevTools answer on $PORT after ${WAIT_MS}ms; log: $LOG" >&2
+    tail -5 "$LOG" >&2
+    exit 4
+  fi
+  sleep 0.2
+done
