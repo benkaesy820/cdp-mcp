@@ -20,6 +20,7 @@ PROJECT=""
 ASSUME_YES=0
 HARNESSES=""
 PROFILE="default"
+ALLOW_LAUNCH=""
 
 say() { printf '%s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
@@ -35,6 +36,8 @@ Usage: ./install.sh [options]
   --project DIR       install for one project only
   --harness LIST      opencode, claude, or both (comma separated)
   --profile NAME      profile name passed to cdp-mcp (default: default)
+  --allow-launch CMD  allow cdp-mcp to start CMD, written to the consent file
+                      without a prompt (for --yes and pipes)
   -y, --yes           no prompts; requires --global or --project
   -h, --help          this text
 
@@ -61,6 +64,11 @@ while [ $# -gt 0 ]; do
             shift
             [ $# -gt 0 ] || die "--profile needs a name"
             PROFILE=$1
+            ;;
+        --allow-launch)
+            shift
+            [ $# -gt 0 ] || die "--allow-launch needs a browser command, e.g. helium-browser"
+            ALLOW_LAUNCH=$1
             ;;
         -y | --yes) ASSUME_YES=1 ;;
         -h | --help)
@@ -294,6 +302,29 @@ backup() {
 merge_opencode() {
     local cfg=$1
     backup "$cfg"
+    if ! have python3; then
+        # python3 is the easy path; jq is the common one. Neither is guaranteed,
+        # so the last resort is instructions, not a failed install.
+        if have jq; then
+            mkdir -p "$(dirname "$cfg")"
+            [ -s "$cfg" ] || printf '{}\n' > "$cfg"
+            local tmp
+            tmp=$(mktemp)
+            if jq --arg bin "$BIN" --arg prof "$PROFILE" \
+                  '.mcp.servers.cdp = {"type":"local","command":[$bin,"--profile",$prof]}' \
+                  "$cfg" > "$tmp"; then
+                mv -f "$tmp" "$cfg"
+                say "  merged with jq (no python3 here)"
+                return 0
+            fi
+            rm -f "$tmp"
+            warn "jq could not merge $cfg"
+        fi
+        warn "no python3 and no jq to merge $cfg"
+        say '  add this under "mcp": { "servers": { ... } } by hand:'
+        say "    \"cdp\": { \"type\": \"local\", \"command\": [\"$BIN\", \"--profile\", \"$PROFILE\"] }"
+        return 1
+    fi
     python3 - "$cfg" "$BIN" "$PROFILE" <<'PY'
 import json, os, sys
 path, binary, profile = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -377,14 +408,24 @@ for h in ${HARNESSES//,/ }; do
             fi
             if have claude; then
                 if [ "$SCOPE" = global ]; then
-                    claude mcp add --scope user cdp -- "$BIN" --profile "$PROFILE" >/dev/null 2>&1 ||
-                        warn "claude mcp add failed; add cdp from ~/.claude.json by hand"
-                    say "config: Claude Code (user scope)"
+                    # Remove first, so an upgrade replaces a stale path instead of
+                    # failing on "already exists", and keep the reason if it fails.
+                    claude mcp remove cdp >/dev/null 2>&1 || true
+                    if out=$(claude mcp add --scope user cdp -- "$BIN" --profile "$PROFILE" 2>&1); then
+                        say "config: Claude Code (user scope)"
+                    else
+                        warn "claude mcp add failed: $out"
+                        say "  by hand: claude mcp add --scope user cdp -- $BIN --profile $PROFILE"
+                    fi
                 else
-                    (cd "$PROJECT" && claude mcp add --scope project cdp -- "$BIN" --profile "$PROFILE" >/dev/null 2>&1) ||
-                        warn "claude mcp add failed; add cdp to $PROJECT/.mcp.json by hand"
-                    say "config: Claude Code (project scope, $PROJECT)"
-                    say "note  : Claude Code asks once to approve the project server on next launch"
+                    ( cd "$PROJECT" && claude mcp remove cdp >/dev/null 2>&1 || true )
+                    if out=$( cd "$PROJECT" && claude mcp add --scope project cdp -- "$BIN" --profile "$PROFILE" 2>&1 ); then
+                        say "config: Claude Code (project scope, $PROJECT)"
+                        say "note  : Claude Code asks once to approve the project server on next launch"
+                    else
+                        warn "claude mcp add failed: $out"
+                        say "  by hand: ( cd $PROJECT && claude mcp add --scope project cdp -- $BIN --profile $PROFILE )"
+                    fi
                 fi
             elif [ "$SCOPE" = project ]; then
                 merge_claude_json "$PROJECT/.mcp.json"
@@ -453,7 +494,22 @@ else
     say "launcher: no Chromium-family browser on PATH; skipped"
 fi
 
-if [ -f "$HOME/.config/cdp-mcp/consent.json" ]; then
+if [ -n "$ALLOW_LAUNCH" ]; then
+    # Consent without a terminal, for --yes and piped installs. The file is the
+    # same one `cdp-mcp setup` writes, so nothing downstream can tell the
+    # difference; only the tab policy is fixed rather than asked.
+    mkdir -p "$HOME/.config/cdp-mcp"
+    cat > "$HOME/.config/cdp-mcp/consent.json" <<CONSENT_EOF
+{
+  "launch": { "allowed": true, "browser": "$ALLOW_LAUNCH" },
+  "tabs": { "background": true, "foreground": false },
+  "written": "install.sh --allow-launch $ALLOW_LAUNCH"
+}
+CONSENT_EOF
+    say "consent: launch allowed ($ALLOW_LAUNCH), written without a prompt"
+    command -v "$ALLOW_LAUNCH" >/dev/null ||
+        warn "$ALLOW_LAUNCH is not on PATH; the launcher will fall back to the first browser it finds"
+elif [ -f "$HOME/.config/cdp-mcp/consent.json" ]; then
     if interactive; then
         read_yn "A consent file exists. Ask the one consent question again (may it start your browser)?" n
         answer=$ANSWER
