@@ -6,6 +6,7 @@
 #   ./install.sh --dry-run       show every step and every question, change nothing
 #   ./install.sh --yes           take the defaults without asking (for scripts)
 #   ./install.sh --uninstall     remove the binaries, keep consent and skills
+#   ./install.sh --uninstall --purge   remove those too, and runtime state
 #
 # Questions are only asked when there is a terminal to ask them in. Piped or
 # scripted runs take the defaults and say which ones they took, so nothing hangs.
@@ -17,12 +18,14 @@ set -euo pipefail
 DRY=0
 YES=0
 UNINSTALL=0
+PURGE=0
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY=1 ;;
     --yes|-y) YES=1 ;;
     --with-skill) : ;;   # kept for compatibility; the question now asks
     --uninstall) UNINSTALL=1 ;;
+    --purge) PURGE=1 ;;
     -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option $arg" >&2; exit 2 ;;
   esac
@@ -68,8 +71,19 @@ if [ "$UNINSTALL" = 1 ]; then
   run rm -f "$BIN/cdp" "$BIN/cdp-mcp"
   step "remove the Helium launcher (only if this installer put it there)"
   [ -f "$BIN/helium-cdp" ] && run rm -f "$BIN/helium-cdp"
-  printf '\nkept: %s\nkept: %s\n' "$CONSENT" "$SKILL_DIR"
-  printf '(delete those by hand if you mean it)\n'
+  if [ "$PURGE" = 1 ]; then
+    step "purge configuration and runtime state"
+    run rm -rf "$CONFIG_DIR/cdp-mcp"
+    run rm -rf "$SKILL_DIR"
+    run rm -rf "$HOME/.local/share/cdp-mcp"
+    RT=${XDG_RUNTIME_DIR:-/tmp}
+    run rm -f "$RT/helium-cdp.port" "$RT/helium-cdp.log" "$RT/airdb.state"
+    printf '\nremoved: consent, agent skill, reports, published port and logs.\n'
+    printf 'kept: the browser (it is not ours to close) and the repository.\n'
+  else
+    printf '\nkept: %s\nkept: %s\n' "$CONSENT" "$SKILL_DIR"
+    printf '(add --purge to remove those as well)\n'
+  fi
   exit 0
 fi
 
