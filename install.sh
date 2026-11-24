@@ -81,6 +81,46 @@ else
 fi
 command -v python3 >/dev/null || die "python3 is required to merge JSON config safely"
 
+# An empty line is not an answer. These loop until something valid is typed; with
+# --yes or no terminal they take the default and say so, so scripts never hang.
+ANSWER=""
+read_yn() {   # $1 question, $2 default for EOF/--yes
+    local reply=""
+    while :; do
+        if [ "$ASSUME_YES" = 1 ] || [ ! -t 0 ]; then
+            printf '   %s -> %s (not asking: %s)\n' "$1" "$2" \
+                "$([ "$ASSUME_YES" = 1 ] && echo --yes || echo 'no terminal')"
+            ANSWER=$2; return
+        fi
+        printf '   %s [y/n] ' "$1"
+        IFS= read -r reply || { ANSWER=$2; return; }
+        case "${reply,,}" in
+            y | yes) ANSWER=y; return ;;
+            n | no) ANSWER=n; return ;;
+            "") printf '     nothing typed: answer y or n\n' ;;
+            *) printf '     "%s" is not an answer: type y or n\n' "$reply" ;;
+        esac
+    done
+}
+read_num() {  # $1 question, $2 max, $3 default
+    local reply=""
+    while :; do
+        if [ "$ASSUME_YES" = 1 ] || [ ! -t 0 ]; then
+            printf '   %s -> %s (not asking: %s)\n' "$1" "$3" \
+                "$([ "$ASSUME_YES" = 1 ] && echo --yes || echo 'no terminal')"
+            ANSWER=$3; return
+        fi
+        printf '   %s [1-%s] ' "$1" "$2"
+        IFS= read -r reply || { ANSWER=$3; return; }
+        if [ -z "$reply" ]; then printf '     nothing typed: type 1 to %s\n' "$2"; continue; fi
+        case "$reply" in
+            *[!0-9]*) printf '     "%s" is not a number\n' "$reply"; continue ;;
+        esac
+        if [ "$reply" -ge 1 ] && [ "$reply" -le "$2" ]; then ANSWER=$reply; return; fi
+        printf '     %s is not between 1 and %s\n' "$reply" "$2"
+    done
+}
+
 have() { command -v "$1" >/dev/null 2>&1; }
 
 DETECTED=()
@@ -121,7 +161,8 @@ if [ -z "$HARNESSES" ]; then
             codex) def=3 ;;
             *) def=4 ;;
         esac
-        read -r -p "Type 1, 2, 3 or 4 [$def]: " answer
+        read_num "Which harness? (1 opencode, 2 claude, 3 codex, 4 everything detected)" 4 "$def"
+        answer=$ANSWER
         detected_list=$(IFS=,; printf '%s' "${DETECTED[*]:-opencode,claude}")
         case "${answer:-$def}" in
             1) HARNESSES=opencode ;;
@@ -147,7 +188,8 @@ if [ -z "$SCOPE" ]; then
     say "Where should cdp-mcp be available?"
     say "  1) Every project (user level)"
     say "  2) One project only"
-    read -r -p "Type 1 or 2 [1]: " answer
+    read_num "Where should cdp-mcp be available? (1 every project, 2 one project)" 2 1
+    answer=$ANSWER
     case "${answer:-1}" in
         1) SCOPE=global ;;
         2) SCOPE=project ;;
@@ -170,7 +212,8 @@ say "  scope     : $SCOPE${PROJECT:+ ($PROJECT)}"
 say "  profile   : $PROFILE"
 say "  binary    : $BIN"
 if [ "$ASSUME_YES" = 0 ]; then
-    read -r -p "Proceed? [Y/n] " answer
+    read_yn "Proceed?" y
+    answer=$ANSWER
     case "${answer:-y}" in
         y | Y | yes | YES) ;;
         *) exit 1 ;;
@@ -374,7 +417,8 @@ interactive() { [ -t 0 ] && [ "$ASSUME_YES" = 0 ]; }
 say ""
 if command -v helium-browser >/dev/null; then
     if interactive; then
-        read -r -p "Install the Helium launcher to ~/.local/bin/helium-cdp (takes 9222, or a free port, and publishes it)? [Y/n] " answer
+        read_yn "Install the Helium launcher to ~/.local/bin/helium-cdp (takes 9222, or a free port, and publishes it)?" y
+        answer=$ANSWER
     else
         answer=y
     fi
@@ -386,7 +430,8 @@ fi
 
 if [ -f "$HOME/.config/cdp-mcp/consent.json" ]; then
     if interactive; then
-        read -r -p "A consent file exists. Ask the one consent question again (may it start your browser)? [y/N] " answer
+        read_yn "A consent file exists. Ask the one consent question again (may it start your browser)?" n
+        answer=$ANSWER
     else
         answer=n
     fi
@@ -395,7 +440,8 @@ if [ -f "$HOME/.config/cdp-mcp/consent.json" ]; then
         *) say "consent: kept (change it any time with: cdp-mcp setup)" ;;
     esac
 elif interactive; then
-    read -r -p "Ask the consent question now (may cdp-mcp start your browser when none is running, and which one)? [Y/n] " answer
+    read_yn "Ask the consent question now (may cdp-mcp start your browser when none is running, and which one)?" y
+    answer=$ANSWER
     case "${answer:-y}" in
         y | Y | yes | YES) "$BIN" setup ;;
         *) say "consent: none written — cdp-mcp will not start a browser until you run 'cdp-mcp setup'" ;;

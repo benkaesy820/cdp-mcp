@@ -528,16 +528,22 @@ fn on_path(cmd: &str) -> bool {    std::env::var_os("PATH")
 }
 
 fn ask(prompt: &str, default_yes: bool) -> bool {
-    println!("{prompt} [{}]{}", if default_yes { "Y/n" } else { "y/N" },
-             if default_yes { "" } else { "  (Enter = no)" });
-    let mut line = String::new();
-    if std::io::stdin().read_line(&mut line).is_err() {
-        return default_yes;
-    }
-    match line.trim().to_ascii_lowercase().as_str() {
-        "" => default_yes,
-        "y" | "yes" => true,
-        _ => false,
+    // No Enter-to-accept: an empty line is not an answer, it is a question that
+    // was not read. Only y/yes/n/no decide; EOF (a piped, empty stdin) takes the
+    // default so a scripted run cannot hang.
+    loop {
+        println!("{prompt} [y/n]");
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(0) | Err(_) => return default_yes, // nobody there to answer
+            Ok(_) => {}
+        }
+        match line.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => return true,
+            "n" | "no" => return false,
+            "" => println!("  nothing typed: answer y or n"),
+            other => println!("  {other:?} is not an answer: type y or n"),
+        }
     }
 }
 
@@ -561,16 +567,23 @@ fn setup() {
         for (n, b) in found.iter().enumerate() {
             println!("  {}. {b}", n + 1);
         }
-        println!("[1-{}], default {}", found.len(), found[0]);
-        let mut line = String::new();
-        let _ = std::io::stdin().read_line(&mut line);
-        line.trim()
-            .parse::<usize>()
-            .ok()
-            .and_then(|n| n.checked_sub(1))
-            .and_then(|n| found.get(n))
-            .map(|b| b.to_string())
-            .unwrap_or_else(|| found[0].to_string())
+        println!("type a number from 1 to {} ({} is first)", found.len(), found[0]);
+        loop {
+            let mut line = String::new();
+            match std::io::stdin().read_line(&mut line) {
+                Ok(0) | Err(_) => break found[0].to_string(),
+                Ok(_) => {}
+            }
+            let typed = line.trim();
+            if typed.is_empty() {
+                println!("  nothing typed: type a number from 1 to {}", found.len());
+                continue;
+            }
+            match typed.parse::<usize>() {
+                Ok(n) if n >= 1 && n <= found.len() => break found[n - 1].to_string(),
+                _ => println!("  {typed:?} is not one of 1 to {}", found.len()),
+            }
+        }
     } else {
         "helium-browser".to_string()
     };
