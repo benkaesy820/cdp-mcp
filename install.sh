@@ -199,8 +199,13 @@ fi
 
 if [ "$SCOPE" = project ] && [ -z "$PROJECT" ]; then
     [ -t 0 ] || die "--project needs a directory"
-    read -r -p "Project directory [$PWD]: " answer
-    PROJECT=${answer:-$PWD}
+    while :; do
+        printf '   Project directory (absolute or relative to %s): ' "$PWD"
+        IFS= read -r answer || { answer=$PWD; break; }
+        [ -n "$answer" ] && break
+        printf '     nothing typed: give a directory\n'
+    done
+    PROJECT=$answer
 fi
 if [ "$SCOPE" = project ]; then
     PROJECT=$(cd -- "$PROJECT" 2>/dev/null && pwd) || die "no such directory: $PROJECT"
@@ -275,6 +280,9 @@ mkdir -p "$HOME/.local/bin"
 install -m 755 "$SRC" "$BIN.new"
 mv -f "$BIN.new" "$BIN"
 say "binary: $BIN ($("$BIN" --version 2>/dev/null || printf 'installed'))"
+# The CLI is the same binary under a shorter name, and the README documents it.
+ln -sf "$BIN" "${BIN%/*}/cdp"
+say "cli   : ${BIN%/*}/cdp"
 
 # ---------------------------------------------------------------- JSON merge
 
