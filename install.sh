@@ -101,8 +101,8 @@ if [ -z "$HARNESSES" ]; then
         [ -t 0 ] || die "no terminal to ask in: pass --harness LIST and --global/--project with --yes"
         seen=${DETECTED[*]:-none}
         default=$(IFS=,; printf '%s' "${DETECTED[*]:-opencode,claude}")
-        say "Harnesses found: $seen"
-        read -r -p "Install for [$default]: " HARNESSES
+        say "Harnesses detected on this machine: $seen"
+        read -r -p "Give the MCP entry + skill to (comma separated) [$default]: " HARNESSES
         HARNESSES=${HARNESSES:-$default}
     fi
 fi
@@ -167,7 +167,10 @@ else
         SRC="$REPO/target/release/cdp-mcp"
     fi
     mkdir -p "$HOME/.local/bin"
-    install -m 755 "$SRC" "$BIN"
+    # Write beside it and rename: overwriting a running binary fails with
+    # "Text file busy", and the server a harness spawned is usually running.
+    install -m 755 "$SRC" "$BIN.new"
+    mv -f "$BIN.new" "$BIN"
     say "binary: $BIN"
 fi
 
@@ -284,6 +287,43 @@ for h in ${HARNESSES//,/ }; do
             ;;
     esac
 done
+
+# ---------------------------------------------------------------- launcher and consent
+
+interactive() { [ -t 0 ] && [ "$ASSUME_YES" = 0 ]; }
+
+say ""
+if command -v helium-browser >/dev/null; then
+    if interactive; then
+        read -r -p "Install the Helium launcher to ~/.local/bin/helium-cdp (takes 9222, or a free port, and publishes it)? [Y/n] " answer
+    else
+        answer=y
+    fi
+    case "${answer:-y}" in
+        y | Y | yes | YES) install -m 755 "$REPO/scripts/helium-cdp" "$HOME/.local/bin/helium-cdp"; say "launcher: ~/.local/bin/helium-cdp" ;;
+        *) say "launcher: skipped" ;;
+    esac
+fi
+
+if [ -f "$HOME/.config/cdp-mcp/consent.json" ]; then
+    if interactive; then
+        read -r -p "A consent file exists. Walk through those questions again? [y/N] " answer
+    else
+        answer=n
+    fi
+    case "${answer:-n}" in
+        y | Y | yes | YES) "$BIN" setup ;;
+        *) say "consent: kept (change it any time with: cdp-mcp setup)" ;;
+    esac
+elif interactive; then
+    read -r -p "Ask the consent questions now (may cdp-mcp start a browser, which one, may a tab take the foreground)? [Y/n] " answer
+    case "${answer:-y}" in
+        y | Y | yes | YES) "$BIN" setup ;;
+        *) say "consent: none written — cdp-mcp will not start a browser until you run 'cdp-mcp setup'" ;;
+    esac
+else
+    say "consent: none written (run 'cdp-mcp setup' to allow starting a browser)"
+fi
 
 # ---------------------------------------------------------------- check the browser
 
