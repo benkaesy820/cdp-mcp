@@ -58,10 +58,12 @@ fn tab_lines(v: &Value) {
         return;
     };
     for t in tabs {
+        // Padded spaces, not tabs: tabs collapse when a person copies a line out
+        // of the terminal, and the columns then read as one word.
         println!(
-            "{}\t{}\t{}",
+            "{:<4} {:<44} {}",
             t.get("handle").and_then(Value::as_str).unwrap_or("-"),
-            t.get("title").and_then(Value::as_str).unwrap_or("").chars().take(50).collect::<String>(),
+            t.get("title").and_then(Value::as_str).unwrap_or("").chars().take(42).collect::<String>(),
             t.get("url").and_then(Value::as_str).unwrap_or("")
         );
     }
@@ -74,9 +76,9 @@ fn find_lines(v: &Value) {
     };
     for e in els {
         println!(
-            "{}\t{}\t{},{}\t{}",
+            "{:<4} {:<44} {:>5},{:<5} {}",
             e.get("i").and_then(Value::as_u64).unwrap_or(0),
-            e.get("label").and_then(Value::as_str).unwrap_or(""),
+            e.get("label").and_then(Value::as_str).unwrap_or("").chars().take(42).collect::<String>(),
             e.get("x").and_then(Value::as_i64).unwrap_or(0),
             e.get("y").and_then(Value::as_i64).unwrap_or(0),
             if e.get("role").and_then(Value::as_str) == Some("button") { "tap" } else { "---" }
