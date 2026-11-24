@@ -1,26 +1,29 @@
 #!/usr/bin/env bash
 # install.sh — build cdp-mcp, install it, and wire up `cdp` and the Helium
-# launcher. Idempotent: run it again after a `git pull` to upgrade in place.
+# launcher.
 #
-#   ./install.sh --dry-run        show every step, change nothing
-#   ./install.sh                  install (asks before touching consent or skills)
-#   ./install.sh --with-skill     also install skills/cdp into the agent's skills
-#   ./install.sh --uninstall      remove the binaries, keep consent and skills
+#   ./install.sh                 install, asking about the optional parts
+#   ./install.sh --dry-run       show every step and every question, change nothing
+#   ./install.sh --yes           take the defaults without asking (for scripts)
+#   ./install.sh --uninstall     remove the binaries, keep consent and skills
 #
-# What it will not do: start a browser, edit the browser's flags, or write
-# anything outside $PREFIX/bin, ~/.config/cdp-mcp and (with --with-skill)
-# ~/.config/opencode/skills/cdp.
+# Questions are only asked when there is a terminal to ask them in. Piped or
+# scripted runs take the defaults and say which ones they took, so nothing hangs.
+#
+# It never starts a browser, never edits the browser's flags, and writes only to
+# $PREFIX/bin, ~/.config/cdp-mcp (consent) and ~/.config/opencode/skills/cdp.
 set -euo pipefail
 
 DRY=0
-WITH_SKILL=0
+YES=0
 UNINSTALL=0
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY=1 ;;
-    --with-skill) WITH_SKILL=1 ;;
+    --yes|-y) YES=1 ;;
+    --with-skill) : ;;   # kept for compatibility; the question now asks
     --uninstall) UNINSTALL=1 ;;
-    -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option $arg" >&2; exit 2 ;;
   esac
 done
@@ -34,21 +37,39 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 
 step() { printf '\n== %s\n' "$*"; }
 run() {
+  if [ "$DRY" = 1 ]; then printf '   [dry] %s\n' "$*"; else printf '   %s\n' "$*"; "$@"; fi
+}
+# ask <question> <default y|n> -> sets ANSWER to y or n
+ask() {
+  local q=$1 def=$2 hint="[y/N]"
+  [ "$def" = y ] && hint="[Y/n]"
   if [ "$DRY" = 1 ]; then
-    printf '   [dry] %s\n' "$*"
-  else
-    printf '   %s\n' "$*"
-    "$@"
+    printf '   [dry] %s %s -> %s\n' "$q" "$hint" "$def"
+    ANSWER=$def
+    return
   fi
+  if [ "$YES" = 1 ] || [ ! -t 0 ]; then
+    printf '   %s %s -> %s (not asking: %s)\n' "$q" "$hint" "$def" \
+      "$([ "$YES" = 1 ] && echo --yes || echo 'no terminal')"
+    ANSWER=$def
+    return
+  fi
+  printf '   %s %s ' "$q" "$hint"
+  local line=""
+  IFS= read -r line || true
+  case "${line:-$def}" in
+    [Yy]|[Yy][Ee][Ss]) ANSWER=y ;;
+    *) ANSWER=n ;;
+  esac
 }
 
 if [ "$UNINSTALL" = 1 ]; then
   step "remove $BIN/cdp and $BIN/cdp-mcp"
-  run rm -f "$BIN/cdp"
-  run rm -f "$BIN/cdp-mcp"
+  run rm -f "$BIN/cdp" "$BIN/cdp-mcp"
   step "remove the Helium launcher (only if this installer put it there)"
-  if [ -f "$BIN/helium-cdp" ]; then run rm -f "$BIN/helium-cdp"; fi
-  printf '\nkept: %s (delete by hand if you mean it)\nkept: %s\n' "$CONSENT" "$SKILL_DIR"
+  [ -f "$BIN/helium-cdp" ] && run rm -f "$BIN/helium-cdp"
+  printf '\nkept: %s\nkept: %s\n' "$CONSENT" "$SKILL_DIR"
+  printf '(delete those by hand if you mean it)\n'
   exit 0
 fi
 
@@ -61,11 +82,8 @@ printf '   prefix: %s\n' "$PREFIX"
 [ -d "$BIN" ] || run mkdir -p "$BIN"
 
 step "build (release)"
-if [ "$DRY" = 1 ]; then
-  printf '   [dry] cargo build --release (in %s)\n' "$ROOT"
-else
-  ( cd "$ROOT" && cargo build --release )
-fi
+if [ "$DRY" = 1 ]; then printf '   [dry] cargo build --release (in %s)\n' "$ROOT"
+else ( cd "$ROOT" && cargo build --release ); fi
 
 step "install the binary (rename, so a running server is not disturbed)"
 run install -m755 "$ROOT/target/release/cdp-mcp" "$BIN/.cdp-mcp.new"
@@ -75,48 +93,49 @@ run ln -sf "$BIN/cdp-mcp" "$BIN/cdp"
 
 step "Helium launcher"
 if command -v helium-browser >/dev/null; then
-  run install -m755 "$ROOT/scripts/helium-cdp" "$BIN/helium-cdp"
-  printf '   it takes 9222 when free, a free port otherwise, and publishes it in\n'
-  printf '   $XDG_RUNTIME_DIR/helium-cdp.port, which cdp-mcp reads.\n'
+  ask "Install the Helium launcher (takes 9222, or a free port, and publishes it)?" y
+  if [ "$ANSWER" = y ]; then run install -m755 "$ROOT/scripts/helium-cdp" "$BIN/helium-cdp"; fi
 else
-  printf '   no helium-browser on PATH; skipping (Chrome/Chromium work too, the\n'
-  printf '   port is read from <profile>/DevToolsActivePort)\n'
+  printf '   no helium-browser on PATH; skipping. Chrome/Chromium work too: the port\n'
+  printf '   is read from <profile>/DevToolsActivePort.\n'
 fi
 
 step "consent"
 if [ -f "$CONSENT" ]; then
-  printf '   exists: %s (re-run `cdp-mcp setup` to change the answers)\n' "$CONSENT"
-elif [ ! -t 0 ]; then
-  printf '   no consent file, and stdin is not a terminal. Run `cdp-mcp setup`\n'
-  printf '   yourself: it asks whether a browser may be started, which one, and\n'
-  printf '   whether a tab may take the foreground.\n'
-elif [ "$DRY" = 1 ]; then
-  printf '   [dry] cdp-mcp setup  (interactive: launch? which browser? foreground?)\n'
+  printf '   current: %s\n' "$(tr -d '\n' < "$CONSENT" | sed 's/  */ /g' | cut -c1-120)..."
+  ask "Keep it? (answer n to walk through the questions again)" y
+  if [ "$ANSWER" = n ] && [ -t 0 ] && [ "$DRY" = 0 ]; then "$BIN/cdp-mcp" setup; fi
+  [ "$ANSWER" = n ] && [ "$DRY" = 1 ] && printf '   [dry] cdp-mcp setup\n'
 else
-  "$BIN/cdp-mcp" setup
+  ask "Ask the consent questions now (may a browser be started, which one, foreground)?" y
+  if [ "$ANSWER" = y ]; then
+    if [ "$DRY" = 1 ]; then printf '   [dry] cdp-mcp setup\n'; else "$BIN/cdp-mcp" setup; fi
+  else
+    printf '   no consent file: cdp-mcp will not start a browser until you run\n'
+    printf '   `cdp-mcp setup`.\n'
+  fi
 fi
 
 step "agent skill"
-if [ "$WITH_SKILL" = 1 ]; then
+ask "Install the agent skill into $SKILL_DIR?" n
+if [ "$ANSWER" = y ]; then
   run mkdir -p "$SKILL_DIR"
   run install -m644 "$ROOT/skills/cdp/SKILL.md" "$SKILL_DIR/SKILL.md"
 else
-  printf '   skipped. To install it: ./install.sh --with-skill\n'
-  printf '   (it is markdown: %s/skills/cdp/SKILL.md)\n' "$ROOT"
+  printf '   skipped; the file is %s/skills/cdp/SKILL.md\n' "$ROOT"
 fi
 
 step "verify"
 if [ "$DRY" = 1 ]; then
-  printf '   [dry] cdp --version\n   [dry] cdp status\n'
-  printf '\nNothing changed. Run without --dry-run to do it.\n'
+  printf '   [dry] cdp --version\n   [dry] cdp status\n\nNothing changed.\n'
   exit 0
 fi
 "$BIN/cdp-mcp" --version
 if "$BIN/cdp" status 2>/dev/null; then
   printf '\nok: a browser is publishing DevTools and `cdp` can reach it.\n'
 else
-  printf '\nok: installed. No browser is publishing DevTools right now, so start one:\n'
-  printf '   helium-cdp              (takes 9222, or a free port if it is busy)\n'
-  printf '   cdp status              (should then print one line per tab)\n'
+  printf '\nok: installed. No browser is publishing DevTools right now:\n'
+  printf '   helium-cdp     start one (takes 9222, or a free port if busy)\n'
+  printf '   cdp status     then expect one line per tab\n'
 fi
 printf '\nnext: restart any running agent host so it loads the new server.\n'
