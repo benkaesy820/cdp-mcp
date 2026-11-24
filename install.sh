@@ -99,11 +99,26 @@ if [ -z "$HARNESSES" ]; then
         fi
     else
         [ -t 0 ] || die "no terminal to ask in: pass --harness LIST and --global/--project with --yes"
-        seen=${DETECTED[*]:-none}
-        default=$(IFS=,; printf '%s' "${DETECTED[*]:-opencode,claude}")
-        say "Harnesses detected on this machine: $seen"
-        read -r -p "Give the MCP entry + skill to (comma separated) [$default]: " HARNESSES
-        HARNESSES=${HARNESSES:-$default}
+        # Numbered, not a comma list: a number can be chosen without already
+        # knowing the syntax, which is the whole point of asking.
+        say "Which harness gets the cdp-mcp entry and the skill?"
+        say "  1) opencode"
+        say "  2) claude"
+        say "  3) both"
+        [ ${#DETECTED[@]} -gt 0 ] && say "  detected on this machine: ${DETECTED[*]}"
+        case "$(printf '%s' "${DETECTED[*]:-}")" in
+            opencode) def=1 ;;
+            claude) def=2 ;;
+            *) def=3 ;;
+        esac
+        read -r -p "Choose [$def]: " answer
+        case "${answer:-$def}" in
+            1) HARNESSES=opencode ;;
+            2) HARNESSES=claude ;;
+            3) HARNESSES=opencode,claude ;;
+            *opencode* | *claude*) HARNESSES=$answer ;;   # typing names still works
+            *) die "choose 1, 2 or 3" ;;
+        esac
     fi
 fi
 
