@@ -118,7 +118,7 @@ that is already long: the MCP catalog costs ~17 KB of context on every turn, a
 command costs nothing. Reach for the MCP server when you need a long-lived
 session, `batch`, or `flow`.
 
-Verified on Helium (Chrome/157) and cdp-mcp 0.10.7+.
+Verified on Helium (Chrome/157) and cdp-mcp 0.13+.
 
 ## The five commands you will use most
 
