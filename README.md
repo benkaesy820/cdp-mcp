@@ -186,7 +186,7 @@ Fourteen. Each resolves its own tab, so nothing has to be called first.
 | `input` | real input in order, in one call: click, type, key, scroll, select, hover, drag, touch, dismiss, wait |
 | `eval` | evaluate JavaScript in the page, return JSON, awaits promises |
 | `flow` | run steps server-side and repeat until a condition holds — N acts for one turn |
-| `idle` | wait with no polling: an element exists, text appears, or the page stops changing |
+| `idle` | wait with no polling: an element exists, text appears, or nothing visible changes for 2 s (hidden and below-the-fold churn does not count, so never-quiet pages like YouTube still settle) |
 | `shot` | screenshot to a path (one line back), or inline when you ask for it |
 | `paste` | type text or paste an image into the focused element |
 | `upload` | set files on an `<input type=file>` |
@@ -373,6 +373,10 @@ first. Nothing experimental is published as a release.
   not been run on hardware; macOS and Windows are not built.
 - **No network awareness.** A click that starts a fetch and leaves the DOM
   unchanged can be reported idle before the response renders.
+- **Idle means visually still.** Changes to hidden elements, `<head>`, icon
+  `<svg>`s and rows below the fold do not keep a wait awake (they are reported in
+  `offScreen`). A navigation's `idle` gives up after 15 s with `idle:false`; the
+  page is usable then, just still moving.
 - **Wait reports are coalesced.** `changes` is at most one per 80 ms, the text
   check is capped at 50 ms, and `maxIdleMs` below ~100 ms is approximate.
 - **Screenshots need a window the compositor is drawing.** An occluded window can

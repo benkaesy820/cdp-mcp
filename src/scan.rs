@@ -538,6 +538,8 @@ const SCAN_TPL: &str = r##"(() => {
     w: Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0)),
     h: Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0)),
   });
+  const chrome = (el) => el.matches('header, nav, [role="banner"], [role="navigation"], [role="toolbar"], [role="search"]')
+    || !!el.querySelector('header, nav, [role="banner"], [role="navigation"], [role="search"], input[type="search"], input[name="search_query"], input[name="q"]');
   for (const el of layerCandidates) {
     const cs = getComputedStyle(el);
     if (cs.position !== 'fixed' && cs.position !== 'absolute') continue;
@@ -548,6 +550,10 @@ const SCAN_TPL: &str = r##"(() => {
     const spansWidth = v.w >= innerWidth * 0.7 && v.h >= 40;
     if (areaShare < 0.15 && !spansWidth) continue;
     if (cs.position === 'absolute' && Number(cs.zIndex || 0) < 10) continue;
+    // A fixed site header or bottom tab bar is wide too, but it is the page's
+    // own chrome, not something in the way: YouTube's masthead was reported
+    // as a layer whose "closer" was its skip link.
+    if (spansWidth && v.h < innerHeight * 0.2 && chrome(el)) continue;
     candidates.push(el);
   }
   // Whole words only: a bare `x` or `ok` inside "Explore" or "Book now" is not
@@ -570,7 +576,7 @@ const SCAN_TPL: &str = r##"(() => {
       const r2 = b2.getBoundingClientRect();
       if (!shown(b2, r2)) continue;
       const lbl = labelOf(b2);
-      if (!lbl || !CLOSE_RE.test(lbl)) continue;
+      if (!lbl || !CLOSE_RE.test(lbl) || /^skip (to|nav)/i.test(lbl)) continue;
       const rec = { label: lbl };
       if (index.has(b2)) rec.i = index.get(b2); // clickable by absolute index
       Object.assign(rec, { x: Math.round(r2.x + r2.width / 2), y: Math.round(r2.y + r2.height / 2),

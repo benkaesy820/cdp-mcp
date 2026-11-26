@@ -1221,6 +1221,43 @@ await withTab(`http://localhost:${fport}/select`, async (tab) => {
         list.v?.log?.[0]);
 });
 
+// The YouTube case: nothing on screen moves, but the page never stops
+// changing out of sight. Waits must settle on what a person can see, and
+// still report the rows that arrived below the fold.
+await withTab(page("never-quiet.html"), async (tab, ev) => {
+  const sc = (await s.tool("elements", { tab })).v;
+  check("a fixed site header is not an overlay", !(sc.overlays || []).length, sc.overlays);
+  const t0 = Date.now();
+  const r = (await s.tool("idle", { tab, maxIdleMs: 800, timeoutMs: 8000 })).v;
+  const ms = Date.now() - t0;
+  check("a page that only changes out of sight settles", r.woke === "idleLimit" && ms < 3000, { woke: r.woke, ms, note: r.note });
+  check("out-of-sight churn does not count as visible changes", (r.changes || 0) <= 1, r.changes);
+  check("rows that arrived below the fold are still reported",
+        JSON.stringify(r.offScreen || []).includes("later video") && !(r.appeared || []).length,
+        { addedCount: r.addedCount, appeared: r.appeared, offScreen: r.offScreen });
+
+  const bare = Date.now();
+  const d = (await s.tool("idle", { tab })).v;
+  check("a bare idle settles in seconds, not at its ten-minute timeout",
+        d.woke === "idleLimit" && Date.now() - bare < 6000, { woke: d.woke, ms: Date.now() - bare });
+
+  const n = Number(await ev("document.querySelectorAll('#rows p').length")) + 15;
+  const hit = (await s.tool("idle", { tab, untilText: "later video " + (n - 200), timeoutMs: 8000 })).v;
+  check("a hit below the fold still wakes the wait", hit.woke === "text", hit.woke);
+
+  await ev("setTimeout(() => { const p = document.createElement('p'); p.textContent = 'Now playing'; document.querySelector('h1').after(p); }, 500)");
+  const t1 = Date.now();
+  const vis = (await s.tool("idle", { tab, maxIdleMs: 800, timeoutMs: 8000 })).v;
+  const ms1 = Date.now() - t1;
+  check("a change on screen still restarts the quiet clock",
+        ms1 >= 1250 && JSON.stringify(vis.appeared || []).includes("Now playing"), { ms: ms1, appeared: vis.appeared });
+
+  const t2 = Date.now();
+  const nav = (await s.tool("tabs", { action: "goto", tab, url: page("never-quiet.html"), idle: true })).v;
+  check("navigation idle settles on a never-quiet page", nav.idle === true && Date.now() - t2 < 6000,
+        { idle: nav.idle, ms: Date.now() - t2, note: nav.note });
+});
+
 await withTab(page("chatty.html"), async (tab, ev) => {
   const before = Number(await ev("window.__ticks")) || 0;
   const r = (await s.tool("idle", { tab, maxIdleMs: 1500, timeoutMs: 4000 })).v;
@@ -1333,7 +1370,7 @@ await withTab(page("basic.html"), async (tab, ev) => {
   await s.tool("eval", {
     tab,
     expression: `(() => {
-      const add = (t) => { const p = document.createElement('p'); p.textContent = t; document.body.appendChild(p); };
+      const add = (t) => { const p = document.createElement('p'); p.textContent = t; document.body.prepend(p); };
       setTimeout(() => add('tail one'), 120);
       setTimeout(() => add('tail two'), 150);
     })()`,

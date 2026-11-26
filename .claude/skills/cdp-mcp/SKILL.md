@@ -155,6 +155,13 @@ Look in `collapsed` for the item you need and its opener index → click the ope
 `find` it and click: the click scrolls by itself. To load more of a feed:
 `[{scroll:{dy:1500}}, {wait:{idle:true,ms:5000}}]`, then scan again.
 
+**A page that never finishes loading** (YouTube, feeds, live dashboards)
+Do not wait for it to stop. `tabs {…, idle:true}` returns once what is on screen
+is still; if it says `"idle":false`, the page has content anyway — scan or read
+it now. Waiting longer, or calling `idle` again and again, gains nothing.
+`idle {}` alone waits for 2 s with no visible change (`offScreen` lists rows that
+arrived below the fold, which do not count).
+
 **Wait for something to appear**
 `idle {untilText:"Order confirmed", timeoutMs:30000}` or
 `idle {untilSelector:"[role=dialog]"}`. It wakes the moment it appears and says
@@ -262,9 +269,9 @@ say it works before `status` answers with `browser` and `tabs`.
   never tunnel or expose the port.
 - `paste` hands data to the page and never touches the system clipboard.
 - One call at a time per server; a long `idle` makes the others wait.
-- `idle` does not watch the network: after a click that loads data, wait for the
-  text you expect (`untilText`) rather than for quiet.
+- `idle` does not watch the network, only what is visible: after a click that
+  loads data, wait for the text you expect (`untilText`) rather than for quiet.
 - Screenshots only, no video.
 - Tested on one machine only: Arch Linux x86_64, Helium 157 (Chrome/157), cdp-mcp
-  0.15. The aarch64 build is compiled but has never been run; macOS and Windows have
+  0.16. The aarch64 build is compiled but has never been run; macOS and Windows have
   no build. Say so rather than implying wider support.

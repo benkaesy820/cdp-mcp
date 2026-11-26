@@ -325,6 +325,8 @@ pub(crate) fn check_cancel() -> Result<(), String> {
 /// (`idle`'s timeout, an input action's `wait`/`sleep`) refuses more, so a
 /// missing argument cannot turn into an hours-long call.
 pub(crate) const MAX_WAIT_MS: u64 = 900_000;
+/// `idle` with nothing to wait for: this long without a visible change.
+const DEFAULT_QUIET_MS: u64 = 2_000;
 
 /// Sleep that a cancellation cuts short.
 pub(crate) fn nap(ms: u64) -> Result<(), String> {
@@ -905,7 +907,14 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
             if timeout > MAX_WAIT_MS {
                 return Err(format!("idle: timeoutMs must be at most {MAX_WAIT_MS}"));
             }
-            let max_idle = args.get("maxIdleMs").and_then(Value::as_u64).unwrap_or(timeout);
+            // With nothing to wait for, "idle" means "settled enough to read":
+            // two seconds of no visible change. Defaulting to the whole timeout
+            // made a bare `idle {}` sit out ten minutes on any page that ticks.
+            let watching = args.get("untilText").is_some() || args.get("untilSelector").is_some();
+            let max_idle = args
+                .get("maxIdleMs")
+                .and_then(Value::as_u64)
+                .unwrap_or(if watching { timeout } else { DEFAULT_QUIET_MS.min(timeout) });
             let until_text = args.get("untilText").and_then(Value::as_str).map(str::to_string);
             // Waiting for a thing to exist is the common case a text search
             // cannot express: a form that has mounted, a dialog that has opened.
@@ -1097,7 +1106,7 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
                 // needs content should ask to settle: wait until the resource
                 // count stops moving instead of trusting readyState alone.
                 let idle = if args.get("idle").and_then(Value::as_bool).unwrap_or(false) {
-                    match with_conn(&cfg.endpoint, Some(&id), |conn, _| wait_idle(conn, 20_000, 300)) {
+                    match with_conn(&cfg.endpoint, Some(&id), |conn, _| wait_idle(conn, IDLE_MS, 300)) {
                         Ok(n) => Some(n),
                         Err(e) => {
                             check_cancel()?;
@@ -1120,9 +1129,8 @@ pub(crate) fn call_tool(cfg: &Cfg, name: &str, args: &Value) -> Result<Value, St
                     ));
                 }
                 let mut out = json!({ "tab": id, "url": final_url, "readyState": ready });
-                if let Some(n) = idle {
-                    out["idle"] = json!(true);
-                    out["resources"] = json!(n);
+                if let Some(w) = idle {
+                    w.put(&mut out);
                 }
                 if !dialog.is_null() {
                     out["dialog"] = dialog;

@@ -1,0 +1,40 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>cdp-mcp never quiet</title>
+<!-- What YouTube's history page does: the part on screen is finished, but the
+     page never stops rewriting things nobody can see. Rows keep arriving below
+     the fold, a hidden player rebuilds itself, <head> gains tags, and icons
+     swap their <svg>. A wait must call this page settled. -->
+<body style="margin:0;padding-top:60px">
+<!-- YouTube's masthead: fixed, full width, with a skip link that reads like a closer. -->
+<div id="masthead" style="position:fixed;top:0;left:0;right:0;height:56px;background:#fff;z-index:100">
+  <a href="#rows">Skip navigation</a> <input name="search_query" placeholder="Search"> <button>Search</button>
+</div>
+<h1>Watch history</h1>
+<div id="icon"><svg width="10" height="10"><rect width="10" height="10"/></svg></div>
+<p>Today</p>
+<div id="rows"></div>
+<div id="player" hidden></div>
+<script>
+  const rows = document.getElementById('rows');
+  for (let i = 0; i < 200; i++) {
+    const d = document.createElement('p');
+    d.textContent = 'video ' + i;
+    rows.appendChild(d);
+  }
+  let n = 0;
+  setInterval(() => {
+    n++;
+    const d = document.createElement('p');
+    d.textContent = 'later video ' + n;
+    rows.appendChild(d);
+    const player = document.getElementById('player');
+    player.textContent = '';
+    player.appendChild(document.createElement('div')).textContent = 'frame ' + n;
+    const m = document.createElement('meta');
+    m.name = 'tick' + n;
+    document.head.appendChild(m);
+    const icon = document.getElementById('icon');
+    icon.replaceChildren(document.createElementNS('http://www.w3.org/2000/svg', 'svg'));
+  }, 60);
+</script>

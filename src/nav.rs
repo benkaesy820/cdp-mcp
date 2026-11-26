@@ -7,12 +7,11 @@
 
 use serde_json::{json, Value};
 
-use crate::wait::wait_idle;
+use crate::wait::{wait_idle, IDLE_MS};
 use crate::{cdp, scan_cache, scope_cache};
 
 /// How long a navigation gets to commit before the tool says what it knows.
 const COMMIT_MS: u64 = 15_000;
-const IDLE_MS: u64 = 15_000;
 
 #[derive(Clone)]
 pub(crate) enum Action {
@@ -141,10 +140,7 @@ pub(crate) fn navigate(
             // whole timeout: the dialog is already attached to this result.
             if idle && conn.dialog.is_none() {
                 match wait_idle(conn, IDLE_MS, 300) {
-                    Ok(n) => {
-                        out["idle"] = json!(true);
-                        out["resources"] = json!(n);
-                    }
+                    Ok(w) => w.put(&mut out),
                     Err(e) => {
                         // A dialog or a dead socket is not "settled": say which.
                         if let Some(d) = conn.dialog.clone() {

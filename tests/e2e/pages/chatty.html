@@ -17,10 +17,12 @@
   setInterval(() => {
     window.__ticks++;
     box.setAttribute('data-tick', String(window.__ticks));
+    // At the top, where it can be seen: a change below the fold does not
+    // keep a wait awake (never-quiet.html checks that half).
     if (window.__ticks % 2 === 0) {
       const s = document.createElement('span');
       s.textContent = ' tick ';
-      document.body.appendChild(s);
+      document.body.insertBefore(s, box);
     }
   }, 20);
 </script>

@@ -36,12 +36,12 @@ pub(crate) fn tool_defs() -> Value {
         },
         {
             "name": "idle",
-            "description": "Wait without spinning: an observer inside the page calls back the moment something changes, so a still page costs no traffic and a change is noticed in milliseconds rather than on a timer. Returns when `untilText` or `untilSelector` matches, or when the page has been still for `maxIdleMs`. The result names what changed (`appeared`, `dialogs`, `changes`, `textChars`/`textDelta`, `url`, `navigated`), so you usually do not need to scan the page afterwards. `changes` counts reports from the page, coalesced to at most one per 80 ms while it is moving, so read it as activity rather than as a mutation count. Use it instead of a sleep loop when waiting for a page.",
+            "description": "Wait without spinning: an observer inside the page calls back the moment something changes, so a still page costs no traffic and a change is noticed in milliseconds rather than on a timer. Returns when `untilText` or `untilSelector` matches, or when nothing visible has changed for `maxIdleMs`. Only on-screen changes keep it waiting: hidden elements, <head>, icon swaps and rows added below the fold do not, so pages that never stop loading (YouTube) still settle. The result names what changed (`appeared` on screen, `offScreen` below the fold, `dialogs`, `changes`, `textChars`/`textDelta`, `url`, `navigated`), so you usually do not need to scan the page afterwards. `changes` counts reports from the page, coalesced to at most one per 80 ms while it is moving, so read it as activity rather than as a mutation count. Use it instead of a sleep loop when waiting for a page.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "timeoutMs": { "type": "integer", "description": "stop waiting after this long, message or not (default 600000 = 10 min, max 900000)" },
-                    "maxIdleMs": { "type": "integer", "description": "treat the page as idle after this long with no change (defaults to timeoutMs). Values below about 100 ms are approximate: reports are coalesced" },
+                    "maxIdleMs": { "type": "integer", "description": "treat the page as idle after this long with no visible change (default 2000; with untilText or untilSelector, defaults to timeoutMs). Values below about 100 ms are approximate: reports are coalesced" },
                     "untilText": { "type": "string", "description": "also wake when this text appears" },
                     "untilSelector": { "type": "string", "description": "also wake when this CSS selector matches something, e.g. input[name=email] or [role=dialog]" },
 
@@ -68,7 +68,7 @@ pub(crate) fn tool_defs() -> Value {
                 "properties": {
                     "action": { "type": "string", "enum": ["list", "open", "close", "goto", "back", "forward", "reload"] },
                     "url": { "type": "string", "description": "for action=open or goto" },
-                    "idle": { "type": "boolean", "description": "for action=open or a navigation: also wait for loading to settle (single-page apps paint after readyState)" },
+                    "idle": { "type": "boolean", "description": "for action=open or a navigation: also wait for loading to settle (single-page apps paint after readyState). Gives up after 15 s with idle:false and a note; the page is still usable then" },
                     "ignoreCache": { "type": "boolean", "description": "for action=reload: bypass the HTTP cache" },
                     "foreground": { "type": "boolean", "description": "for action=open: bring the tab to the front and focus the browser. Default false, because activating a tab takes the keyboard away from whoever is typing." },
                     "tab": { "type": "string", "description": "the tab to act on; omit for the last tab this server used" },

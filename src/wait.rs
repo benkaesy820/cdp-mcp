@@ -154,13 +154,14 @@ fn watch_js(name: &str, until_text: Option<&str>, until_selector: Option<&str>, 
             // Negative, not zero: `performance.now()` restarts at 0 on a
             // navigation, so a first check compared against 0 could be
             // suppressed for the first 80 ms of the new document.
-            let lastSent = -1e9, lastText = -1e9, textTimer = 0, sendTimer = 0, dirty = false;
+            let lastSent = -1e9, lastText = -1e9, textTimer = 0, sendTimer = 0, asideTimer = 0, dirty = false;
             const send = (o) => {{ try {{ window[NAME](JSON.stringify(o)); }} catch (e) {{}} }};
             const stop = () => {{
                 stopped = true;
                 try {{ if (obs) obs.disconnect(); }} catch (e) {{}}
                 try {{ if (textTimer) clearTimeout(textTimer); }} catch (e) {{}}
                 try {{ if (sendTimer) clearTimeout(sendTimer); }} catch (e) {{}}
+                try {{ if (asideTimer) clearTimeout(asideTimer); }} catch (e) {{}}
                 window.__cdpWatch = null;
             }};
             const snapshot = (t, extra) => {{
@@ -263,22 +264,93 @@ fn watch_js(name: &str, until_text: Option<&str>, until_selector: Option<&str>, 
             // boundary look uses it, because stopping or installing there
             // would discard the watcher's buffered window.
             if (!{install}) return {{ r: 'miss' }};
+            // Only a change a person could see counts towards "the page is
+            // still moving". Sites like YouTube never stop rewriting icons in
+            // rows below the fold, a hidden player and <head>; counting those
+            // kept `idle` from ever returning. Hits are still checked on every
+            // batch, so a watched selector or text is never missed by this.
+            const SVGNS = 'http://www.w3.org/2000/svg';
+            // How visible a node is: 0 hidden or gone, 1 rendered but off
+            // screen, 2 on screen. `up`: an emptied or `display: contents` box
+            // has no size, so judge it by the nearest ancestor that has one. Off
+            // for a node that was just added: a row appended below the fold sits
+            // in a list that is on screen, and the row's own place is what says
+            // whether anyone can see it.
+            const shown = (el, up) => {{
+                if (!el || !el.isConnected) return 0;
+                if (el.closest('head,svg,script,style,noscript,template')) return 0;
+                if (el.checkVisibility && !el.checkVisibility({{ checkVisibilityCSS: true }})) return 0;
+                let e = el, b = e.getBoundingClientRect();
+                for (let k = 0; up && k < 3 && b.width < 1 && b.height < 1 && e.parentElement; k++) {{
+                    e = e.parentElement;
+                    b = e.getBoundingClientRect();
+                }}
+                const vh = window.innerHeight || 800, vw = window.innerWidth || 1280;
+                return b.bottom > -vh * 0.25 && b.top < vh * 1.25 && b.right > 0 && b.left < vw ? 2 : 1;
+            }};
+            // Swapping one <svg> for another is an icon repaint, not content.
+            const iconOnly = (r) => {{
+                const ns = [...r.addedNodes, ...r.removedNodes];
+                return ns.length > 0 && ns.every((n) => n.nodeType === 1
+                    ? n.namespaceURI === SVGNS
+                    : !(n.nodeValue || '').trim());
+            }};
+            // Off-screen arrivals are still news (rows a "load more" added
+            // below the fold), so they are reported, but as an aside that does
+            // not restart the quiet clock, and at most every 200 ms.
+            const aside = () => {{
+                if (asideTimer) return;
+                asideTimer = setTimeout(() => {{
+                    asideTimer = 0;
+                    if (stopped || !(added.length || addedCount || removed)) return;
+                    send(snapshot('aside'));
+                    added = [];
+                    addedCount = 0;
+                    removed = 0;
+                }}, 200);
+            }};
             obs = new MutationObserver((records) => {{
-                let moved = false;
+                let moved = false, off = false;
+                // One verdict per node per batch: a list render is hundreds
+                // of records against a handful of parents.
+                const verdict = new Map();
+                let looked = 0;
+                // Past 40 looks in one batch this is a real render, and
+                // measuring each one would cost more than it saves.
+                const seen = (el, up) => {{
+                    let v = verdict.get(el);
+                    if (v === undefined) {{
+                        v = looked++ >= 40 ? 2 : shown(el, up);
+                        verdict.set(el, v);
+                    }}
+                    return v;
+                }};
                 for (const r of records) {{
                     if (r.type === 'attributes') continue;
                     const t = r.target && r.target.nodeType === 1 ? r.target : (r.target ? r.target.parentElement : null);
                     if (t && t.closest && t.closest('script,style,noscript,template')) continue;
+                    if (r.type === 'childList' && iconOnly(r)) continue;
+                    let level = 0;
+                    if (r.type === 'childList' && r.addedNodes.length) {{
+                        for (const n of r.addedNodes) {{
+                            const v = n.nodeType === 1 ? seen(n, false)
+                                : n.nodeType === 3 && (n.nodeValue || '').trim() ? seen(t, true) : 0;
+                            if (v > level) level = v;
+                            if (level === 2) break;
+                        }}
+                    }} else {{
+                        level = seen(t, true);
+                    }}
+                    if (level === 0) continue;
+                    if (level === 2) moved = true; else off = true;
                     if (r.type === 'characterData') {{
                         // A price that changes in place has no added node; the
                         // parent's current text is the delta the caller wants.
-                        moved = true;
                         const p = r.target.parentElement;
                         const d = p ? describe(p) : null;
                         if (d && added.length < 6) added.push(d);
                         continue;
                     }}
-                    moved = true;
                     addedCount += r.addedNodes.length;
                     removed += r.removedNodes.length;
                     for (const n of r.addedNodes) {{
@@ -293,6 +365,7 @@ fn watch_js(name: &str, until_text: Option<&str>, until_selector: Option<&str>, 
                         if (d) added.push(d);
                     }}
                 }}
+                if (off && !moved) aside();
                 // An attribute change can be what makes SEL or WANT start
                 // matching, so it is only ignored when nothing is being watched
                 // for.
@@ -322,6 +395,7 @@ fn watch_js(name: &str, until_text: Option<&str>, until_selector: Option<&str>, 
 struct Settled {
     changes: u64,
     appeared: Vec<Value>,
+    off_screen: Vec<Value>,
     seen: std::collections::HashSet<String>,
     added_count: i64,
     removed: i64,
@@ -341,6 +415,13 @@ impl Settled {
     /// Fold one payload from the page into the running report.
     fn absorb(&mut self, p: &Value) {
         self.changes += 1;
+        self.take(p, false);
+    }
+
+    /// Everything `absorb` records except the change count. `aside`: the
+    /// report was of changes off screen, whose elements are listed apart so
+    /// they never push what a person can see out of `appeared`.
+    fn take(&mut self, p: &Value, aside: bool) {
         if let Some(u) = p.get("url").and_then(Value::as_str) {
             if !self.url.is_empty() && self.url != u {
                 self.navigated = true;
@@ -366,7 +447,8 @@ impl Settled {
                 // Eight named elements is the token budget for this report; past
                 // that the caller wants a scan, not a list, and `addedCount`
                 // still tells it how many actually arrived.
-                if self.appeared.len() >= 8 {
+                let (list, cap) = if aside { (&self.off_screen, 4) } else { (&self.appeared, 8) };
+                if list.len() >= cap {
                     break;
                 }
                 let key = format!(
@@ -376,7 +458,7 @@ impl Settled {
                     a.get("text").and_then(Value::as_str).unwrap_or("")
                 );
                 if self.seen.insert(key) {
-                    self.appeared.push(a.clone());
+                    if aside { &mut self.off_screen } else { &mut self.appeared }.push(a.clone());
                 }
             }
         }
@@ -436,7 +518,10 @@ impl Settled {
         if !self.appeared.is_empty() {
             o["appeared"] = json!(self.appeared);
         }
-        if self.added_count > self.appeared.len() as i64 {
+        if !self.off_screen.is_empty() {
+            o["offScreen"] = json!(self.off_screen);
+        }
+        if self.added_count > (self.appeared.len() + self.off_screen.len()) as i64 {
             o["addedCount"] = json!(self.added_count);
         }
         if self.removed > 0 {
@@ -649,6 +734,10 @@ fn wait_page_settled_inner(
     let mut first_install = true;
     let mut failing_since: Option<std::time::Instant> = None;
     let mut last_event = started;
+    // How many times the final text look has restarted the quiet clock. Text
+    // that changes where the observer cannot see it (off screen, hidden) would
+    // otherwise restart it forever on a page that never stops ticking.
+    let mut looks_moved = 0u32;
 
     // The watcher must not outlive the wait: a live observer keeps pushing into
     // a socket nobody is reading, and the next tool on this tab pays for it.
@@ -805,7 +894,14 @@ fn wait_page_settled_inner(
             if let Some(a) = conn.eval_within(VISIBLE_JS, 1_500).ok().filter(|v| v.is_array()) {
                 let len = a.get(0).and_then(Value::as_i64).unwrap_or(settled.chars);
                 let shadow = a.get(1).and_then(Value::as_i64).unwrap_or(settled.shadow_chars);
-                if (len > 0 && len != settled.chars) || shadow != settled.shadow_chars {
+                // Shadow text is the only sign a web component is still
+                // painting, so it may restart the clock a few times. Light text
+                // that moved with no visible record is almost always rows added
+                // off screen: one more window, then believe the observer.
+                let light = len > 0 && len != settled.chars;
+                let shade = shadow != settled.shadow_chars;
+                if (shade && looks_moved < 3) || (light && looks_moved < 1) {
+                    looks_moved += 1;
                     settled.chars = len;
                     settled.shadow_chars = shadow;
                     if settled.first_chars.is_none() {
@@ -823,7 +919,11 @@ fn wait_page_settled_inner(
 
             stop_watch(conn);
             let mut o = settled.report("idleLimit", &started, &last_event);
-            o["note"] = json!("nothing changed for maxIdleMs");
+            o["note"] = json!(if looks_moved > 0 {
+                "nothing visible changed for maxIdleMs; text off screen or hidden is still changing"
+            } else {
+                "nothing visible changed for maxIdleMs"
+            });
             return Ok(o);
         }
         if now >= deadline {
@@ -888,6 +988,9 @@ fn wait_page_settled_inner(
                     settled.absorb(&p);
                     last_event = std::time::Instant::now();
                 }
+                // Off screen: what arrived is reported, but the page a person
+                // sees has not moved, so the quiet clock keeps running.
+                Some("aside") => settled.take(&p, true),
                 // An unknown payload is still evidence the page moved.
                 _ => last_event = std::time::Instant::now(),
             }
@@ -895,15 +998,48 @@ fn wait_page_settled_inner(
     }
 }
 
-/// Wait until loading settles: the Performance API's resource count stops
-/// moving. Network idle without enabling the Network domain.
-pub(crate) fn wait_idle(conn: &mut cdp::Conn, ms: u64, step: u64) -> Result<i64, String> {
+/// The longest a navigation's `idle` waits. A page still moving at this point
+/// is reported as `idle: false` with its content, not waited on further.
+pub(crate) const IDLE_MS: u64 = 15_000;
+
+/// What a load wait saw.
+pub(crate) struct Idle {
+    pub resources: i64,
+    /// False when the cap ran out first: the page is usable, but still moving.
+    pub settled: bool,
+    pub chars: i64,
+}
+
+impl Idle {
+    /// The fields every caller reports, so they all say the same thing.
+    pub(crate) fn put(&self, o: &mut Value) {
+        o["idle"] = json!(self.settled);
+        o["resources"] = json!(self.resources);
+        if !self.settled {
+            o["note"] = json!(if self.chars > 0 {
+                "the page is still loading or animating, but it has content: read it now rather than waiting longer"
+            } else {
+                "the page is still loading and shows no text yet: call idle or scan again"
+            });
+        }
+    }
+}
+
+/// Wait until loading settles: the resource count stops moving for 600 ms, and
+/// then nothing visible changes for 600 ms. Network idle without enabling the
+/// Network domain; the second half matters for single-page apps, which paint
+/// long after their last bundle arrives. "Visible" is the `idle` watcher's
+/// rule, so a site that never stops rewriting rows below the fold (YouTube)
+/// still settles once what is on screen is still. At the cap the answer is
+/// `settled: false`, never a pretend idle.
+pub(crate) fn wait_idle(conn: &mut cdp::Conn, ms: u64, step: u64) -> Result<Idle, String> {
     // An open dialog blocks the renderer: the eval below would wait out the full
     // call timeout rather than fail.
     if conn.dialog.is_some() {
         return Err("dialog open: the page is blocked".into());
     }
     let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_millis(ms);
     let mut last = -1i64;
     let mut stable_ms = 0u64;
     loop {
@@ -923,11 +1059,39 @@ pub(crate) fn wait_idle(conn: &mut cdp::Conn, ms: u64, step: u64) -> Result<i64,
             stable_ms = 0;
             last = n;
         }
-        if stable_ms >= 600 || started.elapsed().as_millis() >= ms as u128 {
-            return Ok(last);
+        if stable_ms >= 600 {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(Idle { resources: n, settled: false, chars: page_chars(conn) });
         }
         nap(step)?;
     }
+    // An empty body is not a settled page unless it stays empty a while: some
+    // pages really are blank, most are still fetching.
+    loop {
+        let v = wait_page_settled(conn, None, None, std::time::Instant::now(), deadline, 600)?;
+        if conn.dialog.is_some() {
+            return Err("dialog open: the page is blocked".into());
+        }
+        let chars = v.get("textChars").and_then(Value::as_i64).unwrap_or(0);
+        let quiet = v.get("woke").and_then(Value::as_str) == Some("idleLimit");
+        let now = std::time::Instant::now();
+        if quiet && (chars > 0 || now.duration_since(started).as_millis() >= 3_000) {
+            return Ok(Idle { resources: last, settled: true, chars });
+        }
+        if now >= deadline || !quiet {
+            return Ok(Idle { resources: last, settled: false, chars: chars.max(page_chars(conn)) });
+        }
+        nap(step)?;
+    }
+}
+
+fn page_chars(conn: &mut cdp::Conn) -> i64 {
+    conn.eval("document.body ? (document.body.innerText || '').length : 0")
+        .ok()
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

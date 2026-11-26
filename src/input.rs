@@ -706,9 +706,10 @@ pub(crate) fn run_input(
             }
             if w.get("idle").and_then(Value::as_bool).unwrap_or(false) {
                 let started = std::time::Instant::now();
-                let n = wait_idle(conn, ms, 300)?;
-                log.push(json!({ "waitedFor": "idle", "resources": n,
-                                 "ms": started.elapsed().as_millis() as u64 }));
+                let w = wait_idle(conn, ms, 300)?;
+                let mut e = json!({ "waitedFor": "idle", "ms": started.elapsed().as_millis() as u64 });
+                w.put(&mut e);
+                log.push(e);
                 continue;
             }
             let text = w.get("text").and_then(Value::as_str).ok_or("wait needs text, or idle:true")?;
