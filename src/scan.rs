@@ -245,22 +245,35 @@ const COMMON_JS: &str = r##"
     }
     return true;
   };
+  // Checked before anything changes: a request for a missing option used to
+  // set the value anyway and leave the <select> with nothing selected.
   const applySelect = (el, want, out) => {
     const s = el.tagName === 'SELECT' ? el : el.closest('select');
     if (!s) { out.selectError = 'not a select'; return; }
-    if (Array.isArray(want)) {
-      const wanted = want.map(String);
-      const missing = wanted.filter((v) => ![...s.options].some((o) => o.value === v));
-      if (missing.length) { out.selectError = 'no option ' + missing.join(', '); return; }
-      if (!s.multiple && wanted.length > 1) { out.selectError = 'this <select> takes one value; it is not multiple'; return; }
-      const set = new Set(wanted);
-      for (const o of s.options) o.selected = set.has(o.value);
-    } else {
-      s.value = want;
+    const opts = [...s.options];
+    // The option's value, or the visible text the scan showed: "Pro" finds
+    // <option value="pro">Pro</option>.
+    const resolve = (w) => {
+      w = String(w);
+      const o = opts.find((o) => o.value === w) ||
+        opts.find((o) => clean(o.text, 200).toLowerCase() === w.trim().toLowerCase());
+      return o ? o.value : null;
+    };
+    const list = Array.isArray(want) ? want : [want];
+    const vals = list.map(resolve);
+    const missing = list.filter((w, k) => vals[k] === null);
+    if (missing.length) {
+      const known = opts.slice(0, 12).map((o) => { const t = clean(o.text, 30); return o.value === t ? t : t + '=' + o.value; });
+      out.selectError = 'no option ' + missing.join(', ') + ' (options: ' + known.join(', ') + (opts.length > 12 ? ', …' : '') + ')';
+      return;
     }
+    if (Array.isArray(want) && !s.multiple && vals.length > 1) { out.selectError = 'this <select> takes one value; it is not multiple'; return; }
+    if (Array.isArray(want)) { const set = new Set(vals); for (const o of opts) o.selected = set.has(o.value); }
+    else s.value = vals[0];
     s.dispatchEvent(new Event('input', { bubbles: true }));
     s.dispatchEvent(new Event('change', { bubbles: true }));
-    out.selected = Array.isArray(want) ? [...s.options].filter((o) => o.selected).map((o) => o.value) : s.value;
+    out.asked = Array.isArray(want) ? vals : vals[0];
+    out.selected = Array.isArray(want) ? opts.filter((o) => o.selected).map((o) => o.value) : s.value;
   };
 "##;
 
@@ -1250,9 +1263,11 @@ pub(crate) fn frame_click(
 /// A React app mid-hydration and a genuinely empty document both return no
 /// elements. What tells them apart is how much DOM exists: a page still being
 /// built has nodes but no interactive ones yet, while a truly empty document has
-/// almost nothing at all.
+/// almost nothing at all. Only an empty list is suspect: a small page with one
+/// or two controls is real, and calling it "still rendering" sent agents into
+/// wait-and-rescan loops.
 pub(crate) fn suspect_render(total: u64, nodes: u64) -> bool {
-    total < 3 && nodes < 400
+    total == 0 && nodes < 400
 }
 
 /// Keys `scan_with_frames` and the scanner keep for the click path. They are
@@ -1323,8 +1338,8 @@ pub(crate) fn element_line(e: &Value, dupes: usize) -> String {
         }
     }
     match e.get("selected") {
-        Some(Value::String(v)) => flags.push(format!("selected={v}")),
-        Some(Value::Array(a)) => flags.push(format!(
+        Some(Value::String(v)) if !v.is_empty() => flags.push(format!("selected={v}")),
+        Some(Value::Array(a)) if !a.is_empty() => flags.push(format!(
             "selected={}",
             a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(",")
         )),
@@ -1594,7 +1609,9 @@ fn build(scan_v: &Value, previous: &Value, a: Shape) -> Value {
     // A near-empty scan on a document with almost nothing in it is usually a
     // page that has not painted yet, not an empty page. Never for a scope that
     // missed: that answer is already exact.
-    if !scope_missing && suspect_render(total as u64, scan_v.get("nodes").and_then(Value::as_u64).unwrap_or(0)) {
+    // Judged on the whole scan, not the viewport slice: nothing on screen
+    // after a scroll is an answer, not a page still loading.
+    if !scope_missing && suspect_render(raw.len() as u64, scan_v.get("nodes").and_then(Value::as_u64).unwrap_or(0)) {
         o.insert("suspect".into(), json!("page may still be rendering: few nodes, no elements"));
     }
     o.insert("elements".into(), Value::Array(shown));
@@ -1746,6 +1763,7 @@ mod tests {
         assert!(!suspect_render(0, 812));
         assert!(!suspect_render(2, 900));
         assert!(!suspect_render(5, 100));
+        assert!(!suspect_render(2, 100), "a two-button page is a page");
     }
 
     #[test]
@@ -1759,6 +1777,8 @@ mod tests {
         assert_eq!(element_line(&json!({ "i": 3, "tag": "a", "role": "link", "label": "Reply" }), 7),
                    "3 link Reply · ×7");
         assert_eq!(element_line(&json!({ "i": 4, "tag": "summary", "label": "" }), 1), "4 summary (no label)");
+        assert_eq!(element_line(&json!({ "i": 5, "tag": "select", "role": "combobox", "label": "Tags", "selected": [] }), 1),
+                   "5 combobox Tags", "an empty selection is no flag");
     }
 
     #[test]

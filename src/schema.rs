@@ -276,6 +276,22 @@ mod tests {
         }
     }
 
+    // The skill is what a model reads before its first call. A tool it does not
+    // name does not exist for that model, and a removed one it still names is a
+    // call that fails.
+    #[test]
+    fn the_skill_names_every_tool_and_no_removed_one() {
+        let skill = include_str!("../.claude/skills/cdp-mcp/SKILL.md");
+        for t in tool_defs().as_array().unwrap() {
+            let name = t["name"].as_str().unwrap();
+            assert!(skill.contains(&format!("`{name}")) || skill.contains(&format!("**`{name}")),
+                    "the skill never mentions the {name} tool");
+        }
+        for gone in ["`batch`", "`report`", "`images`", "`clip`"] {
+            assert!(!skill.contains(gone), "the skill still names removed tool {gone}");
+        }
+    }
+
     // The catalog is sent on every turn, so its size is a standing cost, not a
     // detail. These ceilings exist to make growth visible in the commit that
     // causes it: raise a number here deliberately, never drift past it.

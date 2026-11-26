@@ -1199,6 +1199,14 @@ await withTab(`http://localhost:${fport}/select`, async (tab) => {
   check("a missing option is named, not ignored",
         !missing.ok && /no option z/.test(String(missing.v)), String(missing.v).slice(0, 140));
 
+  const byText = await s.tool("input", { tab, actions: [{ select: { i: at("Plan")?.i, value: "Pro" } }] });
+  check("a select takes the visible text the scan showed",
+        byText.ok && byText.v?.log?.[0]?.selected?.value === "pro", byText.v);
+  const wrong = await s.tool("input", { tab, actions: [{ select: { i: at("Plan")?.i, value: "Enterprise" } }] });
+  const kept = (await s.tool("eval", { tab, expression: "document.querySelectorAll('select')[1].value" })).v?.value;
+  check("a missing option names the options and leaves the selection alone",
+        !wrong.ok && /options: Free=free, Pro=pro/.test(String(wrong.v)) && kept === "pro", { v: String(wrong.v).slice(0, 160), kept });
+
   const single = await s.tool("input", { tab, actions: [{ select: { i: at("Plan")?.i, value: ["free", "pro"] } }] });
   check("two values on a single select are refused",
         !single.ok && /takes one value/.test(String(single.v)), String(single.v).slice(0, 140));

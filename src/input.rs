@@ -685,14 +685,18 @@ pub(crate) fn run_input(
                     return Err(format!("select failed: {e}"));
                 }
                 let got = f.get("selected").cloned().unwrap_or(Value::Null);
-                selected_entry(i, &value, got, true)?
+                // What the page resolved the request to: visible text names an
+                // option as well as its value does.
+                let asked = f.get("asked").cloned().unwrap_or_else(|| value.clone());
+                selected_entry(i, &asked, got, true)?
             } else {
                 let at = pick(conn, scope, i, false, Some(&value))?;
                 if let Some(e) = at.get("selectError").and_then(Value::as_str) {
                     return Err(format!("select failed: {e}"));
                 }
                 let got = at.get("selected").cloned().unwrap_or(Value::Null);
-                selected_entry(i, &value, got, false)?
+                let asked = at.get("asked").cloned().unwrap_or_else(|| value.clone());
+                selected_entry(i, &asked, got, false)?
             };
             log.push(json!({ "selected": entry }));
         } else if let Some(w) = obj.get("wait") {
