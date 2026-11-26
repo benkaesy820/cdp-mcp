@@ -642,6 +642,8 @@ pub struct Conn {
     /// The socket itself failed (closed, reset). A timeout does not set this:
     /// a busy page is still connected and its late reply is skipped by id.
     pub dead: bool,
+    /// The tab this connection drives, set by `with_conn` before each call.
+    pub tab: String,
     /// Replies received. `with_conn` compares it across a failure to know
     /// whether anything reached the page before the socket died, which is the
     /// only case where running the caller's actions again is safe.
@@ -798,7 +800,7 @@ impl Conn {
         // Bounded so a stuck page cannot hang an agent that was left alone.
         // Configurable per profile with `call_timeout_ms`.
         let ms = timeout_from_env();
-        let mut conn = Conn { ws, next: 0, focus_on: false, timeout_ms: ms, dead: false, replies: 0,
+        let mut conn = Conn { ws, next: 0, focus_on: false, timeout_ms: ms, dead: false, tab: String::new(), replies: 0,
                               oopifs: Vec::new(), auto_attach: false, runtime_on: false,
                               binding: None, timed_out: false, contexts_cleared: false,
                               receipts: None, page_on: false, dialog: None, dialog_seq: 0, network_on: false,

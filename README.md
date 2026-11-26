@@ -36,9 +36,12 @@ Draft and anything contenteditable ignore synthetic DOM events; real events are
 accepted because they *are* real events.
 
 **References that cannot go stale.** `elements` returns every visible interactive
-element with a label and a clickable centre. `input {click:{i}}` re-resolves that
-index at click time — scrolling it into view, re-measuring, hit-testing what is
-actually on top — so an old list can never click the wrong thing.
+element as one line — `7 button icon:menu · header collapsed popup=menu` — and the
+menus, drawers and closed sections the page hides, with the index that opens each.
+`input {click:{i}}` re-resolves that index at click time — scrolling it into view,
+re-measuring, hit-testing what is actually on top — and checks it still names the
+element the scan showed: if the page inserted something above it, the click finds
+it again by name or refuses, instead of landing on whatever moved into its place.
 
 ## Install
 
@@ -178,8 +181,8 @@ Fourteen. Each resolves its own tab, so nothing has to be called first.
 |---|---|
 | `status` | browser, protocol, every page tab with its handle; a doctor result (`up:false`, why, and whether launching is allowed) when CDP is down. `inUse:true` adds whether a page this server did not open has focus |
 | `tabs` | `list` · `open {url}` (background) · `close` · `goto` · `back` · `forward` · `reload` |
-| `elements` | visible interactive elements with `{i, tag, role, label, x, y}` — through shadow roots, same-origin and cross-origin frames; plus `overlays`, `media`, `scroll`, form state, `capped` and a `hint` |
-| `text` | the page as readable text, top to bottom; `within` a selector, `limit` characters |
+| `elements` | visible interactive elements as `i role label · flags` lines (region, state, value) — through shadow roots, same-origin and cross-origin frames; plus `collapsed` (hidden menus and what opens them), `overlays`, `media`, `scroll`, `capped` and a `hint`. `full:true` returns JSON records with coordinates |
+| `text` | the page as readable text, top to bottom: `<main>` and any open dialog by default, `within` a selector, `limit` characters |
 | `input` | real input in order, in one call: click, type, key, scroll, select, hover, drag, touch, dismiss, wait |
 | `eval` | evaluate JavaScript in the page, return JSON, awaits promises |
 | `flow` | run steps server-side and repeat until a condition holds — N acts for one turn |
@@ -192,9 +195,43 @@ Fourteen. Each resolves its own tab, so nothing has to be called first.
 | `emulate` | device metrics, scale, touch and media state; `reset` restores the table |
 
 Indexes are re-resolved at click time, so they cannot go stale between the scan
-and the click. `within` scopes a scan to a subtree; `find` filters by label;
-`limit` caps the list (default 120, scan cap 600, reported as `capped` with a hint
-telling you how to narrow it).
+and the click. `within` scopes a scan to a subtree; `find` filters by label (and
+lists every repeat, which the default shows once as `×N`); `limit` caps the list
+(default 120, scan cap 600, reported as `capped` with a hint telling you how to
+narrow it). Fields that would be empty, `null` or `false` are left out.
+
+### Reading an `elements` answer
+
+```json
+{ "elements": [
+    "0 button icon:menu · header collapsed",
+    "4 link Products · nav",
+    "7 checkbox Account · nav unchecked",
+    "9 textbox Email · required value=a@b.c",
+    "11 tab Tab A · current",
+    "14 button Reply · ×2" ],
+  "collapsed": [
+    "drawer of 4 (Home | Settings | Billing | Sign out) — opened by 0 button icon:menu",
+    "menu of 2 (Laptops | Phones) — opened by 4 link Products" ] }
+```
+
+- **Names** come from what a person sees: `aria-label`, `aria-labelledby`, a
+  field's `<label>`, visible text (a card by its heading), an image's `alt` or an
+  `<svg><title>`, then `title` and `placeholder`. Icon-only controls are named by
+  their icon class (`icon:menu`, `icon:search`, `icon:close`). A field keeps its
+  name while you type into it.
+- **Flags**: the region (`nav`, `header`, `footer`, `aside`, `dialog`, `search`;
+  none means main content), `off` (needs scrolling), `frame=host`, `disabled`,
+  `checked`/`unchecked`, `collapsed`/`expanded`, `popup=`, `current`, `pressed`,
+  `required`, `invalid`, `selected=`, `value=` (passwords masked).
+- **`collapsed`** is what the page keeps hidden — `display:none` and
+  `visibility:hidden` menus, off-canvas drawers parked beside the viewport,
+  closed `<details>`, checkbox-driven menus — with a sample of the items, read
+  without opening anything, and the opener: wired through `aria-controls`, a
+  `<summary>`, the trigger just before it, or the label of a hidden checkbox.
+  `maybe opened by` marks a guess (the page's only menu button).
+- **A hidden checkbox or radio** (custom-styled toggles) is listed through the
+  `<label>` that stands in for it, since that is what a person clicks.
 
 ### `input` actions
 
@@ -288,8 +325,9 @@ new process.
 ## Cost
 
 Measured on the development machine (medians): `eval` ~2 ms, `status` ~5 ms, a
-click ~17 ms, a full `elements` scan ~28 ms and ~8 KB of JSON instead of 1.5 MB of
-HTML. The tool catalogue is ~18 KB of schema; the CLI exists so a long session can
+click ~17 ms, a full `elements` scan ~30 ms in the page. The default answer for a
+Wikipedia article is 4.6 KB (was 12.5 KB), GitHub's repository page 5.5 KB (was
+14.6 KB), against 1.5 MB of HTML. The tool catalogue is ~18 KB of schema; the CLI exists so a long session can
 avoid paying for it on every turn. `flow` runs a loop server-side, so a hundred
 clicks cost one model turn; `idle` waits without spending one.
 

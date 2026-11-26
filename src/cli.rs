@@ -147,7 +147,7 @@ pub(crate) fn run(cfg: &Cfg, argv: &[String]) -> i32 {
         }
         "find" => {
             let q = pos.first().ok_or("find needs text")?;
-            let mut args = with_tab(json!({ "limit": 30, "find": q }))?;
+            let mut args = with_tab(json!({ "limit": 30, "find": q, "full": true }))?;
             args["find"] = json!(q);
             crate::call_tool(cfg, "elements", &args)
         }

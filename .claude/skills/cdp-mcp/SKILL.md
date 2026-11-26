@@ -160,8 +160,16 @@ Flags, anywhere after the verb: `--tab t1|id`, `--json` (raw payload),
   `cdp-mcp setup`.
 - **Read with `find`, not with `read`, when you know what you want.** A full page
   can be thousands of tokens; three matching nodes are tens.
-- **`read` starts at the top of the body**, so it includes site chrome. If the
-  first lines are a menu, use the MCP `text {within:"main"}` or filter.
+- **`read` starts at `<main>`** when the page has one, plus any open dialog, so
+  site chrome is left out; `text {within:"body"}` reads everything.
+- **Hidden navigation is already in the scan.** `collapsed` lists each closed
+  menu, drawer and `<details>` with its items and the index that opens it, so a
+  hamburger does not need a click-and-rescan to find out what is behind it.
+- **An `elements` line is `i role label · flags`.** `collapsed`/`expanded`,
+  `checked`, `current`, `required`, `value=` and the region (`nav`, `header`, …)
+  are in the flags; `×N` means a label repeats (`find` lists every one); `full:true`
+  gives JSON records with coordinates. A click refuses with `not what the last
+  scan showed` when the page changed under an index: scan again.
 - **Errors are one line and name the fix** (`unknown tab handle t9; run status`,
   `no browser is publishing a DevTools endpoint`). Do not retry blindly: the
   message says what to change.

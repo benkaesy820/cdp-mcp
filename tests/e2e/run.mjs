@@ -466,7 +466,7 @@ await withTab(page("frames.html?port=" + fport), async (tab, ev) => {
   const scopedFrame = (await s.tool("elements", { tab, within: "body", limit: 999 })).v;
   const sfEls = scopedFrame.elements || [];
   check("a scoped scan leaves cross-origin frames out",
-        scopedFrame.framesScanned === 0 &&
+        !scopedFrame.framesScanned &&
         sfEls.some(e => (e.label || "").trim() === "Top button") &&
         !sfEls.some(e => /Cross far|Reject all/.test(e.label || "")),
         { framesScanned: scopedFrame.framesScanned, labels: sfEls.map(e => e.label).slice(0, 10) });
@@ -771,7 +771,7 @@ await withTab(`http://localhost:${fport}/many`, async (tab) => {
         { capped: def.capped, cap: def.cap, total: def.total, shown: def.shown });
   const lifted = (await s.tool("elements", { tab, limit: 700 })).v;
   check("a limit above 600 lifts the cap",
-        lifted.capped === false && lifted.cap === 700 && lifted.total === 650,
+        !lifted.capped && lifted.total === 650 && lifted.shown === 650,
         { capped: lifted.capped, cap: lifted.cap, total: lifted.total, shown: lifted.shown });
 });
 
@@ -1562,7 +1562,7 @@ await withTab(`http://127.0.0.1:${rport}/sprint2`, async (tab, ev) => {
         { name: f("Name"), secret: f("Secret"), agree: f("Agree"), plan: f("Plan") });
 
   check("a scoped scan echoes its scope",
-        form.scope === "#modal-form" && form.scopeMissing === false,
+        form.scope === "#modal-form" && !form.scopeMissing,
         { scope: form.scope, scopeMissing: form.scopeMissing });
 
   // A scope that matches nothing must not come back as the whole page: that is
@@ -1570,7 +1570,7 @@ await withTab(`http://127.0.0.1:${rport}/sprint2`, async (tab, ev) => {
   const miss = (await s.tool("elements", { tab, within: "#not-mounted", limit: 99 })).v;
   check("a scope that matches nothing returns no elements, not the whole page",
         (miss.elements || []).length === 0 && miss.total === 0 && miss.scopeMissing === true &&
-        miss.suspect === null,
+        miss.suspect == null,
         { total: miss.total, scopeMissing: miss.scopeMissing, suspect: miss.suspect,
           labels: (miss.elements || []).map(e => e.label) });
 
@@ -1600,8 +1600,8 @@ await withTab(`http://127.0.0.1:${rport}/sprint2`, async (tab, ev) => {
   const emptyScope = (await s.tool("elements", { tab, within: "", limit: 999 })).v;
   const emptyText = (await s.tool("text", { tab, within: "" })).v;
   check("an empty within means the whole page",
-        emptyScope.scope === null && emptyScope.scopeMissing === false && emptyScope.total > 0 &&
-        (emptyText.text || "").length > 0 && emptyText.scopeMissing === false,
+        emptyScope.scope == null && !emptyScope.scopeMissing && emptyScope.total > 0 &&
+        (emptyText.text || "").length > 0 && !emptyText.scopeMissing,
         { scope: emptyScope.scope, scopeMissing: emptyScope.scopeMissing, total: emptyScope.total, chars: emptyText.chars });
 
   const badWithin = await s.tool("text", { tab, within: 5 });
@@ -1647,6 +1647,100 @@ for (const [fixture, clears] of [["ad-overlay.html", true], ["dialog-overlay.htm
     }
   });
 }
+
+// ---- hidden navigation, names, and indexes that move ----------------------
+// Agents were blind to everything a page keeps closed: a hamburger read as an
+// unlabelled button, its drawer did not exist, an off-canvas sidebar was listed
+// as clickable at x = -247, and a click by index went wherever the index now
+// pointed after the page inserted something above it.
+await withTab(page("nav.html"), async (tab, ev) => {
+  const v = (await s.tool("elements", { tab, full: false })).v;
+  const lines = v.elements || [];
+  const line = re => lines.find(l => re.test(l)) || "";
+  check("a hamburger is named by its icon and says it is collapsed",
+        /^0 button icon:menu · header collapsed/.test(lines[0] || ""), lines[0]);
+  check("icon-only controls are named by icon class, svg title and img alt",
+        /button icon:search/.test(line(/icon:search/)) && !!line(/ Notifications/) && !!line(/link Cart/), lines.slice(0, 6));
+  check("a × button with a title is named by the title",
+        !!line(/button Delete · header/), lines.slice(0, 6));
+  check("fields are named by their label, not their value",
+        /textbox Email · required/.test(line(/Email/)) && !!line(/textbox Search site/), lines);
+  check("the active tab is marked current", /tab Tab A · current/.test(line(/Tab A/)), line(/Tab A/));
+  check("a card is named by its heading", !!line(/ Card one$/), line(/Card/));
+  check("a hidden checkbox is reached through its label",
+        /checkbox Account · nav unchecked/.test(line(/Account/)) && /checkbox Remember me · unchecked/.test(line(/Remember/)),
+        [line(/Account/), line(/Remember/)]);
+  check("repeated labels collapse with a count", /button Reply · ×2/.test(line(/Reply/)), line(/Reply/));
+  check("main content carries no region and the footer does", /link About us · footer/.test(line(/About/)), line(/About/));
+  check("an off-canvas drawer is not listed as clickable", !lines.some(l => /Offcanvas/.test(l)), lines);
+  check("an off-canvas drawer is not an overlay", !(v.overlays || []).length, v.overlays);
+  const col = v.collapsed || [];
+  const has = re => col.find(c => re.test(c)) || "";
+  check("the hamburger's drawer is listed with its items and its opener",
+        /^drawer of 4 \(Home \| Settings \| Billing \| Sign out\) — opened by 0 button icon:menu/.test(has(/Home/)), col);
+  check("a hover mega-menu is listed under the link that opens it",
+        /\(Laptops \| Phones\) — opened by \d+ link Products/.test(has(/Laptops/)), col);
+  check("a checkbox-driven menu is opened by its label",
+        /\(Profile \| Log out\) — opened by \d+ checkbox Account/.test(has(/Profile/)), col);
+  check("a closed details lists its contents", /details of 2 \(Red \| Blue\) — opened by \d+ summary More filters/.test(has(/Red/)), col);
+  check("an unwired off-canvas drawer is listed with a guessed opener",
+        /drawer of 2 \(Offcanvas one \| Offcanvas two\) — maybe opened by/.test(has(/Offcanvas/)), col);
+  check("the line format is a fraction of the records",
+        JSON.stringify(v).length * 2 < JSON.stringify((await s.tool("elements", { tab, full: true })).v).length,
+        JSON.stringify(v).length);
+
+  // Opening the hamburger shows up as exactly the drawer's links.
+  await s.tool("elements", { tab, full: false });
+  await s.tool("input", { tab, actions: [{ click: { i: 0 } }] });
+  const d = (await s.tool("elements", { tab, full: false, mode: "delta" })).v;
+  check("opening the hamburger adds its four links to a delta",
+        d.addedCount === 4 && (d.added || []).every(l => /link (Home|Settings|Billing|Sign out) · aside/.test(l)), d.added);
+  // Open, the drawer covers its own button: close it the way a page script would.
+  await ev("drawer.classList.remove('open')");
+
+  // A scroll moves every coordinate; it is not a change.
+  await s.tool("elements", { tab });
+  await ev("scrollBy(0, 40)");
+  const ds = (await s.tool("elements", { tab, mode: "delta" })).v;
+  check("a delta after a scroll reports nothing added or removed",
+        ds.addedCount === 0 && ds.removedCount === 0, { added: ds.addedCount, removed: ds.removedCount });
+  await ev("scrollTo(0, 0)");
+
+  // An index the page moved: re-found by name, and the log says so.
+  const els = (await s.tool("elements", { tab })).v.elements;
+  const pricing = els.find(e => e.label === "Pricing").i;
+  await ev("document.querySelector('header').prepend(Object.assign(document.createElement('button'), { textContent: 'Promo banner' }))");
+  const moved = await s.tool("input", { tab, actions: [{ click: { i: pricing } }] });
+  const entry = ((moved.v || {}).log || [])[0]?.clicked || {};
+  check("a click whose index moved lands on the element the caller saw",
+        moved.ok && (await ev("document.body.dataset.clicked")) === "pricing" &&
+        entry.remapped?.from === pricing && entry.remapped?.to === pricing + 1, { entry, v: String(moved.v).slice(0, 160) });
+
+  // Which of two equal labels was meant cannot be told once one is gone.
+  const els2 = (await s.tool("elements", { tab, unique: false })).v.elements;
+  const second = els2.filter(e => e.label === "Reply")[1].i;
+  await ev("document.querySelector('main button').remove()");
+  const gone = await s.tool("input", { tab, actions: [{ click: { i: second } }] });
+  check("a click whose element is ambiguous after a change is refused",
+        !gone.ok && /not what the last scan showed/.test(String(gone.v)) &&
+        (await ev("document.body.dataset.clicked")) === "pricing", String(gone.v).slice(0, 200));
+
+  const t = (await s.tool("text", { tab })).v;
+  check("text reads <main> by default, without the navigation around it",
+        t.within === "main" && /Readable main text/.test(t.text) && !/Products/.test(t.text), { within: t.within, head: (t.text || "").slice(0, 80) });
+  const whole = (await s.tool("text", { tab, within: "body" })).v;
+  check("text within body still reads everything", /Products/.test(whole.text) && /About us/.test(whole.text), whole.within);
+});
+
+await withTab(page("book-overlay.html"), async (tab, ev) => {
+  const v = (await s.tool("elements", { tab, full: false })).v;
+  check("an overlay lists only whole-word closers",
+        (v.overlays || []).length === 1 && /closers: \d+ OK$/.test(v.overlays[0]), v.overlays);
+  await s.tool("input", { tab, actions: [{ dismiss: { prefer: "accept" } }] });
+  check("dismiss does not click Book now or Explore", (await ev("document.body.dataset.clicked")) === "ok",
+        await ev("document.body.dataset.clicked"));
+});
+
 
 s.close();
 console.log(failed ? `\n${failed} failed` : "\nall passed");

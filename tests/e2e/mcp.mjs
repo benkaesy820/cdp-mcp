@@ -11,6 +11,9 @@ export function server(bin) {
   const rpc = (method, params) => new Promise(r => { const i = ++id; pend.set(i, r); p.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: i, method, params }) + "\n"); });
   const notify = (method, params) => p.stdin.write(JSON.stringify({ jsonrpc: "2.0", method, params }) + "\n");
   const tool = async (name, args = {}) => {
+    // The checks read element records; the line format has its own checks,
+    // which pass `full: false` explicitly.
+    if (name === "elements" && !("full" in args)) args = { ...args, full: true };
     const t = performance.now(); const m = await rpc("tools/call", { name, arguments: args }); const ms = performance.now() - t;
     const txt = m.result?.content?.[0]?.text ?? JSON.stringify(m.error);
     let v; try { v = JSON.parse(txt); } catch { v = txt; }

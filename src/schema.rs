@@ -125,14 +125,14 @@ pub(crate) fn tool_defs() -> Value {
         },
         {
             "name": "elements",
-            "description": "Scan the page: `overlays` lists dialogs/modals/cookie walls with their dismiss buttons, and `elements` lists visible interactive nodes with a clickable index `i` and centre point; `capped` says the scan stopped at its cap (600; `limit` above 600 lifts it, up to 2000) with matches left. Filter with `find` and cap with `limit` to keep the payload small. Indexes are absolute in the unfiltered list and are re-resolved at click time, so they cannot silently go stale. A cross-origin frame element is listed with its `frame` and acted on inside that frame's own session: click re-resolves it live (scrolling the frame if needed), and hover and select route into the frame too; `paste` resolves indexes in the main document. Form controls carry `value` (passwords masked), `checked`, `selected`, `disabled`; `within` scopes the scan to a selector in the main document (cross-origin frame elements are left out), the result echoes `scope`, and a selector that matches nothing returns no elements with `scopeMissing: true` instead of the whole page, and `overlays` stay page-wide and are still reported.",
+            "description": "Scan the page for what can be acted on. Each `elements` line is `i role label · flags`; `i` is what every tool takes, and a click checks it still names that element (re-found or refused if the page moved it). Flags: region (nav/header/footer/aside/dialog/search; none = main content), off (needs scrolling), frame=host, disabled, checked/unchecked, collapsed/expanded, popup=, current, pressed, required, invalid, selected=, value= (passwords masked), ×N (repeated label shown once; `find` lists all). `collapsed` lists hidden menus, drawers and closed sections with their items and the index that opens them; `overlays` lists dialogs and cookie walls with closer indexes. `full: true` returns JSON records with x,y,w,h instead. `capped` means the scan stopped at 600 (`limit` above 600 lifts it, max 2000). `within` scopes to a CSS selector in the main document (cross-origin frames left out; a miss returns `scopeMissing`, overlays stay page-wide).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "tab": { "type": "string" },
                     "find": { "type": "string", "description": "only elements whose label contains this text (case-insensitive)" },
                     "limit": { "type": "integer", "description": "max elements to return (default 120)" },
-                    "full": { "type": "boolean", "description": "include width and height" },
+                    "full": { "type": "boolean", "description": "JSON records with coordinates instead of lines" },
                     "mode": { "type": "string", "enum": ["full", "viewport", "delta"],
                               "description": "full = everything; viewport = only what is on screen; delta = only what changed since the previous scan (use after a click)" },
                     "shot": { "type": "string", "enum": ["none", "viewport", "full", "custom"],
@@ -141,19 +141,19 @@ pub(crate) fn tool_defs() -> Value {
                                 "properties": { "x": {"type":"number"}, "y": {"type":"number"}, "w": {"type":"number"}, "h": {"type":"number"} } },
                     "shotMaxWidth": { "type": "integer", "description": "downscale the attached capture to this width (default 1024)" },
                     "shotFormat": { "type": "string", "enum": ["jpeg", "png", "webp"], "description": "format of the attached capture (default jpeg)" },
-                    "unique": { "type": "boolean", "description": "collapse elements that share a label (repeated nav links)" },
+                    "unique": { "type": "boolean", "description": "show a repeated label once with ×N (default true unless find is set)" },
                     "within": { "type": "string", "description": "CSS selector to scope the scan, e.g. \"main\" — much cheaper on big pages" },
-                    "role": { "type": "string", "description": "only elements with this aria role or tag, e.g. button, link, input" }
+                    "role": { "type": "string", "description": "only elements with this aria role or tag, e.g. button, link, textbox" }
                 }
             }
         },
         {
             "name": "text",
-            "description": "The page as readable text, top to bottom: headings, labels, paragraphs, list items. Use this to find out what a page says or to confirm a sentence is there; use `elements` for what can be clicked. `within` scopes it to a CSS selector in the main document (main, article, [role=dialog]); a selector that matches nothing returns empty text with `scopeMissing: true`, and an invalid selector is an error. `limit` caps characters (default 4000). `frames: true` appends the readable text of visible cross-origin iframes, each labeled with its host.",
+            "description": "The page as readable text, top to bottom. Use this to find out what a page says; use `elements` for what can be clicked. Without `within` it reads <main> when the page has one with real content, plus any open dialog, and echoes what it read in `within`; `within: \"body\"` reads everything. A selector that matches nothing returns empty text with `scopeMissing: true`; an invalid one is an error. `limit` caps characters (default 4000). `frames: true` appends the readable text of visible cross-origin iframes, each labeled with its host.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "within": { "type": "string", "description": "CSS selector to read, default body" },
+                    "within": { "type": "string", "description": "CSS selector to read (default: main, else body)" },
                     "limit": { "type": "integer", "description": "max characters to return (default 4000)" },
                     "frames": { "type": "boolean", "description": "also include readable text from visible cross-origin iframes, labeled with the frame's host (default false)" },
                     "tab": { "type": "string" }

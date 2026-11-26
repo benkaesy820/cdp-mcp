@@ -220,6 +220,7 @@ pub(crate) fn with_conn_retry<R>(
     // this call decides anything, and an idle-dead socket fails here, where the
     // retry below handles it.
     let mut attempt = |conn: &mut cdp::Conn, tab_id: &str| -> Result<R, String> {
+        conn.tab = tab_id.to_string();
         conn.drain_arrived()?;
         conn.enable_page()?;
         conn.cleanup_domains()?;

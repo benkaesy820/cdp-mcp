@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 
 use crate::cdp;
 use crate::scan;
-use crate::scan::{frame_click, frame_target, pick, scan_js};
+use crate::scan::{frame_click, frame_target, pick};
 use crate::scroll;
 use crate::wait::{wait_for_text, wait_idle};
 use crate::{check_cancel, nap, scope_for, MAX_WAIT_MS};
@@ -28,6 +28,17 @@ pub(crate) fn irreversible(label: &str) -> bool {
      "place order", "confirm", "submit order"]
         .iter()
         .any(|w| l == *w || l.starts_with(&format!("{w} ")) || l.ends_with(&format!(" {w}")))
+}
+
+/// Does `label` contain `phrase` as whole words? "ok" is in "OK" and "Ok, got
+/// it" but not in "Book now" or "Facebook", which a substring match clicked.
+pub(crate) fn has_words(label: &str, phrase: &str) -> bool {
+    let word = |c: char| c.is_alphanumeric();
+    label.match_indices(phrase).any(|(at, m)| {
+        let before = label[..at].chars().next_back();
+        let after = label[at + m.len()..].chars().next();
+        !before.is_some_and(word) && !after.is_some_and(word)
+    })
 }
 
 /// Refuse a second click on the same final confirmation in one run, unless the
@@ -205,7 +216,12 @@ pub(crate) fn click_log(at: &Value) -> Value {
         c["scrolled"] = json!(true);
     }
     if at.get("hit").and_then(Value::as_bool) == Some(false) {
-        c["covered"] = at.get("coveredBy").cloned().unwrap_or(json!(true));
+        c["covered"] = at.get("blocker").cloned().unwrap_or(json!(true));
+    }
+    // The index moved because the page changed above it; the click went to
+    // the element the caller saw, at its new index.
+    if let Some(r) = at.get("remapped") {
+        c["remapped"] = r.clone();
     }
     c
 }
@@ -457,9 +473,7 @@ pub(crate) fn run_input(
                             i,
                             at.get("tag").unwrap_or(&Value::Null),
                             at.get("label").unwrap_or(&Value::Null),
-                            at.get("blocker").cloned()
-                                .or_else(|| at.get("coveredBy").cloned())
-                                .unwrap_or(Value::Null),
+                            at.get("blocker").cloned().unwrap_or(Value::Null),
                             false,
                         ));
                     }
@@ -562,7 +576,7 @@ pub(crate) fn run_input(
             let prefer = d.get("prefer").and_then(Value::as_str).unwrap_or("reject").to_lowercase();
             // Closer indexes come from a whole-document scan, so they are
             // clicked in that same (unscoped) scan below.
-            let scan_v = conn.eval(&scan_js(None, 600))?;
+            let scan_v = conn.eval(&scan::dismiss_scan_js())?;
             let overlays = scan_v.get("overlays").and_then(Value::as_array).cloned().unwrap_or_default();
             let mut cands: Vec<(String, i64)> = Vec::new();
             for o in &overlays {
@@ -591,8 +605,8 @@ pub(crate) fn run_input(
             let want: &[&str] = if prefer == "accept" { &acceptish } else { &refuse };
             let pick_c = cands
                 .iter()
-                .find(|(l, _)| want.iter().any(|w| l.contains(w)))
-                .or_else(|| cands.iter().find(|(l, _)| acceptish.iter().any(|w| l.contains(w))));
+                .find(|(l, _)| want.iter().any(|w| has_words(l, w)))
+                .or_else(|| cands.iter().find(|(l, _)| acceptish.iter().any(|w| has_words(l, w))));
             match pick_c {
                 Some((label, idx)) => {
                     let i = *idx as u64;
@@ -1058,6 +1072,17 @@ mod tests {
         assert!(check_irreversible(&tab, "Publish", 7, false).is_err());
         // force still lifts it.
         check_irreversible(&tab, "Publish", 7, true).unwrap();
+    }
+
+    #[test]
+    fn dismiss_matches_whole_words_only() {
+        for (l, w) in [("ok", "ok"), ("ok, got it", "got it"), ("reject all", "reject"), ("×", "×"),
+                       ("only necessary", "necessary")] {
+            assert!(has_words(l, w), "{l} / {w}");
+        }
+        for (l, w) in [("book now", "ok"), ("facebook", "ok"), ("unlock", "ok"), ("closet", "close")] {
+            assert!(!has_words(l, w), "{l} / {w}");
+        }
     }
 
     #[test]

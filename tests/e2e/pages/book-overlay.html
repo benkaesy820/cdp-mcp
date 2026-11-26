@@ -1,0 +1,10 @@
+<!doctype html><meta charset="utf-8"><title>book overlay</title>
+<!-- "Book now" contains "ok" and "Explore" contains "x": neither closes this. -->
+<body style="margin:0;font:14px sans-serif">
+<div role="dialog" aria-label="Holiday offer" style="position:fixed;inset:40px;background:#fff;border:1px solid">
+  <p>Holiday offer</p>
+  <button onclick="document.body.dataset.clicked = 'book'">Book now</button>
+  <button onclick="document.body.dataset.clicked = 'explore'">Explore</button>
+  <button onclick="document.body.dataset.clicked = 'ok'; this.parentNode.remove()">OK</button>
+</div>
+</body>
